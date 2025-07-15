@@ -1,39 +1,31 @@
-# ERP-Software
-MetalWorks ERP is a full-featured, cross-platform ERP software tailored for metal fabrication and shelving businesses. Built using PyQt5 and Firebase, this system enables efficient management of inventory, manufacturing cycles, raw material optimization, and multi-branch operations — all in a modern desktop application.
+# 📦 MetalWorks ERP (Proprietary)
 
-🧾 Description (for GitHub)
-MetalWorks ERP is a full-featured, cross-platform ERP software tailored for metal fabrication and shelving businesses. Built using PyQt5 and Firebase, this system enables efficient management of inventory, manufacturing cycles, raw material optimization, and multi-branch operations — all in a modern desktop application.
+**MetalWorks ERP** is a private, full-featured desktop ERP system designed for metal fabrication and shelving businesses. Developed using **PyQt5** and **Firebase**, it provides complete control over manufacturing cycles, inventory, and raw material optimization.
 
-🔧 Features (you can add to README or GitHub About section)
-🔐 Secure Login & Role-Based Access (Firebase Authentication)
+> 🚫 This is a proprietary application. Cloning, distribution, modification, or reuse of the code is strictly prohibited.
 
-🏬 Multi-Branch Inventory Management (Raw + Finished Goods)
+---
 
-🏗️ Manufacturing Module with:
+## 🔧 Key Features
 
-Bill of Materials (BOM)
+- 🔐 Firebase Authentication (Admin-Controlled)
+- 🏬 Multi-Branch Inventory System (Raw + Finished Goods)
+- 🏗 Manufacturing Cycle Automation with Smart Sheet Layout Optimizer
+- 🛠️ Real-Time Firestore Integration
+- 📦 BOM & Leftover Material Handling
+- 💬 WhatsApp Messaging Automation via Selenium
 
-Raw-to-Finished Product Conversion
+---
 
-Smart Sheet Cutting Layout Optimizer
+## 🚀 Tech Stack
 
-Waste Handling & Leftover Reuse
+- **Frontend:** PyQt5 (Desktop GUI)
+- **Backend:** Firebase Firestore & Authentication
+- **Automation:** Selenium WebDriver (Chrome)
 
-📈 Dynamic Reporting & Real-Time Data (Firestore integration)
+---
 
-💬 WhatsApp Automation Module using Selenium (persistent sessions)
+## 🔒 Licensing
 
-🎨 Built with PyQt5 for a responsive and intuitive desktop UI
+This project is **not open source** and is distributed under a **proprietary license**.
 
-🔒 Sensitive data is excluded using .gitignore (e.g., Firebase credentials, WhatsApp sessions)
-
-💼 Use Case
-This ERP system is ideal for companies that:
-
-Manufacture metal shelving, racks, or custom metal parts
-
-Need to optimize metal sheet usage (cut planning)
-
-Operate across multiple warehouses or branches
-
-Require user access control and centralized cloud-based inventory
