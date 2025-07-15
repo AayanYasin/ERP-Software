@@ -90,8 +90,22 @@ class ManufacturingModule(QWidget):
 
         left_layout.addWidget(QLabel("Select Raw Material Subcategory:"))
         left_layout.addWidget(self.subcategory_dropdown)
+        
         left_layout.addWidget(QLabel("Select Raw Material Item:"))
-        left_layout.addWidget(self.item_dropdown)
+        
+        item_row = QHBoxLayout()
+
+        self.item_dropdown = QComboBox()
+        item_row.addWidget(self.item_dropdown, stretch=1)
+
+        self.refresh_qty_button = QPushButton("🔄 Refresh")
+        self.refresh_qty_button.setFixedWidth(70)  # This line controls the button width
+        self.refresh_qty_button.clicked.connect(self.refresh_raw_quantities)
+        item_row.addWidget(self.refresh_qty_button)
+
+        left_layout.addLayout(item_row)
+
+        # Create the raw_qty_input field first
         self.raw_qty_input = QLineEdit()
         left_layout.addWidget(QLabel("Enter Raw Material Quantity:"))
         left_layout.addWidget(self.raw_qty_input)
@@ -289,6 +303,43 @@ class ManufacturingModule(QWidget):
         self.sheet_tabs.setCurrentIndex(0)
         self.load_sheet_data()
         
+    def refresh_raw_quantities(self):
+        loader = self.show_loader(self, "Refreshing", "Fetching updated quantities...")
+
+        try:
+            for index, sheet in self.sheet_data.items():
+                raw_item = sheet.get("raw_item")
+                if not raw_item:
+                    continue
+
+                raw_id = raw_item.get("id")
+                branch = raw_item.get("branch")
+                color = raw_item.get("color")
+                condition = raw_item.get("condition")
+
+                if not all([raw_id, branch, color, condition]):
+                    continue
+
+                # 🔄 Fetch latest data from Firestore
+                doc = db.collection("products").document(raw_id).get()
+                if not doc.exists:
+                    continue
+
+                product_data = doc.to_dict()
+                qty_data = product_data.get("qty", {})
+
+                updated_qty = qty_data.get(branch, {}).get(color, {}).get(condition, 0)
+                sheet["raw_item"]["available_qty"] = updated_qty
+
+            QMessageBox.information(self, "Refreshed", "Inventory quantities have been updated.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to refresh quantities:\n{e}")
+        finally:
+            loader.close()
+            if self.sheet_tabs.currentIndex() >= 0:
+                self.load_sheet_data()
+
+        
     def fill_cut_fields_from_selection(self, item):
         text = item.text().lower()  # e.g., "24 3/8 x 12 1/2" or "24 height"
         try:
@@ -441,7 +492,12 @@ class ManufacturingModule(QWidget):
         current_qtys = {p["id"]: p.get("qty", 1) for p in current_products}
 
         for p in self.products:
-            label_text = f"{p['item_code']} - {p['name']} - {p['length']}{p['length_unit']} x {p['width']}{p['width_unit']} x {p['height']}{p['height_unit']}"
+            label_text = (
+                f"{p.get('item_code', '')} - {p.get('name', '')} - "
+                f"{p.get('length', 0)}{p.get('length_unit', '')} x "
+                f"{p.get('width', 0)}{p.get('width_unit', '')} x "
+                f"{p.get('height', 0)}{p.get('height_unit', '')}"
+            )
             if keyword in label_text.lower():
                 container = QWidget()
                 layout = QHBoxLayout()
@@ -897,13 +953,29 @@ class ManufacturingModule(QWidget):
             query = db.collection("products").where("sub_id", "==", subcat_id)
             for doc in query.stream():
                 data = doc.to_dict()
-                data["id"] = doc.id
-                label = f"{data['item_code']} - {data['name']} ({data.get('length', 0)} {data.get('length_unit', 0)} x {data.get('width', 0)} {data.get('width_unit', 0)})"
-                self.items.append(data)
-                self.item_dropdown.addItem(label, data)
+                base_id = doc.id
+                qty = data.get("qty", {})
+
+                for branch, colors in qty.items():
+                    for color, conditions in colors.items():
+                        for condition, amount in conditions.items():
+                            variant = data.copy()
+                            variant["id"] = base_id
+                            variant["branch"] = branch
+                            variant["color"] = color
+                            variant["condition"] = condition
+                            variant["available_qty"] = amount
+                            self.items.append(variant)
+
+                            label = (
+                                f"{variant['item_code']} - {variant['name']} "
+                                f"({variant.get('length', 0)} {variant.get('length_unit', '')} x "
+                                f"{variant.get('width', 0)} {variant.get('width_unit', '')}) - "
+                                f"{color} - {condition} ({branch}) - Qty: {amount}"
+                            )
+                            self.item_dropdown.addItem(label, variant)
         except Exception:
             pass
-        
 
     def load_products(self):
         self.products = []
@@ -911,7 +983,7 @@ class ManufacturingModule(QWidget):
         try:
             finished_main_id = None
             for doc in db.collection("product_main_categories").stream():
-                if doc.to_dict().get("name") == "Finished Goods":
+                if doc.to_dict().get("name") == "Finished Products":
                     finished_main_id = doc.id
                     break
             if not finished_main_id:
@@ -921,15 +993,17 @@ class ManufacturingModule(QWidget):
             for doc in db.collection("product_sub_categories").where("main_id", "==", finished_main_id).stream():
                 finished_sub_ids.append(doc.id)
 
+            # Load finished products directly without variants
             for doc in db.collection("products").stream():
                 data = doc.to_dict()
                 data["id"] = doc.id
-                if data.get("sub_id") in finished_sub_ids and data.get("color") == "No Color":
+
+                if data.get("sub_id") in finished_sub_ids:
                     self.products.append(data)
 
             self.filter_products()
-        except Exception:
-            pass
+        except Exception as e:
+            print("load_products error:", e)
         finally:
             loader.close()
         
@@ -1235,33 +1309,70 @@ class ManufacturingModule(QWidget):
     
     
     def send_to_manufacturing(self):
+        from collections import defaultdict
+        loader = self.show_loader(self, "Validating", "Checking inventory...")
+        # Group usage by raw material variant key
+        usage_map = defaultdict(float)
+
+        for index, sheet in self.sheet_data.items():
+            raw_item = sheet.get("raw_item", {})
+            raw_qty_input = sheet.get("raw_qty", "")
+            available_qty = raw_item.get("available_qty", 0)
+
+            try:
+                raw_qty_input = float(raw_qty_input)
+            except (ValueError, TypeError):
+                QMessageBox.critical(self, "Invalid Quantity", f"Sheet {index+1}: Enter a valid number for raw material quantity.")
+                loader.close()
+                return
+
+            # Build a unique key for the raw material variant
+            key = f"{raw_item.get('id')}|{raw_item.get('branch')}|{raw_item.get('color')}|{raw_item.get('condition')}"
+            usage_map[key] += raw_qty_input
+
+            # Check availability once total is accumulated
+            if usage_map[key] > available_qty:
+                QMessageBox.critical(
+                    self,
+                    "Inventory Error",
+                    f"Raw material overuse detected!\n\n"
+                    f"Variant: {raw_item.get('item_code', '')} - {raw_item.get('name', '')} "
+                    f"({raw_item.get('color', '')}, {raw_item.get('condition', '')}) @ {raw_item.get('branch', '')}\n"
+                    f"Available: {available_qty}\n"
+                    f"Total Requested: {usage_map[key]}"
+                )
+                loader.close()
+                return
+        loader.close()
+        
         batches = []
 
         for index, sheet in self.sheet_data.items():
-            # Prepare raw item
             raw_item = sheet.get("raw_item", {})
             raw_ref = db.collection("products").document(raw_item.get("id", ""))
-            if "length" in raw_item and "width" in raw_item and "height" in raw_item:
-                length = f'{raw_item.get("length", 0)} {raw_item.get("length_unit", "")}'
-                width = f'{raw_item.get("width", 0)} {raw_item.get("width_unit", "")}'
-                height = f'{raw_item.get("height", 0)} {raw_item.get("height_unit", "")}'
-                raw_name = f"{raw_item.get('item_code', '')} - {raw_item.get('name', '')} - {length} x {width} x {height}"
-            else:
-                raw_name = raw_item.get("name", "Unknown")
 
+            # 🏷️ Format raw material name with dimensions and units
+            length = f'{raw_item.get("length", 0)} {raw_item.get("length_unit", "")}'
+            width = f'{raw_item.get("width", 0)} {raw_item.get("width_unit", "")}'
+            height = f'{raw_item.get("height", 0)} {raw_item.get("height_unit", "")}'
+            raw_name = f"{raw_item.get('item_code', '')} - {raw_item.get('name', '')} - {length} x {width} x {height}"
 
+            # 📦 Build one batch (i.e., one sheet or pipe entry)
             batch = {
                 "raw_subcat": sheet.get("raw_subcat", ""),
-                "raw_qty": sheet.get("raw_qty", ""),
                 "raw_item": {
                     "raw_ref": raw_ref,
-                    "name": raw_name
+                    "name": raw_name,
+                    "branch": raw_item.get("branch", ""),
+                    "color": raw_item.get("color", ""),
+                    "condition": raw_item.get("condition", ""),
+                    "qty": sheet.get("raw_qty", "")  # ✅ Raw material quantity from input
                 },
                 "cuts": [],
                 "products": []
             }
 
-            # CUTS (converted to dicts)
+            # ✂️ Add cut definitions (rectangles or pipe lengths)
             for cut in sheet.get("cuts", []):
                 if isinstance(cut, (list, tuple)):
                     if len(cut) == 4:
@@ -1277,16 +1388,13 @@ class ManufacturingModule(QWidget):
                             "height_raw": cut[1]
                         })
 
-            # PRODUCTS (with reference + display name)
+            # ✅ Add selected products and quantities
             for p in sheet.get("products", []):
                 product_ref = db.collection("products").document(p["id"])
-                if "length" in p and "width" in p and "height" in p:
-                    length = f'{p.get("length", 0)} {p.get("length_unit", "")}'
-                    width = f'{p.get("width", 0)} {p.get("width_unit", "")}'
-                    height = f'{p.get("height", 0)} {p.get("height_unit", "")}'
-                    name = f"{p.get('item_code', '')} - {p.get('name', '')} - {length} x {width} x {height}"
-                else:
-                    name = p.get("name", "Unknown")
+                length = f'{p.get("length", 0)} {p.get("length_unit", "")}'
+                width = f'{p.get("width", 0)} {p.get("width_unit", "")}'
+                height = f'{p.get("height", 0)} {p.get("height_unit", "")}'
+                name = f"{p.get('item_code', '')} - {p.get('name', '')} - {length} x {width} x {height}"
 
                 batch["products"].append({
                     "product_ref": product_ref,
@@ -1296,13 +1404,15 @@ class ManufacturingModule(QWidget):
 
             batches.append(batch)
 
-        # 🔄 Save or update based on edit mode
+        # 🧾 Final order payload
         order_payload = {
             "sheets": batches,
             "status": "In Progress" if self.edit_data else "Pending",
-            "created_at": firestore.SERVER_TIMESTAMP
+            "created_at": firestore.SERVER_TIMESTAMP,
+            "notes": self.notes.text().strip()
         }
 
+        # ⏳ Upload to Firestore
         loader = self.show_loader(self, "Sending Order", "Please wait while the order is being submitted...")
         try:
             if self.doc_id:
@@ -1316,7 +1426,3 @@ class ManufacturingModule(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to save manufacturing order: {str(e)}")
         finally:
             loader.close()
-
-# ADD LOADERS
-# ADD RIGHTS
-# CORRECT RAW MATERIAL INVENTORY LOGIC

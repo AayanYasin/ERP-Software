@@ -273,7 +273,7 @@ class SettingsWindow(QWidget):
         if not color or color in self.colors:
             return
         self.colors.append(color)
-        db.collection("meta").document("colors").set({"list": self.colors})
+        db.collection("meta").document("colors").set({"pc_colors": self.colors})
         self.load_colors()
         self.color_input.clear()
         self.show_restart_banner()
@@ -286,6 +286,6 @@ class SettingsWindow(QWidget):
         reply = QMessageBox.question(self, "Delete Color", f"Delete color '{color}'?", QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
             self.colors.remove(color)
-            db.collection("meta").document("colors").set({"list": self.colors})
+            db.collection("meta").document("colors").set({"pc_colors": self.colors})
             self.load_colors()
             self.show_restart_banner()
