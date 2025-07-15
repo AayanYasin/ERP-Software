@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Firebase
+*.json
+.env
+secrets/
+firebase/credentials.txt
+
+# IDEs
+.vscode/
+.idea/
+
+# System
+.DS_Store
+Thumbs.db
