@@ -10,7 +10,7 @@ from uuid import uuid4
 from firebase_admin import firestore
 from fractions import Fraction
 from collections import Counter
-import re
+from math import ceil
 
 class PannableGraphicsView(QGraphicsView):
     def __init__(self, scene=None):
@@ -713,6 +713,69 @@ class ManufacturingModule(QWidget):
 
         except Exception as e:
             print("Simulation error:", e)
+            
+    
+    def to_mixed_fraction(self, value):
+        inches = int(value)
+        fraction = Fraction(value - inches).limit_denominator(16)
+        if fraction == 0:
+            return f"{inches}"
+        return f"{inches} {fraction.numerator}/{fraction.denominator}"
+
+    def scan_waste_blocks(sel, sheet_w, sheet_h, rects, scan_direction="top", resolution=8):
+        grid_w = int(sheet_w * resolution)
+        grid_h = int(sheet_h * resolution)
+        used = [[False for _ in range(grid_w)] for _ in range(grid_h)]
+
+        for x, y, w, h in rects:
+            for dx in range(ceil(w * resolution)):
+                for dy in range(ceil(h * resolution)):
+                    px = int((x * resolution) + dx)
+                    py = int((y * resolution) + dy)
+                    if 0 <= px < grid_w and 0 <= py < grid_h:
+                        used[py][px] = True
+
+        visited = [[False for _ in range(grid_w)] for _ in range(grid_h)]
+        waste_blocks = []
+
+        y_range = range(grid_h) if scan_direction == "top" else range(grid_h - 1, -1, -1)
+
+        for y in y_range:
+            for x in range(grid_w):
+                if not used[y][x] and not visited[y][x]:
+                    max_w = 0
+                    while x + max_w < grid_w and not used[y][x + max_w] and not visited[y][x + max_w]:
+                        max_w += 1
+
+                    max_h = 1
+                    done = False
+                    while True:
+                        next_y = y + max_h if scan_direction == "top" else y - max_h
+                        if next_y < 0 or next_y >= grid_h:
+                            break
+                        for dx in range(max_w):
+                            if used[next_y][x + dx] or visited[next_y][x + dx]:
+                                done = True
+                                break
+                        if done:
+                            break
+                        max_h += 1
+
+                    for dy in range(max_h):
+                        for dx in range(max_w):
+                            yy = y + dy if scan_direction == "top" else y - dy
+                            visited[yy][x + dx] = True
+
+                    top_y = y if scan_direction == "top" else y - max_h + 1
+                    # Convert back to inches
+                    waste_blocks.append((x / resolution, top_y / resolution, max_w / resolution, max_h / resolution))
+
+        return waste_blocks
+
+    
+    def find_all_waste_blocks(self, sheet_w, sheet_h, rects):
+        return self.scan_waste_blocks(sheet_w, sheet_h, rects, scan_direction="bottom")
+
 
 
     def draw_canvas(self, sheet_w, sheet_h, rects):
@@ -819,16 +882,47 @@ class ManufacturingModule(QWidget):
                 line.setPen(QPen(QColor("#2c3e50"), 1.5, Qt.SolidLine))
                 self.scene.addItem(line)
 
-        # Summary info
-        waste_area = sheet_w * sheet_h - used_area
-        info = QGraphicsTextItem(
-            f"Sheet: {int(sheet_w)} x {int(sheet_h)} inch\n"
-            f"Used: {int(used_area)} inch²\n"
-            f"Waste: {int(waste_area)} inch²"
-        )
+        # === Summary ===
+        # Count cut usage
+        usage_counter = Counter()
+        for i, (x, y, w, h) in enumerate(rects):
+            if i < len(cuts_with_labels):
+                c = cuts_with_labels[i]
+                if len(c) >= 5 and c[4]:
+                    label = f"{c[2]} x {c[3]} inch - Bracket"
+                else:
+                    label = f"{c[2]} x {c[3]} inch"
+            else:
+                label = f"{w:.2f} x {h:.2f} inch"
+            usage_counter[label] += 1
+
+        lines = [f"Sheet: {int(sheet_w)} x {int(sheet_h)} inch"]
+
+        # ✅ Add spacing + used section if cuts exist
+        if usage_counter:
+            lines.append("-")  # <-- Blank line before Used
+            lines.append("Used:")
+            for label, count in usage_counter.items():
+                lines.append(f"  {label} = {count}")
+
+        # ✅ Add spacing + waste block sizes if any
+        if rects:
+            waste_blocks = self.find_all_waste_blocks(int(sheet_w), int(sheet_h), rects)
+        else:
+            waste_blocks = []
+
+        if waste_blocks:
+            lines.append("")
+            for i, (x, y, w, h) in enumerate(waste_blocks, 1):
+                w_str = self.to_mixed_fraction(w)
+                h_str = self.to_mixed_fraction(h)
+                lines.append(f"Waste Block {i}: {w_str} x {h_str} inch")
+
+        # Render summary
+        info = QGraphicsTextItem("\n".join(lines))
         info.setDefaultTextColor(Qt.darkRed)
         info.setFont(QFont("Arial", 9))
-        info.setPos(10, sheet_h * scale + 10)
+        info.setPos(canvas_w + 20, 10)
         self.scene.addItem(info)
 
         # Title
@@ -838,7 +932,7 @@ class ManufacturingModule(QWidget):
         title.setPos(10, -30)
         self.scene.addItem(title)
 
-        self.canvas.setSceneRect(0, -40, canvas_w + 100, sheet_h * scale + 100)
+        self.canvas.setSceneRect(-20, -60, canvas_w + 250, sheet_h * scale + 100)
         
     def auto_optimize_sheet(self):
         try:
