@@ -1,7 +1,7 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QLineEdit, QPushButton, QListWidget, QListWidgetItem,
     QGraphicsScene, QGraphicsView, QGraphicsRectItem, QHBoxLayout, QGraphicsTextItem, QGraphicsEllipseItem,
-    QComboBox, QMessageBox, QTabWidget, QCheckBox, QSpinBox, QProgressDialog, QApplication
+    QComboBox, QMessageBox, QTabWidget, QCheckBox, QSpinBox, QProgressDialog, QApplication, QGraphicsLineItem
 )
 from PyQt5.QtGui import QBrush, QColor, QPen, QPainter, QFont, QTransform
 from PyQt5.QtCore import Qt
@@ -129,21 +129,27 @@ class ManufacturingModule(QWidget):
         self.cut_length = QLineEdit()
         self.cut_width = QLineEdit()
         self.cut_qty = QLineEdit()
-        self.cut_length.setPlaceholderText("Length")
-        self.cut_width.setPlaceholderText("Width")
+        self.cut_length.setPlaceholderText("Width")
+        self.cut_width.setPlaceholderText("Height")
         self.cut_qty.setPlaceholderText("No.")
-        self.add_cut_btn = QPushButton("Add Cut")
-        self.remove_cut_btn = QPushButton("Remove Selected")
-        self.add_cut_btn.clicked.connect(self.add_cut_size)
-        self.remove_cut_btn.clicked.connect(self.remove_selected_cut)
+        self.bracket_checkbox = QCheckBox("Bracket")
         cut_input_layout.addWidget(self.cut_length)
         cut_input_layout.addWidget(self.length_soot)
         cut_input_layout.addWidget(self.cut_width)
         cut_input_layout.addWidget(self.width_soot)
         cut_input_layout.addWidget(self.cut_qty)
-        cut_input_layout.addWidget(self.add_cut_btn)
-        cut_input_layout.addWidget(self.remove_cut_btn)
+        cut_input_layout.addWidget(self.bracket_checkbox)
         left_layout.addLayout(cut_input_layout)
+
+        # Button row
+        button_row = QHBoxLayout()
+        self.add_cut_btn = QPushButton("Add Cut")
+        self.remove_cut_btn = QPushButton("Remove Cut")
+        button_row.addWidget(self.add_cut_btn)
+        button_row.addWidget(self.remove_cut_btn)
+        self.add_cut_btn.clicked.connect(self.add_cut_size)
+        self.remove_cut_btn.clicked.connect(self.remove_selected_cut)
+        left_layout.addLayout(button_row)
 
         # Action buttons
         # self.auto_btn = QPushButton("⚙️ Auto Layout")
@@ -341,37 +347,50 @@ class ManufacturingModule(QWidget):
 
         
     def fill_cut_fields_from_selection(self, item):
-        text = item.text().lower()  # e.g., "24 3/8 x 12 1/2" or "24 height"
+        text = item.text().lower().strip()  # e.g., "24 3/8 x 12 1/2 - bracket" or "24 height - bracket"
         try:
-            if "x" in text:
-                length_str, width_str = [s.strip() for s in text.split('x')]
+            is_pipe = self.is_pipe_selected()
 
-                def parse_soot(value_str):
-                    parts = value_str.strip().split()
-                    inch = parts[0]
-                    soot = parts[1] if len(parts) > 1 else "0"
-                    return inch, soot
+            # Determine if it's a bracket (only relevant in sheet mode)
+            is_bracket = "bracket" in text
+            self.bracket_checkbox.setChecked(is_bracket if not is_pipe else False)
 
-                l_inch, l_soot = parse_soot(length_str)
-                w_inch, w_soot = parse_soot(width_str)
+            # Clean out the "- bracket" for parsing
+            clean_text = text.replace(" - bracket", "").strip()
 
-                self.cut_length.setText(l_inch)
-                self.length_soot.setCurrentText(l_soot)
-                self.cut_width.setText(w_inch)
-                self.width_soot.setCurrentText(w_soot)
-            elif "height" in text:
-                value = text.replace("height", "").strip()
-                parts = value.split()
+            def parse_soot(value_str):
+                parts = value_str.strip().split()
                 inch = parts[0]
                 soot = parts[1] if len(parts) > 1 else "0"
+                return inch, soot
+
+            if is_pipe:
+                # Pipe mode expects just height
+                parts = clean_text.replace("height", "").strip().split()
+                inch = parts[0]
+                soot = parts[1] if len(parts) > 1 else "0"
+
                 self.cut_length.setText(inch)
                 self.length_soot.setCurrentText(soot)
+
                 self.cut_width.clear()
                 self.width_soot.setCurrentIndex(0)
+
+            else:
+                # Sheet mode: length x width
+                if "x" in clean_text:
+                    length_str, width_str = [s.strip() for s in clean_text.split('x')]
+
+                    l_inch, l_soot = parse_soot(length_str)
+                    w_inch, w_soot = parse_soot(width_str)
+
+                    self.cut_length.setText(l_inch)
+                    self.length_soot.setCurrentText(l_soot)
+                    self.cut_width.setText(w_inch)
+                    self.width_soot.setCurrentText(w_soot)
+
         except Exception as e:
             print("Parse error in fill_cut_fields_from_selection:", e)
-
-
 
     def add_new_sheet(self):
         index = self.sheet_tabs.count()
@@ -444,8 +463,14 @@ class ManufacturingModule(QWidget):
         cuts = sheet.get("cuts", [])
         for c in cuts:
             if isinstance(c, (list, tuple)):
-                if len(c) == 4:
-                    # Sheet cut
+                if len(c) == 5:
+                    # Sheet cut with bracket info
+                    label = f"{c[2]} x {c[3]}"
+                    if c[4]:
+                        label += " - Bracket"
+                    self.cut_list.addItem(label)
+                elif len(c) == 4:
+                    # Sheet cut (no bracket flag)
                     self.cut_list.addItem(f"{c[2]} x {c[3]}")
                 elif len(c) == 2:
                     # Pipe cut
@@ -460,7 +485,8 @@ class ManufacturingModule(QWidget):
             
         self.toggle_pipe_mode()
         loader.close()
-
+        if self.sheet_tabs.count() > 1:
+            self.simulate_cutting()
 
 
     def save_product_selection(self):
@@ -554,6 +580,7 @@ class ManufacturingModule(QWidget):
 
             else:
                 try:
+                    is_bracket = self.bracket_checkbox.isChecked()
                     l = float(self.cut_length.text())
                     w = float(self.cut_width.text())
                     l_str = self.cut_length.text()
@@ -569,25 +596,32 @@ class ManufacturingModule(QWidget):
                         w += float(Fraction(frac))
                         w_str += f" {frac}"
 
+                    # Append " - Bracket" if selected
                     label = f"{l_str} x {w_str}"
+                    if is_bracket:
+                        label += " - Bracket"
+
                     for _ in range(qty):
                         self.cut_list.addItem(label)
                         if index in self.sheet_data:
-                            self.sheet_data[index]["cuts"].append((l, w, l_str, w_str))
+                            self.sheet_data[index]["cuts"].append((l, w, l_str, w_str, is_bracket))
 
                     self.cut_length.clear()
                     self.cut_width.clear()
                     self.length_soot.setCurrentIndex(0)
                     self.width_soot.setCurrentIndex(0)
+                    self.bracket_checkbox.setChecked(False)
+
                 except Exception as e:
-                    QMessageBox.warning(self, "Invalid Input", f"Error parsing input: {str(e)}")
+                    pass
+
             if hasattr(self, "cut_qty"):
                 self.cut_qty.clear()
 
             self.simulate_cutting()
 
         except Exception as e:
-            QMessageBox.warning(self, "Invalid Input", f"Error parsing input: {str(e)}")
+            pass
 
 
     def remove_selected_cut(self):
@@ -602,8 +636,9 @@ class ManufacturingModule(QWidget):
                     # ✅ Clear input fields
                     self.cut_length.clear()
                     self.cut_width.clear()
-                    self.length_soot.clear()
-                    self.width_soot.clear()
+                    self.length_soot.setCurrentIndex(0)
+                    self.width_soot.setCurrentIndex(0)
+                    self.bracket_checkbox.setChecked(False)
 
                     # ✅ Simulate or show blank if no cuts left
                     if self.sheet_data[index]["cuts"]:
@@ -622,18 +657,23 @@ class ManufacturingModule(QWidget):
         
     def toggle_pipe_mode(self):
         if self.is_pipe_selected():
+            # Pipe mode: disable width and bracket
             self.cut_width.setDisabled(True)
             self.width_soot.setDisabled(True)
-            # self.auto_btn.setDisabled(True)
             self.cut_width.setPlaceholderText("Disabled for pipe")
-
             self.cut_length.setPlaceholderText("Height")
+
+            self.bracket_checkbox.setChecked(False)
+            self.bracket_checkbox.setDisabled(True)
+
         else:
+            # Sheet mode: enable width and bracket
             self.cut_width.setDisabled(False)
             self.width_soot.setDisabled(False)
-            # self.auto_btn.setDisabled(False)
-            self.cut_width.setPlaceholderText("Width")
-            self.cut_length.setPlaceholderText("Length")
+            self.cut_width.setPlaceholderText("Height")
+            self.cut_length.setPlaceholderText("Width")
+
+            self.bracket_checkbox.setDisabled(False)
 
     def simulate_cutting(self):
         index = self.item_dropdown.currentIndex()
@@ -663,8 +703,10 @@ class ManufacturingModule(QWidget):
             sheet_w = convert_to_inches(raw_width, width_unit)
             sheet_h = convert_to_inches(raw_length, length_unit)
 
-            cuts = self.sheet_data.get(self.sheet_tabs.currentIndex(), {}).get("cuts", [])
-            placements = self.place_rectangles(sheet_w, sheet_h, cuts)
+            raw_cuts = self.sheet_data.get(self.sheet_tabs.currentIndex(), {}).get("cuts", [])
+            # Convert to 4-tuple for layout placement only
+            cuts_for_placement = [(c[0], c[1]) for c in raw_cuts if len(c) >= 2]
+            placements = self.place_rectangles(sheet_w, sheet_h, cuts_for_placement)
             if not placements:
                 return
             self.draw_canvas(sheet_w, sheet_h, placements)
@@ -706,19 +748,29 @@ class ManufacturingModule(QWidget):
         index = self.sheet_tabs.currentIndex()
         cuts_with_labels = self.sheet_data.get(index, {}).get("cuts", [])
 
-        for x, y, w, h in rects:
+        for i, (x, y, w, h) in enumerate(rects):
             used_area += w * h
-            rect = QGraphicsRectItem(x * scale, y * scale, w * scale, h * scale)
-            rect.setBrush(QBrush(QColor("#74b9ff")))
-            rect.setPen(QPen(Qt.darkBlue, 1))
-            self.scene.addItem(rect)
+            rect_item = QGraphicsRectItem(x * scale, y * scale, w * scale, h * scale)
+            rect_item.setBrush(QBrush(QColor("#74b9ff")))
+            rect_item.setPen(QPen(Qt.darkBlue, 1))
+            self.scene.addItem(rect_item)
 
             # Match original cut label
             original_label = f"{w:.2f} x {h:.2f} inch"
-            for (lw, lh, lw_str, lh_str) in cuts_with_labels:
-                if abs(lw - w) < 0.01 and abs(lh - h) < 0.01:
-                    original_label = f"{lw_str} x {lh_str} inch"
-                    break
+            is_bracket = False
+            if i < len(cuts_with_labels):
+                cut_data = cuts_with_labels[i]
+                if len(cut_data) >= 5:
+                    is_bracket = cut_data[4]
+                    original_label = f"{cut_data[2]} x {cut_data[3]} inch"
+                    # if is_bracket:
+                    #     original_label += " - Bracket"
+                else:
+                    is_bracket = False
+                    original_label = f"{cut_data[2]} x {cut_data[3]} inch"
+            else:
+                is_bracket = False
+                original_label = f"{w:.2f} x {h:.2f} inch"
 
             min_dim = min(w, h)
             font_size = max(6, min(14, int(min_dim * scale * 0.2)))
@@ -727,14 +779,45 @@ class ManufacturingModule(QWidget):
             font = QFont("Arial", font_size)
             label.setFont(font)
             label.setDefaultTextColor(Qt.black)
+            label.setZValue(10)
+
+            label_rect = label.boundingRect()
 
             if h > w:
-                label.setTransform(QTransform().rotate(-90))
-                label.setPos((x + w / 2) * scale - 5, (y + h / 2) * scale + 10)
+                # Rotate -90 around center
+                transform = QTransform()
+                transform.translate((x + w / 2) * scale, (y + h / 2) * scale)
+                transform.rotate(-90)
+                transform.translate(-label_rect.width() / 2, -label_rect.height() / 2)
+                label.setTransform(transform)
             else:
-                label.setPos(x * scale + 4, y * scale + 4)
+                label.setPos((x + w / 2) * scale - label_rect.width() / 2,
+                            (y + h / 2) * scale - label_rect.height() / 2)
 
             self.scene.addItem(label)
+
+            # Draw diagonal if bracket
+            if is_bracket:
+                x_px = x * scale
+                y_px = y * scale
+                w_px = w * scale
+                h_px = h * scale
+                offset = 10
+
+                if w_px > h_px:
+                    x1 = x_px
+                    y1 = y_px + offset
+                    x2 = x_px + w_px
+                    y2 = y_px + h_px - offset
+                else:
+                    x1 = x_px + w_px - offset
+                    y1 = y_px
+                    x2 = x_px + offset
+                    y2 = y_px + h_px
+
+                line = QGraphicsLineItem(x1, y1, x2, y2)
+                line.setPen(QPen(QColor("#2c3e50"), 1.5, Qt.SolidLine))
+                self.scene.addItem(line)
 
         # Summary info
         waste_area = sheet_w * sheet_h - used_area
@@ -756,7 +839,6 @@ class ManufacturingModule(QWidget):
         self.scene.addItem(title)
 
         self.canvas.setSceneRect(0, -40, canvas_w + 100, sheet_h * scale + 100)
-        
         
     def auto_optimize_sheet(self):
         try:
@@ -808,7 +890,7 @@ class ManufacturingModule(QWidget):
                                 if total + w > max_width:
                                     valid = False
                                     break
-                                row.append((w, h, l_str, w_str))
+                                row.append((w, h, l_str, w_str, p['is_bracket']))
                                 total += w
                             if valid and total > best_total:
                                 best_total = total
@@ -825,7 +907,8 @@ class ManufacturingModule(QWidget):
                         'length': l,
                         'width': w,
                         'length_str': c[2],
-                        'width_str': c[3]
+                        'width_str': c[3],
+                        'is_bracket': c[4] if len(c) > 4 else False
                     })
 
                 y_cursor = 0
@@ -835,7 +918,7 @@ class ManufacturingModule(QWidget):
                     if not result:
                         break
                     used_items, row = result
-                    row_height = max(h for _, h, _, _ in row)
+                    row_height = max(h for _, h, _, _, _ in row)
                     if y_cursor + row_height > sheet_h:
                         break
                     layout.extend(row)
@@ -844,7 +927,6 @@ class ManufacturingModule(QWidget):
                     y_cursor += row_height
                 return layout
 
-            # Convert sheet dimensions to inches
             def to_inches(val, unit):
                 unit = unit.lower()
                 if unit == 'ft':
@@ -858,24 +940,23 @@ class ManufacturingModule(QWidget):
 
             optimized = optimize_layout(sheet_w, sheet_h, cuts)
 
-            # Update internal sheet_data and UI
+            # ✅ Update internal sheet_data and UI with brackets preserved
             self.sheet_data[index]["cuts"] = [
-                (round(w, 4), round(h, 4), l_str, w_str) for (w, h, l_str, w_str) in optimized
+                (round(w, 4), round(h, 4), l_str, w_str, is_bracket)
+                for (w, h, l_str, w_str, is_bracket) in optimized
             ]
 
             self.cut_list.clear()
-            for (w, h, l_str, w_str) in optimized:
-                self.cut_list.addItem(f"{l_str} x {w_str}")
+            for (w, h, l_str, w_str, is_bracket) in optimized:
+                label = f"{l_str} x {w_str}"
+                if is_bracket:
+                    label += " - Bracket"
+                self.cut_list.addItem(label)
 
-            # QMessageBox.information(self, "Optimized", "Cut sizes reordered for best fit.")
-            
             self.simulate_cutting()
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Optimization failed:\n{str(e)}")
-
-
-
         
     def place_rectangles(self, sheet_w, sheet_h, rectangles):
         used = []
@@ -967,15 +1048,26 @@ class ManufacturingModule(QWidget):
                             variant["available_qty"] = amount
                             self.items.append(variant)
 
+                            # Get fields safely
+                            item_code = variant.get("item_code", "")
+                            name = variant.get("name", "Unnamed")
+                            length = variant.get("length", 0)
+                            length_unit = variant.get("length_unit", "")
+                            width = variant.get("width", 0)
+                            width_unit = variant.get("width_unit", "")
+                            metal_type = variant.get("metal_type", "").upper()
+
                             label = (
-                                f"{variant['item_code']} - {variant['name']} "
-                                f"({variant.get('length', 0)} {variant.get('length_unit', '')} x "
-                                f"{variant.get('width', 0)} {variant.get('width_unit', '')}) - "
-                                f"{color} - {condition} ({branch}) - Qty: {amount}"
+                                f"{item_code} - {name} "
+                                f"({length} {length_unit} x {width} {width_unit}) - "
+                                f"{metal_type} | {color} - {condition} ({branch}) - Q{amount}"
                             )
+
                             self.item_dropdown.addItem(label, variant)
-        except Exception:
-            pass
+
+        except Exception as e:
+            print("Error loading items:", e)
+
 
     def load_products(self):
         self.products = []
@@ -1375,12 +1467,13 @@ class ManufacturingModule(QWidget):
             # ✂️ Add cut definitions (rectangles or pipe lengths)
             for cut in sheet.get("cuts", []):
                 if isinstance(cut, (list, tuple)):
-                    if len(cut) == 4:
+                    if len(cut) == 5:
                         batch["cuts"].append({
                             "length": cut[0],
                             "width": cut[1],
                             "length_raw": cut[2],
-                            "width_raw": cut[3]
+                            "width_raw": cut[3],
+                            "is_bracket": cut[4]
                         })
                     elif len(cut) == 2:
                         batch["cuts"].append({
