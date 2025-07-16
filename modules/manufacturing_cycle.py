@@ -865,7 +865,7 @@ class ManufacturingModule(QWidget):
                 y_px = y * scale
                 w_px = w * scale
                 h_px = h * scale
-                offset = 10
+                offset = 15
 
                 if w_px > h_px:
                     x1 = x_px
@@ -1495,10 +1495,47 @@ class ManufacturingModule(QWidget):
     
     
     def send_to_manufacturing(self):
+        # from collections import defaultdict
+        # loader = self.show_loader(self, "Validating", "Checking inventory...")
+        # # Group usage by raw material variant key
+        # usage_map = defaultdict(float)
+
+        # for index, sheet in self.sheet_data.items():
+        #     raw_item = sheet.get("raw_item", {})
+        #     raw_qty_input = sheet.get("raw_qty", "")
+        #     available_qty = raw_item.get("available_qty", 0)
+
+        #     try:
+        #         raw_qty_input = float(raw_qty_input)
+        #     except (ValueError, TypeError):
+        #         QMessageBox.critical(self, "Invalid Quantity", f"Sheet {index+1}: Enter a valid number for raw material quantity.")
+        #         loader.close()
+        #         return
+
+        #     # Build a unique key for the raw material variant
+        #     key = f"{raw_item.get('id')}|{raw_item.get('branch')}|{raw_item.get('color')}|{raw_item.get('condition')}"
+        #     usage_map[key] += raw_qty_input
+
+        #     # Check availability once total is accumulated
+        #     if usage_map[key] > available_qty:
+        #         QMessageBox.critical(
+        #             self,
+        #             "Inventory Error",
+        #             f"Raw material overuse detected!\n\n"
+        #             f"Variant: {raw_item.get('item_code', '')} - {raw_item.get('name', '')} "
+        #             f"({raw_item.get('color', '')}, {raw_item.get('condition', '')}) @ {raw_item.get('branch', '')}\n"
+        #             f"Available: {available_qty}\n"
+        #             f"Total Requested: {usage_map[key]}"
+        #         )
+        #         loader.close()
+        #         return
+        # loader.close()
+        
         from collections import defaultdict
+
         loader = self.show_loader(self, "Validating", "Checking inventory...")
-        # Group usage by raw material variant key
         usage_map = defaultdict(float)
+        overuse_detected = []
 
         for index, sheet in self.sheet_data.items():
             raw_item = sheet.get("raw_item", {})
@@ -1512,104 +1549,110 @@ class ManufacturingModule(QWidget):
                 loader.close()
                 return
 
-            # Build a unique key for the raw material variant
+            # Build unique variant key
             key = f"{raw_item.get('id')}|{raw_item.get('branch')}|{raw_item.get('color')}|{raw_item.get('condition')}"
             usage_map[key] += raw_qty_input
 
-            # Check availability once total is accumulated
+            # Check overuse
             if usage_map[key] > available_qty:
-                QMessageBox.critical(
-                    self,
-                    "Inventory Error",
-                    f"Raw material overuse detected!\n\n"
-                    f"Variant: {raw_item.get('item_code', '')} - {raw_item.get('name', '')} "
-                    f"({raw_item.get('color', '')}, {raw_item.get('condition', '')}) @ {raw_item.get('branch', '')}\n"
-                    f"Available: {available_qty}\n"
-                    f"Total Requested: {usage_map[key]}"
-                )
-                loader.close()
-                return
-        loader.close()
-        
-        batches = []
-
-        for index, sheet in self.sheet_data.items():
-            raw_item = sheet.get("raw_item", {})
-            raw_ref = db.collection("products").document(raw_item.get("id", ""))
-
-            # 🏷️ Format raw material name with dimensions and units
-            length = f'{raw_item.get("length", 0)} {raw_item.get("length_unit", "")}'
-            width = f'{raw_item.get("width", 0)} {raw_item.get("width_unit", "")}'
-            height = f'{raw_item.get("height", 0)} {raw_item.get("height_unit", "")}'
-            raw_name = f"{raw_item.get('item_code', '')} - {raw_item.get('name', '')} - {length} x {width} x {height}"
-
-            # 📦 Build one batch (i.e., one sheet or pipe entry)
-            batch = {
-                "raw_subcat": sheet.get("raw_subcat", ""),
-                "raw_item": {
-                    "raw_ref": raw_ref,
-                    "name": raw_name,
+                overuse_detected.append({
+                    "variant": f"{raw_item.get('item_code', '')} - {raw_item.get('name', '')}",
                     "branch": raw_item.get("branch", ""),
                     "color": raw_item.get("color", ""),
                     "condition": raw_item.get("condition", ""),
-                    "qty": sheet.get("raw_qty", "")  # ✅ Raw material quantity from input
-                },
-                "cuts": [],
-                "products": []
-            }
-
-            # ✂️ Add cut definitions (rectangles or pipe lengths)
-            for cut in sheet.get("cuts", []):
-                if isinstance(cut, (list, tuple)):
-                    if len(cut) == 5:
-                        batch["cuts"].append({
-                            "length": cut[0],
-                            "width": cut[1],
-                            "length_raw": cut[2],
-                            "width_raw": cut[3],
-                            "is_bracket": cut[4]
-                        })
-                    elif len(cut) == 2:
-                        batch["cuts"].append({
-                            "height": cut[0],
-                            "height_raw": cut[1]
-                        })
-
-            # ✅ Add selected products and quantities
-            for p in sheet.get("products", []):
-                product_ref = db.collection("products").document(p["id"])
-                length = f'{p.get("length", 0)} {p.get("length_unit", "")}'
-                width = f'{p.get("width", 0)} {p.get("width_unit", "")}'
-                height = f'{p.get("height", 0)} {p.get("height_unit", "")}'
-                name = f"{p.get('item_code', '')} - {p.get('name', '')} - {length} x {width} x {height}"
-
-                batch["products"].append({
-                    "product_ref": product_ref,
-                    "name": name,
-                    "qty": p.get("qty", 1)
+                    "available": available_qty,
+                    "requested": usage_map[key]
                 })
 
-            batches.append(batch)
+        loader.close()
 
-        # 🧾 Final order payload
-        order_payload = {
+        # If any overuse, ask user
+        if overuse_detected:
+            msg = "Raw material overuse detected:\n\n"
+            for o in overuse_detected:
+                msg += (
+                    f"🔹 {o['variant']} ({o['color']}, {o['condition']}) @ {o['branch']}\n"
+                    f"Available: {o['available']} | Requested: {o['requested']}\n\n"
+                )
+            msg += "Do you still want to proceed with the order?"
+
+            reply = QMessageBox.question(
+                self,
+                "Inventory Warning",
+                msg,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+
+            if reply == QMessageBox.No:
+                return  # user cancelled the submission
+
+        # 2. Build Batches
+        batches = []
+        for sheet in self.sheet_data.values():
+            raw = sheet.get("raw_item", {})
+            raw_ref = db.collection("products").document(raw.get("id", ""))
+            cuts = []
+
+            for c in sheet.get("cuts", []):
+                if isinstance(c, dict):
+                    cuts.append(c)
+                elif isinstance(c, (list, tuple)):
+                    if len(c) == 5:
+                        cuts.append({
+                            "length": c[0], "width": c[1],
+                            "length_raw": c[2], "width_raw": c[3],
+                            "is_bracket": c[4]
+                        })
+                    elif len(c) == 2:
+                        cuts.append({
+                            "height": c[0],
+                            "height_raw": c[1]
+                        })
+
+            products = [
+                {
+                    "product_ref": db.collection("products").document(p["id"]),
+                    "name": f"{p.get('item_code')} - {p.get('name')} - "
+                            f"{p.get('length', 0)}{p.get('length_unit')} x "
+                            f"{p.get('width', 0)}{p.get('width_unit')} x "
+                            f"{p.get('height', 0)}{p.get('height_unit')}",
+                    "qty": p.get("qty", 1)
+                }
+                for p in sheet.get("products", [])
+            ]
+
+            batches.append({
+                "raw_subcat": sheet.get("raw_subcat"),
+                "raw_item": {
+                    "raw_ref": raw_ref,
+                    "name": raw.get("name", ""),
+                    "branch": raw.get("branch"),
+                    "color": raw.get("color"),
+                    "condition": raw.get("condition"),
+                    "qty": sheet.get("raw_qty", "")
+                },
+                "cuts": cuts,
+                "products": products
+            })
+
+        # 3. Final Upload
+        payload = {
             "sheets": batches,
             "status": "In Progress" if self.edit_data else "Pending",
             "created_at": firestore.SERVER_TIMESTAMP,
             "notes": self.notes.text().strip()
         }
 
-        # ⏳ Upload to Firestore
-        loader = self.show_loader(self, "Sending Order", "Please wait while the order is being submitted...")
+        loader = self.show_loader(self, "Sending Order", "Uploading to Firebase...")
         try:
             if self.doc_id:
-                db.collection("manufacturing_orders").document(self.doc_id).update(order_payload)
-                QMessageBox.information(self, "Updated", "Manufacturing order updated successfully.")
+                db.collection("manufacturing_orders").document(self.doc_id).update(payload)
             else:
-                db.collection("manufacturing_orders").add(order_payload)
-                QMessageBox.information(self, "Created", "Manufacturing order saved successfully.")
+                db.collection("manufacturing_orders").add(payload)
+            QMessageBox.information(self, "Success", "Order saved successfully.")
             self.close()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save manufacturing order: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to save: {str(e)}")
         finally:
             loader.close()
