@@ -1,26 +1,23 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
     QPushButton, QGraphicsScene, QDialog, QMessageBox, QListView, QFrame,
-    QTextBrowser, QScrollArea, QSizePolicy, QProgressDialog, QApplication, QInputDialog
+    QTextBrowser, QScrollArea, QProgressDialog, QApplication, QInputDialog
 )
-from PyQt5.QtGui import QPainter, QFont
-from PyQt5.QtCore import Qt, QSize, QTimer
+from PyQt5.QtGui import QPainter, QPen
+from PyQt5.QtCore import Qt, QSize
 from firebase.config import db
 from firebase_admin import firestore
 from datetime import datetime
 from modules.manufacturing_cycle import ManufacturingModule, PannableGraphicsView
-import os
 
 
 class ViewManufacturingWindow(QWidget):
     def __init__(self, user_data, dashboard=None, parent=None):
         super().__init__(parent)
         self.user_data = user_data
+        self.dashboard = dashboard
         self.setWindowTitle("📦 Manufacturing Orders")
         self.resize(1200, 700)
-        self.sheet_index = 0
-        
-        self.dashboard = dashboard
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("📋 List of Manufacturing Orders"))
@@ -48,7 +45,6 @@ class ViewManufacturingWindow(QWidget):
     def load_orders(self):
         loader = self.show_loader(self, "Loading Orders", "Fetching manufacturing orders...")
         self.order_list.clear()
-
         try:
             orders = db.collection("manufacturing_orders").order_by("created_at", direction=firestore.Query.DESCENDING).stream()
             for doc in orders:
@@ -60,12 +56,12 @@ class ViewManufacturingWindow(QWidget):
                 status = data.get("status", "Pending")
 
                 status_colors = {
-                    "Completed": "#2ecc71",       # green
-                    "In Progress": "#3498db",     # blue
-                    "Rejected": "#e74c3c",        # red
-                    "Pending":  "#f39c12"  # orange
+                    "Completed": "#2ecc71",
+                    "In Progress": "#3498db",
+                    "Rejected": "#e74c3c",
+                    "Pending": "#f39c12"
                 }
-                status_color = status_colors.get(status, "#95a5a6")  # fallback gray
+                status_color = status_colors.get(status, "#95a5a6")
 
                 summary = f"""
                 <div style='
@@ -113,128 +109,78 @@ class ViewManufacturingWindow(QWidget):
     def open_order(self, item):
         data = item.data(Qt.UserRole)
         dlg = RefactoredOrderDialog(order_data=data, user_data=self.user_data, dashboard=self.dashboard, parent=self)
-        
         if self.dashboard:
             self.dashboard.open_windows.append(dlg)
             dlg.destroyed.connect(lambda: self.dashboard.open_windows.remove(dlg))
-
         dlg.exec_()
         self.load_orders()
-
 
 class RefactoredOrderDialog(QDialog):
     def __init__(self, order_data, user_data, dashboard=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("🔍 View Manufacturing Order")
-        self.resize(1300, 800)
+        self.setWindowTitle("🔍 Order Details")
+        self.resize(1200, 800)
+
         self.order_data = order_data
         self.user_data = user_data
-        self.sheet_index = 0
-        
-        self.dashboard = dashboard  
+        self.dashboard = dashboard
+        self.current_index = 0
+        self.sheet_data = {}  # ✅ Add this line
 
+        # === Main Layout ===
         main_layout = QHBoxLayout(self)
 
-        # Left: scrollable order info
-        left = QVBoxLayout()
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll_content = QWidget()
-        scroll_layout = QVBoxLayout(scroll_content)
+        # === Left Panel (Info + Controls) ===
+        left_panel = QVBoxLayout()
+        header = QLabel(f"🧾 Order ID: {order_data.get('id', 'N/A')}")
+        header.setStyleSheet("font-size: 18px; font-weight: bold;")
+        left_panel.addWidget(header)
 
         self.order_info = QTextBrowser()
-        self.order_info.setStyleSheet("""
-            QTextBrowser {
-                font-size: 14px;
-                padding: 16px;
-                background-color: #ffffff;
-                border: 1px solid #ddd;
-                border-radius: 10px;
-                color: #333;
-            }
-            h3, h4 {
-                margin-top: 16px;
-                margin-bottom: 8px;
-                font-weight: bold;
-                color: #2d3436;
-                border-bottom: 1px solid #ccc;
-                padding-bottom: 4px;
-            }
-            p {
-                margin: 8px 0;
-                line-height: 1.5em;
-            }
-            ul {
-                margin: 0 0 12px 20px;
-                padding-left: 0;
-            }
-            li {
-                margin-bottom: 6px;
-                line-height: 1.4em;
-            }
-            b {
-                color: #2d3436;
-            }
-        """)
+        self.order_info.setStyleSheet("background-color: #f9f9f9; font-size: 13px;")
+        self.order_info.setMinimumWidth(350)
+        left_panel.addWidget(self.order_info, 1)
 
-        title = QLabel("📄 Sheet Details")
-        title.setStyleSheet("""
-            QLabel {
-                font-size: 16px;
-                font-weight: bold;
-                margin-bottom: 8px;
-                color: #2d3436;
-            }
-        """)
-        scroll_layout.addWidget(title)
-        scroll_layout.addWidget(self.order_info)
+        controls = QHBoxLayout()
+        self.btn_prev = QPushButton("⬅️ Previous")
+        self.btn_prev.clicked.connect(self.prev_sheet)
+        self.btn_next = QPushButton("Next ➡️")
+        self.btn_next.clicked.connect(self.next_sheet)
+        self.btn_refresh = QPushButton("🔁 Qty")
+        self.btn_refresh.clicked.connect(self.refresh_raw_quantities)
+        self.controls_layout = QHBoxLayout()
+        self.btn_start = QPushButton("▶️ Start")
+        self.btn_start.clicked.connect(lambda: self.update_status("Started"))
 
+        self.btn_partial = QPushButton("🟡 Complete Partially")
+        self.btn_partial.clicked.connect(lambda: self.update_status("Partially Completed"))
 
-        # Sheet nav buttons
-        nav = QHBoxLayout()
-        self.prev_btn = QPushButton("⬅ Previous")
-        self.next_btn = QPushButton("Next ➡")
-        self.sheet_label = QLabel("Sheet 1")
-        self.prev_btn.clicked.connect(self.prev_sheet)
-        self.next_btn.clicked.connect(self.next_sheet)
-        nav.addWidget(self.prev_btn)
-        nav.addWidget(self.sheet_label)
-        nav.addWidget(self.next_btn)
-        scroll_layout.addLayout(nav)
+        self.btn_done = QPushButton("✅ Complete Order")
+        self.btn_done.clicked.connect(lambda: self.update_status("Completed"))
 
-        # Status control buttons
-        btns = QHBoxLayout()
-        self.edit_btn = QPushButton("✏️ Edit")
-        self.in_progress_btn = QPushButton("🚧 Mark In Progress")
-        self.completed_btn = QPushButton("✅ Mark Completed")
-        self.reject_btn = QPushButton("❌ Reject")
-        self.delete_btn = QPushButton("🗑️ Delete")
+        self.btn_reject = QPushButton("❌ Reject")
+        self.btn_reject.clicked.connect(lambda: self.update_status("Rejected"))
+        self.btn_reject.clicked.connect(self.reject_order)
+
+        controls.addWidget(self.btn_prev)
+        controls.addWidget(self.btn_next)
+        controls.addWidget(self.btn_refresh)
+        controls.addStretch()
+        controls.addWidget(self.btn_done)
+        controls.addWidget(self.btn_reject)
+        left_panel.addLayout(controls)
+
+        # === Right Panel (Canvas) ===
+        self.canvas = PannableGraphicsView()
+        self.canvas.setMinimumSize(700, 700)
+        self.scene = self.canvas.scene
+
+        # Add both panels to main layout
+        main_layout.addLayout(left_panel, 1)
+        main_layout.addWidget(self.canvas, 2)
+
+        self.refresh_view()
         
-        self.edit_btn.clicked.connect(self.edit_order)
-        self.in_progress_btn.clicked.connect(lambda: self.update_status("In Progress"))
-        self.completed_btn.clicked.connect(lambda: self.update_status("Completed"))
-        self.reject_btn.clicked.connect(lambda: self.update_status("Rejected"))
-        self.delete_btn.clicked.connect(self.delete_order)
-
-        for b in [self.edit_btn, self.in_progress_btn, self.completed_btn, self.reject_btn, self.delete_btn]:
-            btns.addWidget(b)
-
-        scroll_layout.addLayout(btns)
-
-        scroll.setWidget(scroll_content)
-        left.addWidget(scroll)
-        main_layout.addLayout(left, 3)
-
-        # Right: canvas
-        self.scene = QGraphicsScene()
-        self.canvas = PannableGraphicsView(self.scene)
-        self.canvas.setRenderHint(QPainter.Antialiasing)
-        main_layout.addWidget(self.canvas, 4)
-
-        if self.order_data.get("sheets"):
-            self.load_sheet(0)
-
     def show_loader(self, parent, title="Please wait...", message="Processing..."):
         loader = QProgressDialog(message, None, 0, 0, parent)
         loader.setWindowModality(Qt.WindowModal)
@@ -245,253 +191,224 @@ class RefactoredOrderDialog(QDialog):
         loader.show()
         QApplication.processEvents()
         return loader
-
-    def edit_order(self):
-        self.close()
-        self.win = ManufacturingModule(edit_data=self.order_data, doc_id=self.order_data.get("id"))
-        self.win.setAttribute(Qt.WA_DeleteOnClose)
-
-        if self.dashboard:
-            self.dashboard.open_windows.append(self.win)
-            self.win.destroyed.connect(lambda: self.dashboard.open_windows.remove(self.win))
-
-        self.win.show()
-        
     
-    def get_selected_branch(self):
-        branches = self.user_data.get("branch", [])
-        if isinstance(branches, str):
-            return branches
-        if isinstance(branches, list):
-            if len(branches) == 1:
-                return branches[0]
-            selected, ok = QInputDialog.getItem(
-                self, "Select Branch", "Choose branch to update inventory:",
-                branches, 0, False
-            )
-            if ok:
-                return selected
-        return None
+    def refresh_status_controls(self):
+        # Clear previous buttons
+        for i in reversed(range(self.controls_layout.count())):
+            widget = self.controls_layout.itemAt(i).widget()
+            if widget:
+                self.controls_layout.removeWidget(widget)
+                widget.deleteLater()
 
-    def update_status(self, status):
-        if status != "Completed":
-            try:
-                db.collection("manufacturing_orders").document(self.order_data.get("id")).update({"status": status})
-                QMessageBox.information(self, "Success", f"Status updated to {status}")
-                self.accept()
-            except Exception as e:
-                QMessageBox.critical(self, "Error", str(e))
+        status = self.order_data.get("status", "Pending")
+
+        if status == "Pending":
+            self.controls_layout.addWidget(self.btn_start)
+            self.controls_layout.addWidget(self.btn_reject)
+        elif status == "Started":
+            self.controls_layout.addWidget(self.btn_done)
+            self.controls_layout.addWidget(self.btn_partial)
         else:
-            self.complete_manufacturing()
+            notice = QLabel("🛑 No actions available.")
+            notice.setStyleSheet("color: gray; font-style: italic;")
+            self.controls_layout.addWidget(notice)
+        
+    def refresh_raw_quantities(self):
+        loader = self.show_loader(self, "Refreshing", "Fetching updated quantities...")
 
-            
-    def complete_manufacturing(self):
         try:
-            selected_branch = self.get_selected_branch()
-            if not selected_branch:
-                QMessageBox.warning(self, "Branch Required", "No branch selected.")
-                return
-
-            sheets = self.order_data.get("sheets", [])  
-            order_id = self.order_data.get("id")
-
+            sheets = self.order_data.get("sheets", [])
             for sheet in sheets:
-                raw_qty = int(sheet.get("raw_qty", 1))
-                raw_ref = sheet.get("raw_item", {}).get("raw_ref")
+                raw_item = sheet.get("raw_item")
+                if not raw_item:
+                    continue
 
-                if raw_ref:
-                    raw_doc = raw_ref.get()
-                    raw_data = raw_doc.to_dict()
+                raw_id = raw_item.get("id")
+                branch = raw_item.get("branch")
+                color = raw_item.get("color")
+                condition = raw_item.get("condition")
 
-                    # Subtract raw material
-                    qty_field = raw_data.get("qty", {})
-                    qty_field[selected_branch] = qty_field.get(selected_branch, 0) - raw_qty
-                    raw_ref.update({"qty": qty_field})
+                if not all([raw_id, branch, color, condition]):
+                    continue
 
-                    # Handle leftover
-                    if "width" in raw_data and "length" in raw_data:
-                        total_area = float(raw_data.get("width", 0)) * float(raw_data.get("length", 0))
-                        used_area = sum(
-                            float(cut.get("length", 0)) * float(cut.get("width", 0))
-                            for cut in sheet.get("cuts", []) if "length" in cut and "width" in cut
-                        )
-                        leftover_area = total_area - used_area
+                # 🔄 Fetch latest data from Firestore
+                doc = db.collection("products").document(raw_id).get()
+                if not doc.exists:
+                    continue
 
-                        if leftover_area > 0:
-                            reply = QMessageBox.question(
-                                self, "Add Waste?",
-                                "Add leftover material to inventory?",
-                                QMessageBox.Yes | QMessageBox.No
-                            )
-                            if reply == QMessageBox.Yes:
-                                leftover_width = float(raw_data.get("width", 1))
-                                leftover_length = round(leftover_area / leftover_width, 2)
+                product_data = doc.to_dict()
+                qty_data = product_data.get("qty", {})
+                updated_qty = qty_data.get(branch, {}).get(color, {}).get(condition, 0)
 
-                                db.collection("products").add({
-                                    "name": f"Leftover from {raw_data.get('name', '')}",
-                                    "category": "Raw Material",
-                                    "subcategory": "Metal Sheet",
-                                    "width": leftover_width,
-                                    "length": leftover_length,
-                                    "width_unit": raw_data.get("width_unit"),
-                                    "length_unit": raw_data.get("length_unit"),
-                                    "qty": {selected_branch: raw_qty}
-                                })
+                sheet["raw_item"]["available_qty"] = updated_qty
 
-                # Add finished products
-                for prod in sheet.get("products", []):
-                    prod_ref = prod.get("product_ref")
-                    if prod_ref:
-                        prod_doc = prod_ref.get()
-                        prod_data = prod_doc.to_dict()
-                        qty_field = prod_data.get("qty", {})
-                        qty_field[selected_branch] = qty_field.get(selected_branch, 0) + (prod.get("qty", 1) * raw_qty)
-                        prod_ref.update({"qty": qty_field})
-
-            db.collection("manufacturing_orders").document(order_id).update({"status": "Completed"})
-            QMessageBox.information(self, "Completed", "Order marked as completed and inventory updated.")
-            self.accept()
-
+            QMessageBox.information(self, "Refreshed", "Inventory quantities have been updated.")
+            self.refresh_view()  # ✅ redraw updated info
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Completion failed: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to refresh quantities:\n{e}")
+        finally:
+            loader.close()
 
 
-
-    def delete_order(self):
-        confirm = QMessageBox.question(self, "Confirm Delete", "Are you sure you want to delete this order?")
-        if confirm == QMessageBox.Yes:
-            db.collection("manufacturing_orders").document(self.order_data.get("id")).delete()
-            self.accept()
+    def refresh_view(self):
+        sheets = self.order_data.get("sheets", [])
+        if not sheets:
+            self.order_info.setHtml("<h3>No sheets found for this order.</h3>")
+            return
+        self.current_index = max(0, min(self.current_index, len(sheets) - 1))
+        sheet = sheets[self.current_index]
+        self.setWindowTitle(f"🧾 Order View — Sheet {self.current_index + 1} of {len(sheets)}")
+        self.draw_sheet(sheet)
+        self.update_info_text(sheet)
 
     def prev_sheet(self):
-        if self.sheet_index > 0:
-            self.sheet_index -= 1
-            self.load_sheet(self.sheet_index)
+        if self.current_index > 0:
+            self.current_index -= 1
+            self.refresh_view()
 
     def next_sheet(self):
-        if self.sheet_index + 1 < len(self.order_data.get("sheets", [])):
-            self.sheet_index += 1
-            self.load_sheet(self.sheet_index)
+        if self.current_index < len(self.order_data.get("sheets", [])) - 1:
+            self.current_index += 1
+            self.refresh_view()
 
-    def load_sheet(self, index):
-        sheets = self.order_data.get("sheets", [])
-        if not sheets or index >= len(sheets):
-            return
+    def mark_completed(self):
+        self.update_status("Completed")
 
-        sheet = sheets[index]
-        self.sheet_label.setText(f"📄 Sheet {index + 1} of {len(sheets)}")
-        self.update_info_text(sheet)
-        self.draw_sheet(sheet)
+    def reject_order(self):
+        self.update_status("Rejected")
+
+    def update_status(self, new_status):
+        status_labels = {
+            "Started": "start this order",
+            "Completed": "mark this order as completed",
+            "Partially Completed": "mark this order as partially completed",
+            "Rejected": "reject this order"
+        }
+
+        label = status_labels.get(new_status, f"change the status to '{new_status}'")
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Status Change",
+            f"Are you sure you want to {label}?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        if confirm != QMessageBox.Yes:
+            return  # User cancelled
+
+        try:
+            db.collection("manufacturing_orders").document(self.order_data["id"]).update({
+                "status": new_status
+            })
+            QMessageBox.information(self, "Status Updated", f"Order marked as {new_status}.")
+            self.close()
+        except Exception as e:
+            QMessageBox.critical(self, "Update Failed", str(e))
+
+    def draw_sheet(self, sheet):
+        dummy = ManufacturingModule()
+        raw_item = sheet.get("raw_item", {})
+        raw_ref = raw_item.get("raw_ref")
+        if isinstance(raw_ref, str):
+            raw_ref = db.document(raw_ref)
+
+        try:
+            item_data = raw_ref.get().to_dict() if raw_ref else {}
+        except:
+            item_data = {}
+
+        dummy.item_dropdown.clear()
+        dummy.item_dropdown.addItem(raw_item.get("name", "Unknown"), item_data)
+        dummy.item_dropdown.setCurrentIndex(0)
+
+        cuts = sheet.get("cuts", [])
+        is_pipe = "pipe" in sheet.get("raw_subcat", "").lower()
+
+        if is_pipe:
+            dummy = ManufacturingModule()
+            dummy.item_dropdown.clear()
+            dummy.item_dropdown.addItem(raw_item.get("name", "Unknown"), item_data)
+            dummy.item_dropdown.setCurrentIndex(0)
+
+            dummy.sheet_data[0] = {
+                "cuts": [ [c.get("height", 0)] for c in cuts ]
+            }
+
+            dummy.simulate_pipe_cutting(item_data)
+
+            self.scene = dummy.scene
+            self.canvas.setScene(self.scene)
+        else:
+            rectangles = []
+            for c in cuts:
+                try:
+                    length = float(c.get("length", 0))
+                    width = float(c.get("width", 0))
+                    length_str = c.get("length_raw", str(length))
+                    width_str = c.get("width_raw", str(width))
+                    is_bracket = c.get("is_bracket", False)
+                    rectangles.append((length, width, length_str, width_str, is_bracket))
+                except:
+                    pass
+
+            dummy.sheet_data[0] = {"cuts": rectangles}
+            dummy.simulate_cutting()
+
+        self.scene = dummy.scene
+        self.canvas.setScene(self.scene)
 
     def update_info_text(self, sheet):
-        raw_item = sheet.get("raw_item", {}).get("name", "N/A")
-        raw_qty = sheet.get("raw_qty", "?")
-        subcat = sheet.get("raw_subcat", "?")
-        status = self.order_data.get("status", "Pending")
-        
-        # Hide/disable buttons based on status
-        if status == "Pending":
-            self.completed_btn.hide()
-        elif status == "In Progress":
-            self.in_progress_btn.hide()
-            self.reject_btn.hide()
-        elif status in ["Completed", "Rejected"]:
-            for btn in [self.edit_btn, self.in_progress_btn, self.completed_btn, self.reject_btn, self.delete_btn]:
-                btn.setDisabled(True)
-                btn.setStyleSheet("color: gray; background-color: #eee;")
+        raw_item_data = sheet.get("raw_item", {})
+        raw_ref = raw_item_data.get("raw_ref")
+        product_doc = raw_ref.get().to_dict() if raw_ref else {}
+
+        item_code = product_doc.get("item_code", "N/A")
+        name = product_doc.get("name", "N/A")
+        l_unit = product_doc.get("length_unit", "L")
+        w_unit = product_doc.get("width_unit", "W")
+        h_unit = product_doc.get("height_unit", "H")
+        length = product_doc.get("length", 0)
+        width = product_doc.get("width", 0)
+        height = product_doc.get("height", 0)
+        metal_type = product_doc.get("metal_type", "N/A")
+        notes = self.order_data.get("notes", "").strip()
+
+        formatted_name = f"{item_code} - {name} - {length}{l_unit} x {width}{w_unit} x {height}{h_unit} - {metal_type}"
+
+        color = raw_item_data.get("color", "N/A")
+        condition = raw_item_data.get("condition", "N/A")
+        branch = raw_item_data.get("branch", "N/A")
+        raw_qty = int(raw_item_data.get("qty", 1))
+        qty_data = product_doc.get("qty", {}).get(branch, {}).get(color, {}).get(condition, 0)
 
         cuts = sheet.get("cuts", [])
         products = sheet.get("products", [])
 
         cut_lines = "".join(
-            f"<li>{cut['height_raw']} height</li>" if "height_raw" in cut
-            else f"<li>{cut['length_raw']} x {cut['width_raw']}</li>"
+            f"<li>{cut.get('height_raw', '?')} height</li>" if "height" in cut
+            else f"<li>{cut.get('length_raw', '?')} x {cut.get('width_raw', '?')} {'(Bracket)' if cut.get('is_bracket') else ''}</li>"
             for cut in cuts
         )
 
         prod_lines = "".join(
-            f"<li>{p['name']} = <b>{int(p['qty'])*int(raw_qty)}</b></li>" for p in products
+            f"<li>{p.get('name', '?')}: {int(p.get('qty', 0))} x {raw_qty} = <b>{int(p.get('qty', 0)) * raw_qty}</b></li>"
+            for p in products
         )
 
         html = f"""
-        <h3 style='margin-bottom:5px;'>🔹 Raw Material</h3>
-        <p><b>{raw_item}</b> <i>({subcat})</i><br><br>
-        <b>Quantity:</b> {raw_qty}<br><br>
-        <b>Status:</b> {status}</p>
+        <h3>🔹 Raw Material</h3>
+        <p><b>{formatted_name}</b><br>
+        🎨 Color: {color}<br>
+        🧪 Condition: {condition}<br>
+        📦 Available in Inventory: {qty_data}<br>
+        🧾 Required Quantity: {raw_qty}<br>
         <hr>
         <h4>✂️ Cuts</h4>
         <ul>{cut_lines}</ul>
         <h4>📦 Products</h4>
         <ul>{prod_lines}</ul>
+        <h4>📝 Notes</h4>
+        <ul>{notes}</ul>
+        </p>
         """
-
         self.order_info.setHtml(html)
-        
-
-    def draw_sheet(self, sheet):
-        loader = self.show_loader(self, "Rendering Sheet", "Generating layout view...")
-        self.scene.clear()
-        self.canvas.resetTransform()
-
-        try:
-            raw_item = sheet.get("raw_item", {})
-            raw_ref = raw_item.get("raw_ref")
-            if isinstance(raw_ref, str):
-                raw_ref = db.document(raw_ref)
-
-            item_data = raw_ref.get().to_dict() if raw_ref else {}
-            if not item_data:
-                raise ValueError("Could not fetch raw material data.")
-
-            dummy = ManufacturingModule()
-            cuts = sheet.get("cuts", [])
-            subcat = sheet.get("raw_subcat", "").lower()
-
-            dummy.item_dropdown.clear()
-            dummy.item_dropdown.addItem(raw_item.get("name", "Unknown"), item_data)
-            dummy.item_dropdown.setCurrentIndex(0)
-
-            if "pipe" in subcat:
-                segments = [c.get("height") for c in cuts if "height" in c]
-                leftover = float(item_data.get("height", 0)) - sum(segments)
-                if leftover > 0:
-                    segments.append(leftover)
-                dummy.draw_pipe_stack(segments)
-            else:
-                rectangles = []
-                for c in cuts:
-                    try:
-                        length = float(c.get("length", 0))
-                        width = float(c.get("width", 0))
-                        length_str = c.get("length_raw", str(length))
-                        width_str = c.get("width_raw", str(width))
-                        rectangles.append((length, width, length_str, width_str))
-                    except Exception as e:
-                        print("Error parsing cut:", c, "|", e)
-                sheet_w = float(item_data.get("width", 48))
-                sheet_h = float(item_data.get("length", 96))
-                dummy.sheet_tabs.setCurrentIndex(0)
-                dummy.sheet_data[0] = {
-                    "cuts": rectangles  # ensure proper labels reach draw_canvas
-                }
-                placements = dummy.place_rectangles(sheet_w, sheet_h, rectangles)
-                dummy.draw_canvas(sheet_w, sheet_h, placements)
-
-            self.scene = dummy.scene
-            self.canvas.setScene(self.scene)
-
-        except Exception as e:
-            print("Draw error:", e)
-            self.order_info.setHtml(f"<span style='color:red;'>Error drawing sheet: {str(e)}</span>")
-
-        finally:
-            loader.close()
-
-
-if __name__ == "__main__":
-    from PyQt5.QtWidgets import QApplication
-    import sys
-    app = QApplication(sys.argv)
-    win = ViewManufacturingWindow()
-    win.show()
-    sys.exit(app.exec_())
