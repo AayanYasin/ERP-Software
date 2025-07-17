@@ -367,8 +367,8 @@ class ManufacturingModule(QWidget):
             if is_pipe:
                 # Pipe mode expects just height
                 parts = clean_text.replace("height", "").strip().split()
-                inch = parts[0]
-                soot = parts[1] if len(parts) > 1 else "0"
+                inch = parts[0].replace("\"", "")
+                soot = parts[1].replace("\"", "") if len(parts) > 1 else "0"
 
                 self.cut_length.setText(inch)
                 self.length_soot.setCurrentText(soot)
