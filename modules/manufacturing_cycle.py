@@ -722,7 +722,7 @@ class ManufacturingModule(QWidget):
             return f"{inches}"
         return f"{inches} {fraction.numerator}/{fraction.denominator}"
 
-    def scan_waste_blocks(sel, sheet_w, sheet_h, rects, scan_direction="top", resolution=8):
+    def scan_waste_blocks(self, sheet_w, sheet_h, rects, scan_direction="top", resolution=8):
         grid_w = int(sheet_w * resolution)
         grid_h = int(sheet_h * resolution)
         used = [[False for _ in range(grid_w)] for _ in range(grid_h)]
@@ -1066,26 +1066,47 @@ class ManufacturingModule(QWidget):
             else:
                 w, h = rect
 
-            # If current row has enough horizontal space
+            placed = False
+
+            # Try to place in current row
             if current_x + w <= sheet_w:
                 used.append((current_x, current_y, w, h))
                 current_x += w
                 row_height = max(row_height, h)
+                placed = True
             else:
-                # Move to next row
+                # Move to new row
                 current_y += row_height
-                if current_y + h > sheet_h:
-                    loader = self.show_loader(self, "Size Error", f"Not enough space for cut {w} x {h} inch, Trying to Auto Adjust Sheet...")
-                    self.auto_optimize_sheet()
-                    loader.close()
-                    return
-                # Start new row
-                current_x = 0
-                row_height = h
-                used.append((current_x, current_y, w, h))
-                current_x += w
+                if current_y + h <= sheet_h:
+                    current_x = 0
+                    row_height = h
+                    used.append((current_x, current_y, w, h))
+                    current_x += w
+                    placed = True
+
+            if not placed:
+                # Attempt to fit in waste blocks
+                waste_blocks = self.find_all_waste_blocks(sheet_w, sheet_h, used)
+                for wx, wy, ww, wh in waste_blocks:
+                    if w <= ww and h <= wh:
+                        used.append((wx, wy, w, h))
+                        placed = True
+                        break
+                    # Try rotated if it helps
+                    elif h <= ww and w <= wh:
+                        used.append((wx, wy, h, w))  # swap w/h
+                        placed = True
+                        break
+
+            if not placed:
+                # Final fallback: auto optimize
+                loader = self.show_loader(self, "Size Error", f"Not enough space for cut {w} x {h} inch, Trying to Auto Adjust Sheet...")
+                self.auto_optimize_sheet()
+                loader.close()
+                return
 
         return used
+
 
 
 
