@@ -11,6 +11,7 @@ from firebase_admin import firestore
 from fractions import Fraction
 from collections import Counter
 from math import ceil
+from itertools import permutations
 
 class PannableGraphicsView(QGraphicsView):
     def __init__(self, scene=None):
@@ -1057,49 +1058,89 @@ class ManufacturingModule(QWidget):
         current_y = 0
         row_height = 0
         current_x = 0
+        scan_resolution = 8
 
         for rect in rectangles:
-            if len(rect) == 4:
-                w, h = rect[0], rect[1]
-            elif len(rect) == 3:
+            if len(rect) >= 2:
                 w, h = rect[0], rect[1]
             else:
-                w, h = rect
+                continue
 
             placed = False
 
-            # Try to place in current row
-            if current_x + w <= sheet_w:
+            # === 1. Try placing in current row ===
+            if current_x + w <= sheet_w and current_y + h <= sheet_h:
                 used.append((current_x, current_y, w, h))
                 current_x += w
                 row_height = max(row_height, h)
                 placed = True
-            else:
-                # Move to new row
-                current_y += row_height
-                if current_y + h <= sheet_h:
+
+            # === 2. Try placing in new row ===
+            if not placed:
+                new_y = current_y + row_height
+                if new_y + h <= sheet_h:
+                    current_y = new_y
                     current_x = 0
                     row_height = h
                     used.append((current_x, current_y, w, h))
                     current_x += w
                     placed = True
 
+            # === 3. Try placing in waste blocks ===
             if not placed:
-                # Attempt to fit in waste blocks
                 waste_blocks = self.find_all_waste_blocks(sheet_w, sheet_h, used)
                 for wx, wy, ww, wh in waste_blocks:
-                    if w <= ww and h <= wh:
+                    if w <= ww and h <= wh and wx + w <= sheet_w and wy + h <= sheet_h:
                         used.append((wx, wy, w, h))
                         placed = True
                         break
-                    # Try rotated if it helps
-                    elif h <= ww and w <= wh:
-                        used.append((wx, wy, h, w))  # swap w/h
+                    elif h <= ww and w <= wh and wx + h <= sheet_w and wy + w <= sheet_h:
+                        used.append((wx, wy, h, w))  # rotated
                         placed = True
                         break
 
+            # === 4. Last resort: full sheet scan for a fit ===
             if not placed:
-                # Final fallback: auto optimize
+                grid_w = int(sheet_w * scan_resolution)
+                grid_h = int(sheet_h * scan_resolution)
+                grid = [[False for _ in range(grid_w)] for _ in range(grid_h)]
+
+                for ux, uy, uw, uh in used:
+                    for dx in range(int(uw * scan_resolution)):
+                        for dy in range(int(uh * scan_resolution)):
+                            gx = int((ux + dx / scan_resolution) * scan_resolution)
+                            gy = int((uy + dy / scan_resolution) * scan_resolution)
+                            if 0 <= gx < grid_w and 0 <= gy < grid_h:
+                                grid[gy][gx] = True
+
+                for gy in range(grid_h):
+                    for gx in range(grid_w):
+                        x_pos = gx / scan_resolution
+                        y_pos = gy / scan_resolution
+
+                        if x_pos + w > sheet_w or y_pos + h > sheet_h:
+                            continue
+
+                        fits = True
+                        for dy in range(int(h * scan_resolution)):
+                            for dx in range(int(w * scan_resolution)):
+                                cx = gx + dx
+                                cy = gy + dy
+                                if cx >= grid_w or cy >= grid_h or grid[cy][cx]:
+                                    fits = False
+                                    break
+                            if not fits:
+                                break
+
+                        if fits:
+                            used.append((x_pos, y_pos, w, h))
+                            placed = True
+                            break
+                    if placed:
+                        break
+
+            # === 5. Auto-optimize fallback if nothing worked ===
+            if not placed:
                 loader = self.show_loader(self, "Size Error", f"Not enough space for cut {w} x {h} inch, Trying to Auto Adjust Sheet...")
                 self.auto_optimize_sheet()
                 loader.close()
