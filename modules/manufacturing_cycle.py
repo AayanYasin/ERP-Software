@@ -1,7 +1,7 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QLineEdit, QPushButton, QListWidget, QListWidgetItem,
     QGraphicsScene, QGraphicsView, QGraphicsRectItem, QHBoxLayout, QGraphicsTextItem, QGraphicsEllipseItem,
-    QComboBox, QMessageBox, QTabWidget, QCheckBox, QSpinBox, QProgressDialog, QApplication, QGraphicsLineItem
+    QComboBox, QMessageBox, QTabWidget, QCheckBox, QSpinBox, QProgressDialog, QApplication, QGraphicsLineItem, QSizePolicy
 )
 from PyQt5.QtGui import QBrush, QColor, QPen, QPainter, QFont, QTransform
 from PyQt5.QtCore import Qt
@@ -146,10 +146,20 @@ class ManufacturingModule(QWidget):
         button_row = QHBoxLayout()
         self.add_cut_btn = QPushButton("Add Cut")
         self.remove_cut_btn = QPushButton("Remove Cut")
-        button_row.addWidget(self.add_cut_btn)
-        button_row.addWidget(self.remove_cut_btn)
+        self.sort_toggle = QCheckBox("🔀 Auto-Sort")
+        self.sort_toggle.setChecked(True)
+        self.sort_toggle.setToolTip("When ON, auto-sorts cut sizes for optimal layout.")
+        # ✅ Ensure the checkbox doesn't expand unnecessarily
+        self.sort_toggle.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        # Add buttons first so they take the stretch
+        button_row.addWidget(self.add_cut_btn, stretch=1)
+        button_row.addWidget(self.remove_cut_btn, stretch=1)
+        # Checkbox gets no stretch — it only takes what it needs
+        button_row.addWidget(self.sort_toggle, stretch=0)
+        # Connect actions
         self.add_cut_btn.clicked.connect(self.add_cut_size)
         self.remove_cut_btn.clicked.connect(self.remove_selected_cut)
+        # Add to layout
         left_layout.addLayout(button_row)
 
         # Action buttons
@@ -626,29 +636,67 @@ class ManufacturingModule(QWidget):
 
 
     def remove_selected_cut(self):
-        row = self.cut_list.currentRow()
-        if row >= 0:
-            self.cut_list.takeItem(row)
+        try:
+            row = self.cut_list.currentRow()
+            if row < 0:
+                return
+
             index = self.sheet_tabs.currentIndex()
-            if index in self.sheet_data:
-                try:
-                    del self.sheet_data[index]["cuts"][row]
+            if index not in self.sheet_data:
+                return
 
-                    # ✅ Clear input fields
-                    self.cut_length.clear()
-                    self.cut_width.clear()
-                    self.length_soot.setCurrentIndex(0)
-                    self.width_soot.setCurrentIndex(0)
-                    self.bracket_checkbox.setChecked(False)
+            cuts = self.sheet_data[index]["cuts"]
+            if not cuts:
+                return
 
-                    # ✅ Simulate or show blank if no cuts left
-                    if self.sheet_data[index]["cuts"]:
-                        self.simulate_cutting()
-                    else:
-                        self.show_empty_raw()
+            # Determine how many to remove
+            qty_to_remove = 1
+            if self.cut_qty.text().isdigit():
+                qty_to_remove = int(self.cut_qty.text())
+                if qty_to_remove <= 0:
+                    qty_to_remove = 1
 
-                except IndexError:
-                    pass
+            # Get the label of selected row
+            selected_label = self.cut_list.item(row).text().strip()
+
+            # Build label for comparison (same as simulate_cutting)
+            def make_label(cut):
+                label = f"{cut[2]} x {cut[3]}"
+                if cut[4]:
+                    label += " - Bracket"
+                return label
+
+            # Remove matching cuts
+            new_cuts = []
+            removed_count = 0
+            for cut in cuts:
+                if removed_count < qty_to_remove and make_label(cut) == selected_label:
+                    removed_count += 1
+                    continue  # skip this one (remove)
+                new_cuts.append(cut)
+
+            # Update data
+            self.sheet_data[index]["cuts"] = new_cuts
+
+            # Clear input fields
+            self.cut_length.clear()
+            self.cut_width.clear()
+            self.length_soot.setCurrentIndex(0)
+            self.width_soot.setCurrentIndex(0)
+            self.bracket_checkbox.setChecked(False)
+            self.cut_qty.clear()
+
+            # ✅ Always refresh cut list and canvas
+            if new_cuts:
+                self.simulate_cutting()
+            else:
+                self.cut_list.clear()
+                self.show_empty_raw()
+
+        except Exception as e:
+            print("Remove cut error:", e)
+
+
 
     def zoom_in(self):
         self.canvas.scale(1.25, 1.25)
@@ -666,6 +714,8 @@ class ManufacturingModule(QWidget):
 
             self.bracket_checkbox.setChecked(False)
             self.bracket_checkbox.setDisabled(True)
+            self.sort_toggle.setDisabled(True)
+            self.sort_toggle.setToolTip("Sorting not applicable in pipe mode.")
 
         else:
             # Sheet mode: enable width and bracket
@@ -673,8 +723,30 @@ class ManufacturingModule(QWidget):
             self.width_soot.setDisabled(False)
             self.cut_width.setPlaceholderText("Height")
             self.cut_length.setPlaceholderText("Width")
+            self.sort_toggle.setDisabled(False)
+            self.sort_toggle.setToolTip("Enable to auto-sort cut sizes")
 
             self.bracket_checkbox.setDisabled(False)
+            
+    def smart_group_sort(self, raw_pieces):
+        from collections import defaultdict
+
+        # Group identical parts by (width, height)
+        grouped = defaultdict(list)
+        for piece in raw_pieces:
+            grouped[(piece[2], piece[3])].append(piece)  # use string widths and heights
+
+        def smart_sort_key(k):
+            w = self.parse_inches(k[0])
+            h = self.parse_inches(k[1])
+            count = len(grouped[k])
+            if w == 0:
+                return (0, 0, 0)
+            ratio = h / w
+            return (-ratio * count, -count, -h)
+
+        sorted_keys = sorted(grouped.keys(), key=smart_sort_key)
+        return [piece for key in sorted_keys for piece in grouped[key]]
 
     def simulate_cutting(self):
         index = self.item_dropdown.currentIndex()
@@ -705,12 +777,52 @@ class ManufacturingModule(QWidget):
             sheet_h = convert_to_inches(raw_length, length_unit)
 
             raw_cuts = self.sheet_data.get(self.sheet_tabs.currentIndex(), {}).get("cuts", [])
-            # Convert to 4-tuple for layout placement only
-            cuts_for_placement = [(c[0], c[1]) for c in raw_cuts if len(c) >= 2]
-            placements = self.place_rectangles(sheet_w, sheet_h, cuts_for_placement)
-            if not placements:
+            # Step 1: Sort cuts using smart grouping if on
+            if self.sort_toggle.isChecked():
+                sorted_cuts = self.smart_group_sort(raw_cuts)
+            else:
+                sorted_cuts = raw_cuts[:]
+
+            # Step 2: Convert to (w, h, label, is_bracket)
+            cuts_for_placement = [
+                (
+                    self.parse_inches(c[2]),
+                    self.parse_inches(c[3]),
+                    f"{c[2]} x {c[3]}",
+                    c[4]
+                )
+                for c in sorted_cuts if len(c) == 5
+            ]
+            used_rects, unplaced = self.place_rectangles(sheet_w, sheet_h, cuts_for_placement)
+            if not used_rects:
                 return
-            self.draw_canvas(sheet_w, sheet_h, placements)
+            
+            self.draw_canvas(sheet_w, sheet_h, used_rects)
+            
+            # ✅ Always update cut_list with visual highlighting
+            # ✅ Count how many times each label was placed
+            placed_label_counts = Counter([
+                f"{label} - Bracket" if is_bracket else label
+                for _, _, _, _, label, is_bracket in used_rects
+            ])
+
+            self.cut_list.clear()
+
+            for c in sorted_cuts:
+                if len(c) == 5:
+                    label = f"{c[2]} x {c[3]}"
+                    if c[4]:
+                        label += " - Bracket"
+
+                    item = QListWidgetItem(label)
+
+                    if placed_label_counts[label] > 0:
+                        placed_label_counts[label] -= 1  # Mark one as placed
+                    else:
+                        item.setBackground(QColor("#ffe6e6"))  # 🔴 Light red
+                        item.setToolTip("❌ Not placed on sheet")
+
+                    self.cut_list.addItem(item)
 
         except Exception as e:
             print("Simulation error:", e)
@@ -728,7 +840,7 @@ class ManufacturingModule(QWidget):
         grid_h = int(sheet_h * resolution)
         used = [[False for _ in range(grid_w)] for _ in range(grid_h)]
 
-        for x, y, w, h in rects:
+        for x, y, w, h, *_ in rects:
             for dx in range(ceil(w * resolution)):
                 for dy in range(ceil(h * resolution)):
                     px = int((x * resolution) + dx)
@@ -812,7 +924,7 @@ class ManufacturingModule(QWidget):
         index = self.sheet_tabs.currentIndex()
         cuts_with_labels = self.sheet_data.get(index, {}).get("cuts", [])
 
-        for i, (x, y, w, h) in enumerate(rects):
+        for i, (x, y, w, h, label, is_bracket) in enumerate(rects):
             used_area += w * h
             rect_item = QGraphicsRectItem(x * scale, y * scale, w * scale, h * scale)
             rect_item.setBrush(QBrush(QColor("#74b9ff")))
@@ -820,21 +932,8 @@ class ManufacturingModule(QWidget):
             self.scene.addItem(rect_item)
 
             # Match original cut label
-            original_label = f"{w:.2f} x {h:.2f} inch"
-            is_bracket = False
-            if i < len(cuts_with_labels):
-                cut_data = cuts_with_labels[i]
-                if len(cut_data) >= 5:
-                    is_bracket = cut_data[4]
-                    original_label = f"{cut_data[2]} x {cut_data[3]} inch"
-                    # if is_bracket:
-                    #     original_label += " - Bracket"
-                else:
-                    is_bracket = False
-                    original_label = f"{cut_data[2]} x {cut_data[3]} inch"
-            else:
-                is_bracket = False
-                original_label = f"{w:.2f} x {h:.2f} inch"
+            original_label = label
+            
 
             min_dim = min(w, h)
             font_size = max(6, min(14, int(min_dim * scale * 0.2)))
@@ -886,15 +985,9 @@ class ManufacturingModule(QWidget):
         # === Summary ===
         # Count cut usage
         usage_counter = Counter()
-        for i, (x, y, w, h) in enumerate(rects):
-            if i < len(cuts_with_labels):
-                c = cuts_with_labels[i]
-                if len(c) >= 5 and c[4]:
-                    label = f"{c[2]} x {c[3]} inch - Bracket"
-                else:
-                    label = f"{c[2]} x {c[3]} inch"
-            else:
-                label = f"{w:.2f} x {h:.2f} inch"
+        for i, (x, y, w, h, label, is_bracket) in enumerate(rects):
+            if is_bracket:
+                label = f"{label} - Bracket"
             usage_counter[label] += 1
 
         lines = [f"Sheet: {int(sheet_w)} x {int(sheet_h)} inch"]
@@ -935,218 +1028,170 @@ class ManufacturingModule(QWidget):
 
         self.canvas.setSceneRect(-20, -60, canvas_w + 250, sheet_h * scale + 100)
         
-    def auto_optimize_sheet(self):
-        try:
-            item_data = self.item_dropdown.currentData()
-            if not item_data:
-                QMessageBox.warning(self, "No Sheet", "Please select a raw material.")
-                return
+    def auto_optimize_sheet(self, sheet_w, sheet_h, rectangles):
+        def dp_find_best_row(pieces, max_width):
+            n = len(pieces)
+            dp = [{} for _ in range(n + 1)]
+            dp[0][0] = (0, [])
 
-            index = self.sheet_tabs.currentIndex()
-            cuts = self.sheet_data.get(index, {}).get("cuts", [])
-            if not cuts:
-                QMessageBox.warning(self, "No Cuts", "No cut sizes entered.")
-                return
+            for i in range(1, n + 1):
+                w0, h0, label, is_bracket = pieces[i - 1]
+                orientations = [(w0, h0), (h0, w0)]
+                for prev_w, (total, items) in dp[i - 1].items():
+                    for w, h in orientations:
+                        new_w = prev_w + w
+                        if new_w <= max_width:
+                            new_total = total + w
+                            new_items = items + [(w, h, label, is_bracket, i - 1)]
+                            if new_w not in dp[i] or dp[i][new_w][0] < new_total:
+                                dp[i][new_w] = (new_total, new_items)
+                    if prev_w not in dp[i] or dp[i][prev_w][0] < total:
+                        dp[i][prev_w] = (total, items)
 
-            def parse_inches(val):
-                try:
-                    if isinstance(val, (float, int)):
-                        return float(val)
-                    if ' ' in val:
-                        whole, frac = val.strip().split(' ')
-                        num, denom = frac.split('/')
-                        return int(whole) + int(num) / int(denom)
-                    elif '/' in val:
-                        num, denom = val.strip().split('/')
-                        return int(num) / int(denom)
-                    return float(val)
-                except Exception:
-                    return 0.0
+            best_total = 0
+            best_items = []
+            for total, items in dp[n].values():
+                if total > best_total:
+                    best_total = total
+                    best_items = items
 
-            def find_best_row(pieces, max_width):
-                from itertools import combinations, product
-                best_combo = []
-                best_total = 0.0
-                for r in range(1, len(pieces) + 1):
-                    for combo in combinations(pieces, r):
-                        for orientation in product([0, 1], repeat=len(combo)):
-                            total = 0.0
-                            row = []
-                            valid = True
-                            for i, p in enumerate(combo):
-                                if orientation[i] == 0:
-                                    w = p['length']
-                                    h = p['width']
-                                    l_str, w_str = p['length_str'], p['width_str']
-                                else:
-                                    w = p['width']
-                                    h = p['length']
-                                    l_str, w_str = p['width_str'], p['length_str']
-                                if total + w > max_width:
-                                    valid = False
-                                    break
-                                row.append((w, h, l_str, w_str, p['is_bracket']))
-                                total += w
-                            if valid and total > best_total:
-                                best_total = total
-                                best_combo = (combo, row)
-                return best_combo
+            if not best_items:
+                return None
 
-            def optimize_layout(sheet_w, sheet_h, cuts):
-                parsed = []
-                for idx, c in enumerate(cuts):
-                    l = parse_inches(c[0])
-                    w = parse_inches(c[1])
-                    parsed.append({
-                        'id': idx,
-                        'length': l,
-                        'width': w,
-                        'length_str': c[2],
-                        'width_str': c[3],
-                        'is_bracket': c[4] if len(c) > 4 else False
-                    })
+            used_indexes = [idx for *_, idx in best_items]
+            used_items = [pieces[i] for i in used_indexes]
+            row = [item[:4] for item in best_items]
+            return used_items, row
 
-                y_cursor = 0
-                layout = []
-                while parsed:
-                    result = find_best_row(parsed, sheet_w)
-                    if not result:
-                        break
-                    used_items, row = result
-                    row_height = max(h for _, h, _, _, _ in row)
-                    if y_cursor + row_height > sheet_h:
-                        break
-                    layout.extend(row)
-                    for item in used_items:
-                        parsed.remove(item)
-                    y_cursor += row_height
-                return layout
+        parsed = [tuple(cut) for cut in rectangles]
+        y_cursor = 0
+        layout = []
 
-            def to_inches(val, unit):
-                unit = unit.lower()
-                if unit == 'ft':
-                    return float(val) * 12
-                elif unit == 'mm':
-                    return float(val) / 25.4
-                return float(val)
+        while parsed:
+            result = dp_find_best_row(parsed, sheet_w)
+            if not result:
+                break
+            used_items, row = result
+            row_height = max(h for _, h, _, _ in row)
+            if y_cursor + row_height > sheet_h:
+                break
+            layout.extend(row)
+            for item in used_items:
+                parsed.remove(item)
+            y_cursor += row_height
 
-            sheet_w = to_inches(item_data.get("width", 0), item_data.get("width_unit", "inch"))
-            sheet_h = to_inches(item_data.get("length", 0), item_data.get("length_unit", "inch"))
-
-            optimized = optimize_layout(sheet_w, sheet_h, cuts)
-
-            # ✅ Update internal sheet_data and UI with brackets preserved
-            self.sheet_data[index]["cuts"] = [
-                (round(w, 4), round(h, 4), l_str, w_str, is_bracket)
-                for (w, h, l_str, w_str, is_bracket) in optimized
-            ]
-
-            self.cut_list.clear()
-            for (w, h, l_str, w_str, is_bracket) in optimized:
-                label = f"{l_str} x {w_str}"
-                if is_bracket:
-                    label += " - Bracket"
-                self.cut_list.addItem(label)
-
-            self.simulate_cutting()
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Optimization failed:\n{str(e)}")
+        return [(w, h, label, is_bracket) for w, h, label, is_bracket in layout]
         
-    def place_rectangles(self, sheet_w, sheet_h, rectangles):
+    def place_rectangles(self, sheet_w, sheet_h, rectangles, fallback_allowed=True):
         used = []
         current_y = 0
         row_height = 0
         current_x = 0
-        scan_resolution = 8
+        resolution = 8
+        unplaced = []
 
         for rect in rectangles:
-            if len(rect) >= 2:
-                w, h = rect[0], rect[1]
-            else:
-                continue
-
+            w, h, label, is_bracket = rect
             placed = False
 
-            # === 1. Try placing in current row ===
-            if current_x + w <= sheet_w and current_y + h <= sheet_h:
-                used.append((current_x, current_y, w, h))
-                current_x += w
-                row_height = max(row_height, h)
-                placed = True
+            # Step 1: Current row
+            for pw, ph in [(w, h), (h, w)] if w != h else [(w, h)]:
+                if current_x + pw <= sheet_w and current_y + ph <= sheet_h:
+                    overlaps = any(
+                        not (current_x + pw <= ux or ux + uw <= current_x or
+                            current_y + ph <= uy or uy + uh <= current_y)
+                        for ux, uy, uw, uh, *_ in used
+                    )
+                    if not overlaps:
+                        used.append((current_x, current_y, pw, ph, label, is_bracket))
+                        current_x += pw
+                        row_height = max(row_height, ph)
+                        placed = True
+                        break
 
-            # === 2. Try placing in new row ===
+            # Step 2: New row
             if not placed:
                 new_y = current_y + row_height
-                if new_y + h <= sheet_h:
-                    current_y = new_y
-                    current_x = 0
-                    row_height = h
-                    used.append((current_x, current_y, w, h))
-                    current_x += w
-                    placed = True
+                for pw, ph in [(w, h), (h, w)] if w != h else [(w, h)]:
+                    if new_y + ph <= sheet_h and pw <= sheet_w:
+                        overlaps = any(
+                            not (0 + pw <= ux or ux + uw <= 0 or
+                                new_y + ph <= uy or uy + uh <= new_y)
+                            for ux, uy, uw, uh, *_ in used
+                        )
+                        if not overlaps:
+                            current_y = new_y
+                            current_x = 0
+                            row_height = ph
+                            used.append((current_x, current_y, pw, ph, label, is_bracket))
+                            current_x += pw
+                            placed = True
+                            break
 
-            # === 3. Try placing in waste blocks ===
+            # Step 3: Waste block
             if not placed:
-                waste_blocks = self.find_all_waste_blocks(sheet_w, sheet_h, used)
+                waste_blocks = self.scan_waste_blocks(sheet_w, sheet_h, used)
                 for wx, wy, ww, wh in waste_blocks:
-                    if w <= ww and h <= wh and wx + w <= sheet_w and wy + h <= sheet_h:
-                        used.append((wx, wy, w, h))
-                        placed = True
-                        break
-                    elif h <= ww and w <= wh and wx + h <= sheet_w and wy + w <= sheet_h:
-                        used.append((wx, wy, h, w))  # rotated
-                        placed = True
+                    for pw, ph in [(w, h), (h, w)] if w != h else [(w, h)]:
+                        if pw <= ww and ph <= wh:
+                            overlaps = any(
+                                not (wx + pw <= ux or ux + uw <= wx or
+                                    wy + ph <= uy or uy + uh <= wy)
+                                for ux, uy, uw, uh, *_ in used
+                            )
+                            if not overlaps:
+                                used.append((wx, wy, pw, ph, label, is_bracket))
+                                placed = True
+                                break
+                    if placed:
                         break
 
-            # === 4. Last resort: full sheet scan for a fit ===
+            # Step 4: Grid scan
             if not placed:
-                grid_w = int(sheet_w * scan_resolution)
-                grid_h = int(sheet_h * scan_resolution)
+                grid_w = int(sheet_w * resolution)
+                grid_h = int(sheet_h * resolution)
                 grid = [[False for _ in range(grid_w)] for _ in range(grid_h)]
 
-                for ux, uy, uw, uh in used:
-                    for dx in range(int(uw * scan_resolution)):
-                        for dy in range(int(uh * scan_resolution)):
-                            gx = int((ux + dx / scan_resolution) * scan_resolution)
-                            gy = int((uy + dy / scan_resolution) * scan_resolution)
+                for ux, uy, uw, uh, *_ in used:
+                    for dx in range(int(uw * resolution)):
+                        for dy in range(int(uh * resolution)):
+                            gx = int((ux + dx / resolution) * resolution)
+                            gy = int((uy + dy / resolution) * resolution)
                             if 0 <= gx < grid_w and 0 <= gy < grid_h:
                                 grid[gy][gx] = True
 
                 for gy in range(grid_h):
                     for gx in range(grid_w):
-                        x_pos = gx / scan_resolution
-                        y_pos = gy / scan_resolution
-
+                        x_pos = gx / resolution
+                        y_pos = gy / resolution
                         if x_pos + w > sheet_w or y_pos + h > sheet_h:
                             continue
 
                         fits = True
-                        for dy in range(int(h * scan_resolution)):
-                            for dx in range(int(w * scan_resolution)):
-                                cx = gx + dx
-                                cy = gy + dy
-                                if cx >= grid_w or cy >= grid_h or grid[cy][cx]:
+                        for dy in range(int(h * resolution)):
+                            for dx in range(int(w * resolution)):
+                                if grid[gy + dy][gx + dx]:
                                     fits = False
                                     break
                             if not fits:
                                 break
 
                         if fits:
-                            used.append((x_pos, y_pos, w, h))
+                            used.append((x_pos, y_pos, w, h, label, is_bracket))
                             placed = True
                             break
                     if placed:
                         break
 
-            # === 5. Auto-optimize fallback if nothing worked ===
-            if not placed:
-                loader = self.show_loader(self, "Size Error", f"Not enough space for cut {w} x {h} inch, Trying to Auto Adjust Sheet...")
-                self.auto_optimize_sheet()
-                loader.close()
-                return
+            # Step 5: Fallback optimizer
+            if not placed and fallback_allowed:
+                optimized = self.auto_optimize_sheet(sheet_w, sheet_h, rectangles)
+                return self.place_rectangles(sheet_w, sheet_h, optimized, fallback_allowed=False)
 
-        return used
+            if not placed:
+                unplaced.append(label)
+
+        return used, unplaced
 
 
 
