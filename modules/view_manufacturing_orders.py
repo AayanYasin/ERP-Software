@@ -296,6 +296,8 @@ class RefactoredOrderDialog(QDialog):
             "Partially Completed": "mark this order as partially completed",
             "Rejected": "reject this order"
         }
+        
+        self.summary_text = "None"
 
         label = status_labels.get(new_status, f"change the status to '{new_status}'")
         confirm = QMessageBox.question(
@@ -447,17 +449,20 @@ class RefactoredOrderDialog(QDialog):
                                 block_lines = []
                                 for i, (x, y, w, h) in enumerate(waste_blocks, 1):
                                     w, h = sorted([w, h], reverse=True)
+                                    if w < 1.5 or h < 1.5:
+                                        continue  # Ignore too small scraps (optional)
                                     block_lines.append(f"🔹 Block {i}: {w:.2f} x {h:.2f} inch × {raw_qty} pcs")
 
-                                summary_text = "\n".join(block_lines)
-                                ask = QMessageBox.question(
-                                    self,
-                                    "Confirm Waste Blocks",
-                                    f"The following waste blocks will be added to inventory:\n\n{summary_text}\n\nProceed?",
-                                    QMessageBox.Yes | QMessageBox.No
-                                )
+                                self.summary_text = "\n".join(block_lines)
+                                # ask = QMessageBox.question(
+                                #     self,
+                                #     "Confirm Waste Blocks",
+                                #     f"The following waste blocks will be added to inventory:\n\n{summary_text}\n\nProceed?",
+                                #     QMessageBox.Yes | QMessageBox.No
+                                # )
 
-                                if ask == QMessageBox.Yes:
+                                # if ask == QMessageBox.Yes:
+                                if True:
                                     # Get last item_code from meta/item_code_counter
                                     counter_ref = db.collection("meta").document("item_code_counter")
                                     counter_doc = counter_ref.get()
@@ -564,7 +569,8 @@ class RefactoredOrderDialog(QDialog):
 
                                             waste_data = {
                                                 "item_code": new_code,
-                                                "name": name,
+                                                "name": name
+                                                ,
                                                 "length": rounded_w,
                                                 "width": rounded_h,
                                                 "height": 0.0,
@@ -595,7 +601,7 @@ class RefactoredOrderDialog(QDialog):
                                             # ✅ Update item code counter only when new product is created
                                             counter_ref.update({"last_code": last_code})
                 if summary_lines:
-                    QMessageBox.information(self, "Inventory Summary", "\n".join(summary_lines))
+                    QMessageBox.information(self, "Inventory Summary", "\n".join(summary_lines) + f"\nWaste Added:\n{self.summary_text}")
 
             # === Final Step: Update Status ===
             db.collection("manufacturing_orders").document(order_id).update({
