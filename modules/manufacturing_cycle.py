@@ -12,6 +12,7 @@ from fractions import Fraction
 from collections import Counter
 from math import ceil
 from itertools import permutations
+from collections import defaultdict
 
 class PannableGraphicsView(QGraphicsView):
     def __init__(self, scene=None):
@@ -731,23 +732,24 @@ class ManufacturingModule(QWidget):
     def smart_group_sort(self, raw_pieces):
         from collections import defaultdict
 
-        # Group identical parts by (width, height)
         grouped = defaultdict(list)
         for piece in raw_pieces:
-            grouped[(piece[2], piece[3])].append(piece)  # use string widths and heights
+            grouped[(piece[2], piece[3])].append(piece)
 
-        def smart_sort_key(k):
+        def nesting_sort_key(k):
             w = self.parse_inches(k[0])
             h = self.parse_inches(k[1])
-            count = len(grouped[k])
-            if w == 0:
-                return (0, 0, 0)
-            ratio = h / w
-            return (-ratio * count, -count, -h)
+            group = grouped[k]
+            qty = len(group)
+            area = w * h
+            aspect_ratio = h / w if w else float('inf')
+            is_portrait = int(h >= w)
 
-        sorted_keys = sorted(grouped.keys(), key=smart_sort_key)
-        return [piece for key in sorted_keys for piece in grouped[key]]
+            return (w, -is_portrait, -qty, -area)
 
+        sorted_keys = sorted(grouped.keys(), key=nesting_sort_key)
+        return [p for key in sorted_keys for p in grouped[key]]
+    
     def simulate_cutting(self):
         index = self.item_dropdown.currentIndex()
         if index < 0:
@@ -1082,108 +1084,168 @@ class ManufacturingModule(QWidget):
 
         return [(w, h, label, is_bracket) for w, h, label, is_bracket in layout]
         
-    def place_rectangles(self, sheet_w, sheet_h, rectangles, fallback_allowed=True):
-        used = []
-        current_y = 0
-        row_height = 0
-        current_x = 0
-        resolution = 8
-        unplaced = []
+    # def place_rectangles(self, sheet_w, sheet_h, rectangles, fallback_allowed=True):
+    #     used = []
+    #     current_y = 0
+    #     row_height = 0
+    #     current_x = 0
+    #     resolution = 8
+    #     unplaced = []
 
-        for rect in rectangles:
-            w, h, label, is_bracket = rect
+    #     for rect in rectangles:
+    #         w, h, label, is_bracket = rect
+    #         placed = False
+
+    #         # Step 1: Current row
+    #         for pw, ph in [(w, h), (h, w)] if w != h else [(w, h)]:
+    #             if current_x + pw <= sheet_w and current_y + ph <= sheet_h:
+    #                 overlaps = any(
+    #                     not (current_x + pw <= ux or ux + uw <= current_x or
+    #                         current_y + ph <= uy or uy + uh <= current_y)
+    #                     for ux, uy, uw, uh, *_ in used
+    #                 )
+    #                 if not overlaps:
+    #                     used.append((current_x, current_y, pw, ph, label, is_bracket))
+    #                     current_x += pw
+    #                     row_height = max(row_height, ph)
+    #                     placed = True
+    #                     break
+
+    #         # Step 2: New row
+    #         if not placed:
+    #             new_y = current_y + row_height
+    #             for pw, ph in [(w, h), (h, w)] if w != h else [(w, h)]:
+    #                 if new_y + ph <= sheet_h and pw <= sheet_w:
+    #                     overlaps = any(
+    #                         not (0 + pw <= ux or ux + uw <= 0 or
+    #                             new_y + ph <= uy or uy + uh <= new_y)
+    #                         for ux, uy, uw, uh, *_ in used
+    #                     )
+    #                     if not overlaps:
+    #                         current_y = new_y
+    #                         current_x = 0
+    #                         row_height = ph
+    #                         used.append((current_x, current_y, pw, ph, label, is_bracket))
+    #                         current_x += pw
+    #                         placed = True
+    #                         break
+
+    #         # Step 3: Waste block
+    #         if not placed:
+    #             waste_blocks = self.scan_waste_blocks(sheet_w, sheet_h, used)
+    #             for wx, wy, ww, wh in waste_blocks:
+    #                 for pw, ph in [(w, h), (h, w)] if w != h else [(w, h)]:
+    #                     if pw <= ww and ph <= wh:
+    #                         overlaps = any(
+    #                             not (wx + pw <= ux or ux + uw <= wx or
+    #                                 wy + ph <= uy or uy + uh <= wy)
+    #                             for ux, uy, uw, uh, *_ in used
+    #                         )
+    #                         if not overlaps:
+    #                             used.append((wx, wy, pw, ph, label, is_bracket))
+    #                             placed = True
+    #                             break
+    #                 if placed:
+    #                     break
+
+    #         # Step 4: Grid scan
+    #         if not placed:
+    #             grid_w = int(sheet_w * resolution)
+    #             grid_h = int(sheet_h * resolution)
+    #             grid = [[False for _ in range(grid_w)] for _ in range(grid_h)]
+
+    #             for ux, uy, uw, uh, *_ in used:
+    #                 for dx in range(int(uw * resolution)):
+    #                     for dy in range(int(uh * resolution)):
+    #                         gx = int((ux + dx / resolution) * resolution)
+    #                         gy = int((uy + dy / resolution) * resolution)
+    #                         if 0 <= gx < grid_w and 0 <= gy < grid_h:
+    #                             grid[gy][gx] = True
+
+    #             for gy in range(grid_h):
+    #                 for gx in range(grid_w):
+    #                     x_pos = gx / resolution
+    #                     y_pos = gy / resolution
+    #                     if x_pos + w > sheet_w or y_pos + h > sheet_h:
+    #                         continue
+
+    #                     fits = True
+    #                     for dy in range(int(h * resolution)):
+    #                         for dx in range(int(w * resolution)):
+    #                             if grid[gy + dy][gx + dx]:
+    #                                 fits = False
+    #                                 break
+    #                         if not fits:
+    #                             break
+
+    #                     if fits:
+    #                         used.append((x_pos, y_pos, w, h, label, is_bracket))
+    #                         placed = True
+    #                         break
+    #                 if placed:
+    #                     break
+        
+        
+    def place_rectangles(self, sheet_w, sheet_h, rectangles, fallback_allowed=True):
+        from math import ceil
+
+        used = []
+        unplaced = []
+        step = 0.125        # Resolution (1/8 inch)
+        kerf = 0.0          # Space between cuts
+
+        map_width = int(sheet_w / step)
+        height_map = [0.0] * map_width  # Stores Y-height at each X-step
+
+        def fits_at(x_idx, w_steps, rect_w, rect_h):
+            x = x_idx * step
+            max_y = max(height_map[x_idx:x_idx + w_steps])
+            if max_y + rect_h > sheet_h:
+                return None
+            return x, max_y  # x and y position to place
+
+        def update_height_map(x_idx, w_steps, new_top):
+            for i in range(x_idx, x_idx + w_steps):
+                height_map[i] = new_top
+
+        def try_place(w, h):
+            w_steps = int(ceil((w + kerf) / step))
+            best_x_idx = None
+            best_y = None
+
+            for x_idx in range(0, map_width - w_steps + 1):
+                result = fits_at(x_idx, w_steps, w, h)
+                if result:
+                    x, y = result
+                    if best_y is None or y < best_y or (y == best_y and x < best_x_idx * step):
+                        best_x_idx = x_idx
+                        best_y = y
+
+            if best_x_idx is not None:
+                x = best_x_idx * step
+                y = best_y
+                update_height_map(best_x_idx, w_steps, y + h + kerf)
+                return x, y
+            return None
+
+        for w, h, label, is_bracket in rectangles:
             placed = False
 
-            # Step 1: Current row
-            for pw, ph in [(w, h), (h, w)] if w != h else [(w, h)]:
-                if current_x + pw <= sheet_w and current_y + ph <= sheet_h:
-                    overlaps = any(
-                        not (current_x + pw <= ux or ux + uw <= current_x or
-                            current_y + ph <= uy or uy + uh <= current_y)
-                        for ux, uy, uw, uh, *_ in used
-                    )
-                    if not overlaps:
-                        used.append((current_x, current_y, pw, ph, label, is_bracket))
-                        current_x += pw
-                        row_height = max(row_height, ph)
-                        placed = True
-                        break
+            # Try original orientation
+            pos = try_place(w, h)
 
-            # Step 2: New row
-            if not placed:
-                new_y = current_y + row_height
-                for pw, ph in [(w, h), (h, w)] if w != h else [(w, h)]:
-                    if new_y + ph <= sheet_h and pw <= sheet_w:
-                        overlaps = any(
-                            not (0 + pw <= ux or ux + uw <= 0 or
-                                new_y + ph <= uy or uy + uh <= new_y)
-                            for ux, uy, uw, uh, *_ in used
-                        )
-                        if not overlaps:
-                            current_y = new_y
-                            current_x = 0
-                            row_height = ph
-                            used.append((current_x, current_y, pw, ph, label, is_bracket))
-                            current_x += pw
-                            placed = True
-                            break
+            # Try rotated
+            if not pos and w != h:
+                pos = try_place(h, w)
+                if pos:
+                    w, h = h, w  # apply rotation
 
-            # Step 3: Waste block
-            if not placed:
-                waste_blocks = self.scan_waste_blocks(sheet_w, sheet_h, used)
-                for wx, wy, ww, wh in waste_blocks:
-                    for pw, ph in [(w, h), (h, w)] if w != h else [(w, h)]:
-                        if pw <= ww and ph <= wh:
-                            overlaps = any(
-                                not (wx + pw <= ux or ux + uw <= wx or
-                                    wy + ph <= uy or uy + uh <= wy)
-                                for ux, uy, uw, uh, *_ in used
-                            )
-                            if not overlaps:
-                                used.append((wx, wy, pw, ph, label, is_bracket))
-                                placed = True
-                                break
-                    if placed:
-                        break
+            if pos:
+                x, y = pos
+                used.append((x, y, w, h, label, is_bracket))
+                placed = True
 
-            # Step 4: Grid scan
-            if not placed:
-                grid_w = int(sheet_w * resolution)
-                grid_h = int(sheet_h * resolution)
-                grid = [[False for _ in range(grid_w)] for _ in range(grid_h)]
-
-                for ux, uy, uw, uh, *_ in used:
-                    for dx in range(int(uw * resolution)):
-                        for dy in range(int(uh * resolution)):
-                            gx = int((ux + dx / resolution) * resolution)
-                            gy = int((uy + dy / resolution) * resolution)
-                            if 0 <= gx < grid_w and 0 <= gy < grid_h:
-                                grid[gy][gx] = True
-
-                for gy in range(grid_h):
-                    for gx in range(grid_w):
-                        x_pos = gx / resolution
-                        y_pos = gy / resolution
-                        if x_pos + w > sheet_w or y_pos + h > sheet_h:
-                            continue
-
-                        fits = True
-                        for dy in range(int(h * resolution)):
-                            for dx in range(int(w * resolution)):
-                                if grid[gy + dy][gx + dx]:
-                                    fits = False
-                                    break
-                            if not fits:
-                                break
-
-                        if fits:
-                            used.append((x_pos, y_pos, w, h, label, is_bracket))
-                            placed = True
-                            break
-                    if placed:
-                        break
-
-            # Step 5: Fallback optimizer
+            # Fallback optimizer
             if not placed and fallback_allowed:
                 optimized = self.auto_optimize_sheet(sheet_w, sheet_h, rectangles)
                 return self.place_rectangles(sheet_w, sheet_h, optimized, fallback_allowed=False)
@@ -1192,7 +1254,6 @@ class ManufacturingModule(QWidget):
                 unplaced.append(label)
 
         return used, unplaced
-
 
 
 
@@ -1724,7 +1785,8 @@ class ManufacturingModule(QWidget):
                             f"{p.get('length', 0)}{p.get('length_unit')} x "
                             f"{p.get('width', 0)}{p.get('width_unit')} x "
                             f"{p.get('height', 0)}{p.get('height_unit')}",
-                    "qty": p.get("qty", 1)
+                    "qty": p.get("qty", 1),
+                    "qty_done": 0
                 }
                 for p in sheet.get("products", [])
             ]
@@ -1737,7 +1799,8 @@ class ManufacturingModule(QWidget):
                     "branch": raw.get("branch"),
                     "color": raw.get("color"),
                     "condition": raw.get("condition"),
-                    "qty": sheet.get("raw_qty", "")
+                    "qty": sheet.get("raw_qty", ""),
+                    "raw_done": 0
                 },
                 "cuts": cuts,
                 "products": products
