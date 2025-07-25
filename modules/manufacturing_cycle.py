@@ -1,10 +1,10 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QLineEdit, QPushButton, QListWidget, QListWidgetItem,
     QGraphicsScene, QGraphicsView, QGraphicsRectItem, QHBoxLayout, QGraphicsTextItem, QGraphicsEllipseItem,
-    QComboBox, QMessageBox, QTabWidget, QCheckBox, QSpinBox, QProgressDialog, QApplication, QGraphicsLineItem, QSizePolicy
+    QComboBox, QMessageBox, QTabWidget, QCheckBox, QSpinBox, QProgressDialog, QApplication, QGraphicsLineItem, QSizePolicy, QGraphicsItem
 )
 from PyQt5.QtGui import QBrush, QColor, QPen, QPainter, QFont, QTransform
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from firebase.config import db
 from uuid import uuid4
 from firebase_admin import firestore
@@ -21,9 +21,12 @@ class PannableGraphicsView(QGraphicsView):
         self._drag_pos = None
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
+        item = self.itemAt(event.pos())
+        if event.button() == Qt.LeftButton and not item:
             self.setCursor(Qt.ClosedHandCursor)
             self._drag_pos = event.pos()
+        else:
+            self._drag_pos = None  # Don't pan if clicking on an item
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -40,6 +43,46 @@ class PannableGraphicsView(QGraphicsView):
             self._drag_pos = None
         super().mouseReleaseEvent(event)
 
+class DraggableBlock(QGraphicsRectItem):
+    def __init__(self, x, y, w, h, label, is_bracket, scale, parent=None, callback=None):
+        super().__init__(x * scale, y * scale, w * scale, h * scale, parent)
+
+        self.setBrush(QBrush(QColor("#74b9ff")))
+        self.setPen(QPen(Qt.darkBlue, 1))
+        self.setZValue(10)
+        self.setFlags(
+            QGraphicsRectItem.ItemIsMovable |
+            QGraphicsRectItem.ItemIsSelectable |
+            QGraphicsRectItem.ItemSendsGeometryChanges
+        )
+        self.setAcceptHoverEvents(True)
+        
+        self.label = label
+        self.callback = callback
+        self.reorder_timer = QTimer()
+        self.reorder_timer.setSingleShot(True)
+        self.reorder_timer.timeout.connect(self._send_reorder_request)
+        self.scale = scale            # Optional, if you want for future use
+        
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        if self.callback:
+            self.callback("preview", self.label, self.pos(), self)  # send ghost-only update
+        
+    def mousePressEvent(self, event):
+        if self.callback:
+            self.callback("start", self.label)  # Inform canvas that drag has started
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if self.callback:
+            self.callback("drop", self.label, self.pos())  # Send final drop
+            
+    def _send_reorder_request(self):
+        if self.callback:
+            self.callback("dragging", self.label, self.pos())
+
 
 
 class ManufacturingModule(QWidget):
@@ -55,6 +98,7 @@ class ManufacturingModule(QWidget):
         self.sheet_data = {}
         self.products = []
         self.subcategories = []
+        self.hidden_blocks = []
 
         self.init_ui()
         self.load_subcategories()
@@ -795,6 +839,8 @@ class ManufacturingModule(QWidget):
                 )
                 for c in sorted_cuts if len(c) == 5
             ]
+            self.sheet_data[self.sheet_tabs.currentIndex()]["sheet_width"] = sheet_w
+            self.sheet_data[self.sheet_tabs.currentIndex()]["sheet_height"] = sheet_h
             used_rects, unplaced = self.place_rectangles(sheet_w, sheet_h, cuts_for_placement)
             if not used_rects:
                 return
@@ -890,7 +936,301 @@ class ManufacturingModule(QWidget):
     
     def find_all_waste_blocks(self, sheet_w, sheet_h, rects):
         return self.scan_waste_blocks(sheet_w, sheet_h, rects, scan_direction="bottom")
+    
+    def on_block_event(self, event_type, label, pos=None, block=None):
+        if event_type == "start":
+            self.sort_toggle.setChecked(False)
+            self.sort_toggle.setDisabled(True)
+            self.sort_toggle.setToolTip("Auto sort not available for manual drag.")
+        elif event_type == "preview" and pos is not None:
+            self.show_ghost_preview(pos, label, block)
+        elif event_type == "drop" and pos is not None:
+            self.remove_ghost()
+            self.handle_block_drop(pos, label)
+            
+    def remove_ghost(self):
+        if hasattr(self, "ghosts"):
+            for g in self.ghosts:
+                self.scene.removeItem(g)
+            self.ghosts = []
+            
+        # Unhide real layout blocks
+        if hasattr(self, "hidden_blocks"):
+            for item in self.hidden_blocks:
+                item.setVisible(True)
+            self.hidden_blocks = []
+            
+    def show_ghost_preview(self, pos, label, block):
+        self.remove_ghost()
+        # Safely get reference to the actual dragging block (to exclude from hiding)
+        self.current_drag_block = block
+        # Hide real blocks temporarily
+        ghost_sources = []
+        for item in self.scene.items():
+            if isinstance(item, QGraphicsRectItem) and hasattr(item, "label"):
+                if item is self.current_drag_block:
+                    continue  # the one being dragged — keep visible
+                if item.label == label:
+                    ghost_sources.append(item)  # same label — use as ghost reference
+                    item.setVisible(False)     # hide original
+                    self.hidden_blocks.append(item)
+                else:
+                    item.setVisible(False)     # unrelated — hide
+                    self.hidden_blocks.append(item)
 
+        index = self.sheet_tabs.currentIndex()
+        cuts = self.sheet_data[index]["cuts"]
+
+        # Step 1: Rebuild reordered cut list
+        old_idx = next(
+            (i for i, c in enumerate(cuts)
+            if len(c) == 5 and (f"{c[2]} x {c[3]}" == label or f"{c[2]} x {c[3]} - Bracket" == label)),
+            None
+        )
+        if old_idx is None:
+            return
+
+        items = [item for item in self.scene.items() if isinstance(item, QGraphicsRectItem) and hasattr(item, "label")]
+        item_map = [(item.sceneBoundingRect().center().y(), item.label) for item in items]
+        item_map.sort(key=lambda x: x[0])
+
+        drop_y = pos.y()
+        insert_idx = next((i for i, (cy, _) in enumerate(item_map) if drop_y < cy), len(item_map))
+
+        # Count how many times this label occurs in cuts
+        label_full = label
+        label_total = sum(
+            1 for c in cuts
+            if f"{c[2]} x {c[3]}" == label or f"{c[2]} x {c[3]} - Bracket" == label
+        )
+
+        # Remove all copies of this label from visual label list
+        visual_labels = [lbl for _, lbl in item_map if lbl != label_full]
+
+        # Insert all copies of the dragged label at the calculated position
+        for _ in range(label_total):
+            visual_labels.insert(insert_idx, label_full)
+
+        label_counter = Counter(visual_labels)
+        used_cuts = Counter()
+        simulated_cuts = []
+
+        # Make a working copy of cuts we can iterate multiple times
+        remaining_cuts = cuts.copy()
+
+        for lbl in visual_labels:
+            for i, c in enumerate(remaining_cuts):
+                if c is None:
+                    continue
+                label_c = f"{c[2]} x {c[3]}"
+                if c[4]:
+                    label_c += " - Bracket"
+
+                if label_c == lbl and used_cuts[label_c] < label_counter[label_c]:
+                    simulated_cuts.append(c)
+                    used_cuts[label_c] += 1
+                    remaining_cuts[i] = None  # Mark this cut as used
+                    break  # Move to next lbl
+
+        # Step 2: Build rectangles from simulated cuts
+        rectangles = [
+            (
+                self.parse_inches(c[2]),
+                self.parse_inches(c[3]),
+                f"{c[2]} x {c[3]}",
+                c[4]
+            )
+            for c in simulated_cuts
+        ]
+
+        sheet_info = self.sheet_data.get(index, {})
+        sheet_w = sheet_info.get("sheet_width")
+        sheet_h = sheet_info.get("sheet_height")
+        if not sheet_w or not sheet_h:
+            return
+
+        canvas_h = 700
+        scale = canvas_h / sheet_h
+
+        layout, _ = self.place_rectangles(sheet_w, sheet_h, rectangles, fallback_allowed=False)
+
+        self.ghosts = []  # Reset
+        for x, y, w, h, lbl, is_bracket in layout:
+            block = QGraphicsRectItem(x * scale, y * scale, w * scale, h * scale)
+            block.setZValue(100)
+            block.setBrush(QBrush(QColor(100, 100, 255, 40)))
+            block.setPen(QPen(Qt.darkBlue, 1))
+            block.setFlag(QGraphicsItem.ItemIsMovable, False)
+            block.setFlag(QGraphicsItem.ItemIsSelectable, False)
+            self.scene.addItem(block)
+            self.ghosts.append(block)
+
+            # Label
+            label_item = QGraphicsTextItem(lbl, block)
+            font_size = max(6, min(14, int(min(w, h) * scale * 0.2)))
+            label_item.setFont(QFont("Arial", font_size))
+            label_item.setDefaultTextColor(QColor(30, 30, 30, 120))  # faded black
+            label_item.setZValue(101)
+
+            label_rect = label_item.boundingRect()
+            if h > w:
+                transform = QTransform()
+                transform.translate((x + w / 2) * scale, (y + h / 2) * scale)
+                transform.rotate(-90)
+                transform.translate(-label_rect.width() / 2, -label_rect.height() / 2)
+                label_item.setTransform(transform)
+            else:
+                label_item.setPos((x + w / 2) * scale - label_rect.width() / 2,
+                                (y + h / 2) * scale - label_rect.height() / 2)
+
+            # Bracket diagonal
+            if is_bracket:
+                x_px = x * scale
+                y_px = y * scale
+                w_px = w * scale
+                h_px = h * scale
+                offset = 15
+
+                if w_px > h_px:
+                    x1 = x_px
+                    y1 = y_px + offset
+                    x2 = x_px + w_px
+                    y2 = y_px + h_px - offset
+                else:
+                    x1 = x_px + w_px - offset
+                    y1 = y_px
+                    x2 = x_px + offset
+                    y2 = y_px + h_px
+
+                line = QGraphicsLineItem(x1, y1, x2, y2)
+                line.setPen(QPen(QColor("#2c3e50"), 1.5, Qt.SolidLine))
+                self.scene.addItem(line)
+                self.ghosts.append(line)
+
+
+            
+    def live_reorder_blocks(self, pos, label):
+        try:
+            index = self.sheet_tabs.currentIndex()
+            cuts = self.sheet_data[index]["cuts"]
+
+            # Step 1: Get current cut index
+            old_idx = next(
+                (i for i, c in enumerate(cuts)
+                if len(c) == 5 and (f"{c[2]} x {c[3]}" == label or f"{c[2]} x {c[3]} - Bracket" == label)),
+                None
+            )
+            if old_idx is None:
+                return
+
+            # Step 2: Get visual center Y of all items
+            items = [item for item in self.scene.items() if isinstance(item, QGraphicsRectItem)]
+            item_map = []
+
+            for item in items:
+                if hasattr(item, "label"):
+                    center_y = item.sceneBoundingRect().center().y()
+                    item_map.append((center_y, item.label))
+
+            # Step 3: Sort visually top-to-bottom
+            item_map.sort(key=lambda x: x[0])
+
+            drop_y = pos.y()
+            insert_idx = 0
+            for i, (cy, lbl) in enumerate(item_map):
+                if drop_y < cy:
+                    insert_idx = i
+                    break
+                insert_idx = i + 1
+
+            # Rebuild label order
+            label_full = label
+            label_total = sum(
+                1 for c in cuts
+                if f"{c[2]} x {c[3]}" == label or f"{c[2]} x {c[3]} - Bracket" == label
+            )
+
+            # Remove all existing occurrences of the label from visual list
+            visual_labels = [lbl for _, lbl in item_map if lbl != label_full]
+
+            # Insert all instances at drop index
+            for _ in range(label_total):
+                visual_labels.insert(insert_idx, label_full)
+
+            # Build new cuts list from label order
+            new_cuts = []
+            for lbl in visual_labels:
+                match = next((c for c in cuts if f"{c[2]} x {c[3]}" == lbl or f"{c[2]} x {c[3]} - Bracket" == lbl), None)
+                if match:
+                    new_cuts.append(match)
+
+            # Replace cuts list and redraw layout
+            self.sheet_data[index]["cuts"] = new_cuts
+            self.simulate_cutting()
+
+        except Exception as e:
+            print("Live reorder error:", e)
+
+
+    def handle_block_drop(self, pos, label):
+        self.live_reorder_blocks(pos, label)
+        # try:
+        #     index = self.sheet_tabs.currentIndex()
+        #     cuts = self.sheet_data[index]["cuts"]
+
+        #     # Step 1: Find old index by label
+        #     old_idx = next(
+        #         (i for i, c in enumerate(cuts)
+        #         if len(c) == 5 and (f"{c[2]} x {c[3]}" == label or f"{c[2]} x {c[3]} - Bracket" == label)),
+        #         None
+        #     )
+        #     if old_idx is None:
+        #         return
+
+        #     # Step 2: Map visual positions of all current blocks
+        #     items = [item for item in self.scene.items() if isinstance(item, QGraphicsRectItem)]
+        #     item_map = []
+
+        #     for item in items:
+        #         if hasattr(item, "label"):
+        #             center_y = item.sceneBoundingRect().center().y()
+        #             item_map.append((center_y, item.label))
+
+        #     # Step 3: Sort by visual Y (top to bottom)
+        #     item_map.sort(key=lambda x: x[0])
+
+        #     # Step 4: Find the visual closest index
+        #     drop_y = pos.y()
+        #     closest_idx = 0
+        #     for i, (cy, lbl) in enumerate(item_map):
+        #         if drop_y < cy:
+        #             closest_idx = i
+        #             break
+        #         closest_idx = i + 1  # Drop at end if past all
+
+        #     # Step 5: Convert visual index to cut index
+        #     visual_order_labels = [lbl for _, lbl in item_map]
+        #     if label in visual_order_labels:
+        #         visual_order_labels.remove(label)  # Remove old entry
+
+        #     visual_order_labels.insert(closest_idx, label)
+
+        #     # Step 6: Reorder the cuts list based on new visual label order
+        #     new_cuts = []
+        #     for lbl in visual_order_labels:
+        #         match = next((c for c in cuts
+        #                     if f"{c[2]} x {c[3]}" == lbl or f"{c[2]} x {c[3]} - Bracket" == lbl), None)
+        #         if match:
+        #             new_cuts.append(match)
+
+        #     # Replace original cut list
+        #     self.sheet_data[index]["cuts"] = new_cuts
+
+        #     # Step 7: Trigger layout
+        #     self.simulate_cutting()
+
+        # except Exception as e:
+        #     print("Drag reorder error (smart snap):", e)
 
 
     def draw_canvas(self, sheet_w, sheet_h, rects):
@@ -928,7 +1268,7 @@ class ManufacturingModule(QWidget):
 
         for i, (x, y, w, h, label, is_bracket) in enumerate(rects):
             used_area += w * h
-            rect_item = QGraphicsRectItem(x * scale, y * scale, w * scale, h * scale)
+            rect_item = DraggableBlock(x, y, w, h, label, is_bracket, scale, callback=self.on_block_event)
             rect_item.setBrush(QBrush(QColor("#74b9ff")))
             rect_item.setPen(QPen(Qt.darkBlue, 1))
             self.scene.addItem(rect_item)
@@ -940,7 +1280,8 @@ class ManufacturingModule(QWidget):
             min_dim = min(w, h)
             font_size = max(6, min(14, int(min_dim * scale * 0.2)))
 
-            label = QGraphicsTextItem(original_label)
+            label = QGraphicsTextItem(original_label, rect_item)
+            label.setAcceptedMouseButtons(Qt.NoButton)
             font = QFont("Arial", font_size)
             label.setFont(font)
             label.setDefaultTextColor(Qt.black)
@@ -958,8 +1299,6 @@ class ManufacturingModule(QWidget):
             else:
                 label.setPos((x + w / 2) * scale - label_rect.width() / 2,
                             (y + h / 2) * scale - label_rect.height() / 2)
-
-            self.scene.addItem(label)
 
             # Draw diagonal if bracket
             if is_bracket:
