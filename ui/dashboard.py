@@ -8,7 +8,6 @@ from PyQt5.QtGui import QFont
 from ui.sidebar import create_expandable_sidebar
 
 # Personal Modules
-from modules.clients_addEdit import ClientsPage
 from modules.products import ProductsPage
 from modules.stock_adjustment import StockAdjustment
 from modules.create_new_login import CreateUserModule
@@ -16,6 +15,11 @@ from modules.view_inventory import ViewInventory
 from modules.manufacturing_cycle import ManufacturingModule
 from modules.view_manufacturing_orders import ViewManufacturingWindow
 from modules.settings import SettingsWindow
+from modules.chart_of_accounts import ChartOfAccounts
+from modules.view_journal_entries import JournalEntryViewer
+from modules.employee_master import EmployeeMaster
+from modules.clients_master import PartyModule
+from modules.invoice import InvoiceModule
 # from modules.whatsapp_module import WhatsAppIntegrationWidget
 from firebase.config import db
 
@@ -41,28 +45,25 @@ class DashboardApp(QMainWindow):
         sidebar_items = [
             ("Dashboard", lambda: print("Dashboard")),
 
-            ("Clients", [
-                ("Add/Edit Clients", lambda: self.launch_module('clients_window', ClientsPage, self.user_data)),
+            ("Parties", [
+                ("Manage/View", lambda: self.launch_module("party_window", PartyModule, self.user_data)),
             ]),
 
-            ("Vendors", [
-                ("Add/Edit Vendors", lambda: print("Vendors")),
+            ("Emploees", [
+                ("Manage/View", lambda: self.launch_module("Emploee_window", EmployeeMaster, self.user_data)),
             ]),
 
-            ("Accounts", [
-                ("Ledgers", lambda: print("Ledgers")),
-                ("Cash Book", lambda: print("Cash Book")),
-                ("Opening Balance", lambda: print("Opening Balance")),
+            ("Accounting", [
+                ("Chart of Accounts", lambda: self.launch_module("chart_of_accounts", ChartOfAccounts, self.user_data)),
+                ("Open Jounal", lambda: self.launch_module("wiew_journal_entry", JournalEntryViewer, self.user_data)),
             ]),
 
             ("Sales", [
-                ("Invoice", lambda: print("Invoice")),
-                ("Quotation", lambda: print("Quotation")),
-                ("Order Tracking", lambda: print("Order Tracking")),
+                ("Invoice", lambda: self.launch_module("invoice_window", InvoiceModule, self.user_data)),
             ]),
 
             ("Purchase", [
-                ("Purchase Order", lambda: print("PO")),
+                ("Purchase Order", lambda: QMessageBox.about(self, "Dev Log", "Cannot Acces, Under Development!")),
             ]),
 
             ("Inventory", [

@@ -49,8 +49,8 @@ class StockAdjustment(QWidget):
         layout.addLayout(header_layout)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["Branch", "Color", "Condition", "Qty"])
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["Product", "Branch", "Color", "Condition", "Qty"])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSelectionMode(self.table.NoSelection)
@@ -81,6 +81,32 @@ class StockAdjustment(QWidget):
         loader.show()
         QApplication.processEvents()
         return loader
+    
+    def _unit_symbol(self, unit):
+        u = (unit or "").strip().lower()
+        if u == "inch": return '"'
+        if u == "ft":   return "'"
+        if u == "mm":   return "mm"
+        return unit or ""
+
+    def _fmt_num(self, val):
+        try:
+            f = float(val)
+            if f == 0:
+                return None  # treat zero as “skip”
+            return str(int(f)) if f.is_integer() else str(f)
+        except Exception:
+            return None
+
+    def _fmt_dims(self, length, width, height, length_unit, width_unit, height_unit):
+        parts = []
+        L = self._fmt_num(length)
+        if L: parts.append(f"{L}{self._unit_symbol(length_unit)}")
+        W = self._fmt_num(width)
+        if W: parts.append(f"{W}{self._unit_symbol(width_unit)}")
+        H = self._fmt_num(height)
+        if H: parts.append(f"{H}{self._unit_symbol(height_unit)}")
+        return " x ".join(parts)
 
     def import_items(self):
         item_code = self.product_id_input.text().strip()
@@ -110,6 +136,16 @@ class StockAdjustment(QWidget):
                 product_id = doc.id
                 sp = float(data.get("selling_price", 0))
                 name = data.get("name", "")
+                
+                length  = data.get("length")
+                width   = data.get("width")
+                height  = data.get("height")
+                l_unit  = data.get("length_unit")
+                w_unit  = data.get("width_unit")
+                h_unit  = data.get("height_unit")
+
+                dims = self._fmt_dims(length, width, height, l_unit, w_unit, h_unit)
+                display_name = f"{name} {dims}".strip() if dims else name
 
                 self.products_data.append({
                     "doc_id": product_id,
@@ -125,23 +161,28 @@ class StockAdjustment(QWidget):
                     for color, cond_data in color_data.items():
                         for condition, value in cond_data.items():
                             self.table.insertRow(row)
+                            
+                            # Product name cell (same for all rows for this product)
+                            product_item = QTableWidgetItem(display_name)
+                            product_item.setFlags(product_item.flags() ^ Qt.ItemIsEditable)
+                            self.table.setItem(row, 0, product_item)
 
                             branch_item = QTableWidgetItem(branch)
                             branch_item.setFlags(branch_item.flags() ^ Qt.ItemIsEditable)
-                            self.table.setItem(row, 0, branch_item)
+                            self.table.setItem(row, 1, branch_item)
 
                             color_item = QTableWidgetItem(color)
                             color_item.setFlags(color_item.flags() ^ Qt.ItemIsEditable)
-                            self.table.setItem(row, 1, color_item)
+                            self.table.setItem(row, 2, color_item)
 
                             condition_item = QTableWidgetItem(condition)
                             condition_item.setFlags(condition_item.flags() ^ Qt.ItemIsEditable)
-                            self.table.setItem(row, 2, condition_item)
+                            self.table.setItem(row, 3, condition_item)
 
                             qty_item = QTableWidgetItem(str(value))
                             qty_item.setFlags(qty_item.flags() | Qt.ItemIsEditable)  # ✅ Only qty is editable
                             qty_item.setTextAlignment(Qt.AlignCenter)
-                            self.table.setItem(row, 3, qty_item)
+                            self.table.setItem(row, 4, qty_item)
 
 
                             # sp_item = QTableWidgetItem(f"{sp:.2f}")
@@ -266,7 +307,7 @@ class StockAdjustment(QWidget):
     def view_log(self):
         self.log_window = QWidget()
         self.log_window.setWindowTitle("📜 Stock Adjustment Log")
-        self.log_window.resize(800, 600)
+        self.log_window.resize(900, 640)
 
         # ✅ Track in dashboard for closing
         if self.dashboard:
@@ -277,17 +318,124 @@ class StockAdjustment(QWidget):
             )
 
         layout = QVBoxLayout(self.log_window)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        # ---- Visuals for the log window & list (UI only) ----
+        self.log_window.setStyleSheet("""
+            QWidget { background: #f6f7fb; font: 13px 'Segoe UI'; color: #1f2937; }
+            QLineEdit { border: 1px solid #dbe3ec; border-radius: 8px; padding: 6px 10px; background:#fff; }
+            QPushButton { border: none; border-radius: 8px; padding: 6px 12px; background:#6b7280; color:#fff; }
+            QPushButton:hover { background:#575e6b; }
+            QListWidget { background:#fff; border:1px solid #e8edf3; border-radius: 12px; }
+            /* Chip badge */
+            .chip { border:1px solid #e6eaf0; border-radius: 10px; padding:2px 8px; background:#f8fafc; color:#475569; }
+            .muted { color:#6b7280; }
+            .deltaPlus { color:#059669; font-weight:600; }
+            .deltaMinus { color:#dc2626; font-weight:600; }
+            .mono { font-family: 'Consolas','Courier New', monospace; }
+        """)
+
+        # Header row (search + count)
+        header_row = QHBoxLayout()
+        header_row.setSpacing(8)
 
         search_bar = QLineEdit()
-        search_bar.setPlaceholderText("Search by item code or name")
-        layout.addWidget(search_bar)
+        search_bar.setPlaceholderText("Search by item code, name, branch, color, condition")
+        header_row.addWidget(search_bar, 1)
 
+        self.count_label = QLabel("")
+        header_row.addWidget(self.count_label, 0, Qt.AlignRight | Qt.AlignVCenter)
+
+        layout.addLayout(header_row)
+
+        # Pretty list
         self.log_list = QListWidget()
+        self.log_list.setSpacing(4)  # a bit of breathing room between rows
         layout.addWidget(self.log_list)
 
+        # Footer actions
+        footer = QHBoxLayout()
+        footer.addStretch(1)
         delete_btn = QPushButton("🗑 Delete Selected Record")
         delete_btn.clicked.connect(self.delete_log_entry)
-        layout.addWidget(delete_btn)
+        footer.addWidget(delete_btn)
+        layout.addLayout(footer)
+
+        # --- helpers to render a pretty row (no logic changes) ---
+        def make_row_widget(item_code, display_name, branch, color, condition, old_qty, new_qty, created):
+            # Card container (no extra imports needed)
+            card = QWidget()
+            card.setObjectName("card")
+            card.setStyleSheet("QWidget#card{border:1px solid #edf1f6; border-radius:10px; background:#ffffff;}")
+            outer = QVBoxLayout(card)
+            outer.setContentsMargins(10, 8, 10, 8)
+            outer.setSpacing(6)
+
+            # Top line: Title + quantities
+            top = QHBoxLayout()
+            top.setSpacing(6)
+
+            safe_display_name = display_name or ""
+            safe_item_code = item_code or ""
+            title_lbl = QLabel(f"<b class='mono'>📦 {safe_item_code}</b> — {safe_display_name}")
+            title_lbl.setTextFormat(Qt.RichText)
+            top.addWidget(title_lbl, 1)
+
+            # Right side: qty old → new and delta colored
+            qty_box = QHBoxLayout()
+            qty_box.setSpacing(6)
+            try:
+                old_i = int(old_qty)
+            except Exception:
+                old_i = 0
+            try:
+                new_i = int(new_qty)
+            except Exception:
+                new_i = 0
+            qty_lbl = QLabel(f"<span class='mono'>{old_i} → {new_i}</span>")
+            qty_lbl.setTextFormat(Qt.RichText)
+            delta = new_i - old_i
+            delta_cls = "deltaPlus" if delta > 0 else ("deltaMinus" if delta < 0 else "muted")
+            delta_lbl = QLabel(f"<span class='{delta_cls} mono'><b>{ '+' if delta>0 else ''}{delta}</b></span>")
+            delta_lbl.setTextFormat(Qt.RichText)
+            qty_box.addWidget(qty_lbl, 0, Qt.AlignRight)
+            qty_box.addWidget(delta_lbl, 0, Qt.AlignRight)
+            top.addLayout(qty_box, 0)
+
+            outer.addLayout(top)
+
+            # Mid line: chips
+            chips = QHBoxLayout()
+            chips.setSpacing(6)
+            for text in (f"Branch: {branch}", f"Color: {color}", f"Condition: {condition}"):
+                chip = QLabel(f"<span class='chip'>{text}</span>")
+                chip.setTextFormat(Qt.RichText)
+                chips.addWidget(chip, 0, Qt.AlignLeft)
+            chips.addStretch(1)
+            outer.addLayout(chips)
+
+            # Bottom line: created timestamp
+            created_lbl = QLabel(f"<span class='muted'>⏱ {created}</span>")
+            created_lbl.setTextFormat(Qt.RichText)
+            outer.addWidget(created_lbl, 0, Qt.AlignLeft)
+
+            return card
+
+        def set_count(n):
+            self.count_label.setText(f"{n} record" + ("s" if n != 1 else ""))
+
+        def render_items(items):
+            self.log_list.clear()
+            for (doc_id, pid, branch, color, condition, old_qty, new_qty, created, display_name, item_code) in items:
+                row_widget = make_row_widget(item_code, display_name, branch, color, condition, old_qty, new_qty, created)
+                list_item = QListWidgetItem(self.log_list)
+                # keep delete logic intact: store tuple in UserRole
+                list_item.setData(Qt.UserRole, (doc_id, pid, branch, color, condition, old_qty, new_qty))
+                list_item.setSizeHint(row_widget.sizeHint())
+                self.log_list.addItem(list_item)
+                self.log_list.setItemWidget(list_item, row_widget)
+            set_count(len(items))
 
         def load_logs():
             self.logs = []
@@ -312,7 +460,7 @@ class StockAdjustment(QWidget):
                         pname = product_data.get("name", "")
                         item_code = product_data.get("item_code", "")
 
-                        # ➕ Get dimensions and units
+                        # ➕ Dimensions (nice in name if present)
                         width = product_data.get("width")
                         length = product_data.get("length")
                         height = product_data.get("height")
@@ -325,7 +473,7 @@ class StockAdjustment(QWidget):
                             return str(int(val)) if isinstance(val, (int, float)) and val == int(val) else str(val)
 
                         def unit_symbol(unit):
-                            unit = unit.lower()
+                            unit = (unit or "").lower()
                             if unit == "inch":
                                 return '"'
                             elif unit == "ft":
@@ -337,50 +485,32 @@ class StockAdjustment(QWidget):
                         width_str = f"{format_value(width)}{unit_symbol(width_unit)}" if width is not None else ""
                         length_str = f"{format_value(length)}{unit_symbol(length_unit)}" if length is not None else ""
                         height_str = f"{format_value(height)}{unit_symbol(height_unit)}" if height is not None else ""
-
                         dims = " x ".join(filter(None, [width_str, length_str, height_str]))
-                        display_name = f"[{dims}] {pname}"
+                        display_name = f"[{dims}] {pname}" if dims else pname
                     else:
                         display_name = pname = item_code = ""
 
-                    log_text = (
-                        f"📦 {item_code} - {display_name}\n"
-                        f"Branch: {branch} | Color: {color} | Condition: {condition}\n"
-                        f"Qty: {old_qty} → {new_qty} at {created}"
-                    )
-
-                    item = QListWidgetItem(log_text)
-                    item.setData(Qt.UserRole, (doc.id, pid, branch, color, condition, old_qty, new_qty))
                     self.logs.append((doc.id, pid, branch, color, condition, old_qty, new_qty, created, display_name, item_code))
-                    self.log_list.addItem(item)
-
-                    separator = QListWidgetItem("—" * 60)
-                    separator.setFlags(separator.flags() & ~Qt.ItemIsSelectable)
-                    separator.setForeground(Qt.gray)
-                    self.log_list.addItem(separator)
             finally:
                 loader.close()
 
+            render_items(self.logs)
+
         def filter_logs():
-            keyword = search_bar.text().lower()
-            self.log_list.clear()
+            keyword = search_bar.text().lower().strip()
+            if not keyword:
+                render_items(self.logs)
+                return
 
-            for doc_id, pid, branch, color, condition, old_qty, new_qty, created, display_name, item_code in self.logs:
-                if any(keyword in s.lower() for s in [item_code, display_name, branch, color, condition]):
-                    log_text = (
-                        f"📦 {item_code} - {display_name}\n"
-                        f"Branch: {branch} | Color: {color} | Condition: {condition}\n"
-                        f"Qty: {old_qty} → {new_qty} at {created}"
-                    )
-
-                    item = QListWidgetItem(log_text)
-                    item.setData(Qt.UserRole, (doc_id, pid, branch, color, condition, old_qty, new_qty))
-                    self.log_list.addItem(item)
-
-                    separator = QListWidgetItem("—" * 60)
-                    separator.setFlags(separator.flags() & ~Qt.ItemIsSelectable)
-                    separator.setForeground(Qt.gray)
-                    self.log_list.addItem(separator)
+            filtered = []
+            for tup in self.logs:
+                doc_id, pid, branch, color, condition, old_qty, new_qty, created, display_name, item_code = tup
+                hay = " ".join([
+                    str(item_code or ""), str(display_name or ""), str(branch or ""), str(color or ""), str(condition or "")
+                ]).lower()
+                if keyword in hay:
+                    filtered.append(tup)
+            render_items(filtered)
 
         search_bar.textChanged.connect(filter_logs)
         load_logs()

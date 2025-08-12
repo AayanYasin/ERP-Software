@@ -7,8 +7,9 @@ from PyQt5.QtGui import QPainter, QPen
 from PyQt5.QtCore import Qt, QSize
 from firebase.config import db
 from firebase_admin import firestore
-from datetime import datetime
+from datetime import datetime, timezone
 from modules.manufacturing_cycle import ManufacturingModule, PannableGraphicsView
+import traceback
 
 
 class ViewManufacturingWindow(QWidget):
@@ -210,6 +211,11 @@ class RefactoredOrderDialog(QDialog):
                 widget.deleteLater()
 
         status = self.order_data.get("status", "Pending")
+        
+        if self.user_data.get("role") == "admin":
+            self.btn_revert = QPushButton("Revert Status")
+            self.btn_revert.clicked.connect(self.revert_status)
+            self.controls_layout.addWidget(self.btn_revert)
 
         if status == "Pending":
             self.controls_layout.addWidget(self.btn_start)
@@ -285,6 +291,41 @@ class RefactoredOrderDialog(QDialog):
 
     def reject_order(self):
         self.update_status("Rejected")
+        
+    def revert_status(self):
+        order_id = self.order_data.get("id")
+        if not order_id:
+            QMessageBox.warning(self, "Missing ID", "Order ID not available.")
+            return
+
+        # Get history (in reverse to find last status)
+        history = self.order_data.get("status_history", [])
+        if len(history) < 2:
+            QMessageBox.information(self, "No Previous Status", "There’s no previous status to revert to.")
+            return
+
+        prev_status = history[-2]["status"]  # second last
+        confirm = QMessageBox.question(
+            self, "Confirm Revert",
+            f"Revert to previous status: {prev_status}?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        try:
+            # Revert status
+            db.collection("manufacturing_orders").document(order_id).update({
+                "status": prev_status,
+                "status_history": history[:-1]  # remove last entry
+            })
+            QMessageBox.information(self, "Reverted", f"Order status reverted to {prev_status}.")
+            self.order_data["status"] = prev_status
+            self.order_data["status_history"] = history[:-1]
+            self.refresh_status_controls()
+            self.refresh_view()
+        except Exception as e:
+            QMessageBox.critical(self, "Revert Failed", str(e))
 
     def update_status(self, new_status):
         from PyQt5.QtWidgets import QInputDialog
@@ -373,7 +414,7 @@ class RefactoredOrderDialog(QDialog):
                         )
                         return
 
-            elif new_status in ["Completed", "Partially Completed"]:
+            elif new_status in  ["Completed", "Partially Completed"]:
                 sheets = self.order_data.get("sheets", [])
                 summary_lines = []
 
@@ -410,14 +451,35 @@ class RefactoredOrderDialog(QDialog):
                         if not prod_ref:
                             continue
 
+                        # ✅ Already produced qty
+                        qty_done = p.get("qty_done", 0)
+
+                        # ✅ Total target = (units per raw) × (raw qty used)
+                        full_target = int(p.get("qty", 0)) * raw_qty
+                        remaining_qty = max(0, full_target - qty_done)
+
+                        if remaining_qty == 0:
+                            continue  # Nothing left to produce
+
+                        # ✅ Determine how much to add this time
                         if new_status == "Completed":
-                            prod_qty = int(p.get("qty", 0)) * raw_qty
+                            prod_qty = remaining_qty  # Finish whatever's left
                         else:
+                            # Ask user how much to produce (max = remaining)
                             prod_qty, ok2 = QInputDialog.getInt(
-                                self, "Product Qty", f"How many units of '{p.get('name', '')}' made?", 0, 0, 9999
+                                self,
+                                "Product Qty",
+                                f"How many units of '{p.get('name', '')}' made?\nRemaining: {remaining_qty}",
+                                remaining_qty,  # Default
+                                0,              # Min
+                                remaining_qty   # Max
                             )
                             if not ok2:
                                 continue
+
+                        # ✅ Add this to write qty_done
+                        product_path = f"sheets.{sheets.index(sheet)}.products.{products.index(p)}.qty_done"
+                        updates.append(("manufacturing_orders", order_id, product_path, prod_qty))
 
                         prod_doc = prod_ref.get()
                         if prod_doc.exists:
@@ -434,25 +496,63 @@ class RefactoredOrderDialog(QDialog):
                         sheet_h = item_data.get("length", 0)
 
                         if cuts and sheet_w and sheet_h:
-                            rectangles = [
-                                (float(c.get("length", 0)), float(c.get("width", 0)))
-                                for c in cuts
-                            ]
+                            # 🧼 Clean and validate all rectangles (even legacy ones)
+                            rectangles = []
+                            for c in cuts:
+                                try:
+                                    x = float(c.get("x", 0)) if "x" in c else 0.0
+                                    y = float(c.get("y", 0)) if "y" in c else 0.0
+
+                                    # Guard: check for tuple/list values
+                                    length = c.get("length", 0)
+                                    width = c.get("width", 0)
+
+                                    if isinstance(length, (tuple, list)) or isinstance(width, (tuple, list)):
+                                        print(f"⚠️ Skipping invalid cut (tuple values): {c}")
+                                        continue
+
+                                    w = float(length)
+                                    h = float(width)
+
+                                    rectangles.append((x, y, w, h))
+
+                                except Exception as e:
+                                    print(f"⚠️ Skipping malformed cut: {c}, error: {e}")
 
                             sheet_w = item_data.get("width", 0)
                             sheet_h = item_data.get("length", 0)
 
-                            rects = ManufacturingModule().place_rectangles(sheet_w, sheet_h, rectangles)
-                            waste_blocks = ManufacturingModule().find_all_waste_blocks(sheet_w, sheet_h, rects)
+                            rects, _ = ManufacturingModule().place_rectangles(sheet_w, sheet_h, rectangles)
+                            rects_clean = []
+                            for r in rects:
+                                try:
+                                    x, y, w, h = map(float, r[:4])  # ✅ Force real numbers
+                                    rects_clean.append((x, y, w, h))
+                                except Exception as e:
+                                    print("⚠️ Skipping bad rect:", r, "→", e)
+                            waste_blocks = ManufacturingModule().find_all_waste_blocks(sheet_w, sheet_h, rects_clean)
 
                             if waste_blocks:
                                 block_lines = []
-                                for i, (x, y, w, h) in enumerate(waste_blocks, 1):
+                                for i, block in enumerate(waste_blocks, 1):
+                                    if not isinstance(block, (list, tuple)) or len(block) != 4:
+                                        print(f"⚠️ Skipping malformed waste block: {block}")
+                                        continue
+
+                                    x, y, w, h = block
+
+                                    try:
+                                        w = float(w)
+                                        h = float(h)
+                                    except Exception as e:
+                                        print(f"⚠️ Skipping block due to non-numeric dimensions: w={w}, h={h}, error={e}")
+                                        continue
+
                                     w, h = sorted([w, h], reverse=True)
                                     if w < 1.5 or h < 1.5:
-                                        continue  # Ignore too small scraps (optional)
-                                    block_lines.append(f"🔹 Block {i}: {w:.2f} x {h:.2f} inch × {raw_qty} pcs")
+                                        continue  # Ignore too small scraps
 
+                                    block_lines.append(f"🔹 Block {i}: {w:.2f} x {h:.2f} inch × {raw_qty} pcs")
                                 self.summary_text = "\n".join(block_lines)
                                 # ask = QMessageBox.question(
                                 #     self,
@@ -512,8 +612,22 @@ class RefactoredOrderDialog(QDialog):
                                         print("🔥 Failed to get/create Waste Raw Material subcategory:", e)
                                         waste_sub_id = ""  # fallback if needed
 
-                                    for (x, y, w, h) in waste_blocks:
+                                    for block in waste_blocks:
+                                        if not isinstance(block, (list, tuple)) or len(block) != 4:
+                                            print(f"⚠️ Skipping invalid waste block: {block}")
+                                            continue
+
+                                        x, y, w, h = block
+
+                                        try:
+                                            w = float(w)
+                                            h = float(h)
+                                        except Exception as e:
+                                            print(f"⚠️ Skipping block due to bad dimensions: w={w}, h={h}, error={e}")
+                                            continue
+
                                         w, h = sorted([w, h], reverse=True)
+
 
                                         # Round to 2 decimal places to ensure match consistency
                                         rounded_w = round(w, 2)
@@ -604,19 +718,93 @@ class RefactoredOrderDialog(QDialog):
                     QMessageBox.information(self, "Inventory Summary", "\n".join(summary_lines) + f"\nWaste Added:\n{self.summary_text}")
 
             # === Final Step: Update Status ===
-            db.collection("manufacturing_orders").document(order_id).update({
-                "status": new_status
+            # === Step 1: Safely update qty_done by modifying and writing back full sheets array ===
+            order_doc_ref = db.collection("manufacturing_orders").document(order_id)
+            order_data_full = order_doc_ref.get().to_dict()
+
+            if not order_data_full:
+                QMessageBox.critical(self, "Error", f"Order {order_id} no longer exists.")
+                return
+
+            # Get full sheets structure from Firestore
+            sheets = order_data_full.get("sheets", [])
+
+            # Apply qty_done from self.order_data (which has the latest UI values)
+            for sheet_idx, sheet in enumerate(sheets):
+                products = sheet.get("products", [])
+                for prod_idx, product in enumerate(products):
+                    try:
+                        new_qty_done = self.order_data["sheets"][sheet_idx]["products"][prod_idx].get("qty_done")
+                        if new_qty_done is not None:
+                            product["qty_done"] = new_qty_done
+                    except Exception as e:
+                        print(f"Error copying qty_done for sheet {sheet_idx} product {prod_idx}: {e}")
+
+            # ✅ Write back entire sheets array safely
+            order_doc_ref.update({
+                "sheets": sheets,
+                "status": new_status,
+                "status_history": firestore.ArrayUnion([{
+                    "status": new_status,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "user": self.user_data.get("name", "Unknown")
+                }])
             })
-            for (col, doc_id, field, value) in updates:
+
+            # === Step 3: Apply all deep field updates (qty_done, inventory) ===
+            for col, doc_id, field, value in updates:
                 db.collection(col).document(doc_id).update({field: value})
 
+            # === Step 4: Inventory adjustments (raw, finished, waste blocks) ===
+            for sheet in self.order_data.get("sheets", []):
+                raw_ref = sheet.get("raw_ref")
+                if raw_ref:
+                    try:
+                        raw_data = raw_ref.get().to_dict()
+                        raw_id = raw_ref.id
+                        color = raw_data.get("color", "Unknown")
+                        branch = self.user_data.get("branch")
+                        condition = "Used"
+                        used_qty = sheet.get("used_qty", 0)
+                        raw_field = f"qty.{branch}.{color}.{condition}"
+                        updates.append(("products", raw_id, raw_field, firestore.Increment(-used_qty)))
+                    except Exception as e:
+                        print(f"Failed to get raw_ref: {e}")
+
+                for product in sheet.get("products", []):
+                    prod_ref = product.get("product_ref")
+                    if prod_ref:
+                        try:
+                            prod_data = prod_ref.get().to_dict()
+                            prod_id = prod_ref.id
+                            color = prod_data.get("color", "Unknown")
+                            branch = self.user_data.get("branch")
+                            condition = "Waste" if product.get("is_waste") else "New"
+                            qty_done = product.get("qty_done", 0)
+                            prod_field = f"qty.{branch}.{color}.{condition}"
+                            updates.append(("products", prod_id, prod_field, firestore.Increment(qty_done)))
+                        except Exception as e:
+                            print(f"Failed to get prod_ref: {e}")
+                            
+            # === Step 5: Apply inventory updates ===
+            for col, doc_id, field, value in updates:
+                db.collection(col).document(doc_id).update({field: value})
+
+            # === Step 6: UI Updates ===
             QMessageBox.information(self, "Status Updated", f"Order marked as {new_status}.")
             self.order_data["status"] = new_status
+            self.order_data.setdefault("status_history", []).append({
+                "status": new_status,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "user": self.user_data.get("name", "Unknown")
+            })
             self.refresh_status_controls()
             self.refresh_view()
 
         except Exception as e:
-            QMessageBox.critical(self, "Update Failed", str(e))
+            error_message = traceback.format_exc()
+            QMessageBox.critical(self, "Update Failed", str(error_message))
+            
 
 
     def draw_sheet(self, sheet):
@@ -704,11 +892,26 @@ class RefactoredOrderDialog(QDialog):
             for cut in cuts
         )
 
-        prod_lines = "".join(
-            f"<li>{p.get('name', '?')}: {int(p.get('qty', 0))} x {raw_qty} = <b>{int(p.get('qty', 0)) * raw_qty}</b></li>"
-            for p in products
-        )
+        prod_lines = ""
+        for p in products:
+            name = p.get("name", "?")
+            per_raw = int(p.get("qty", 0))
+            total_expected = per_raw * raw_qty
 
+            # ✅ Use the newly tracked `qty_done` field instead of legacy produced
+            produced = int(p.get("qty_done", 0))  # fallback to 0 if missing
+
+            # ✅ Status icon logic
+            if produced >= total_expected:
+                status_icon = "✅"
+            elif produced > 0:
+                status_icon = "⏳"
+            else:
+                status_icon = "❌"
+
+            # ✅ Display as: ⏳ Product Name: 4 / 10
+            prod_lines += f"<li>{status_icon} {name}: {produced} / {total_expected}</li>"
+            
         html = f"""
         <h3>🔹 Raw Material</h3>
         <p><b>{formatted_name}</b><br>

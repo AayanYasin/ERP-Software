@@ -1,12 +1,26 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QListWidget,
-    QComboBox, QGridLayout, QMessageBox, QFileDialog, QProgressDialog, QApplication, QDialog, QFormLayout, QDialogButtonBox
+    QComboBox, QGridLayout, QMessageBox, QFileDialog, QProgressDialog, QApplication,
+    QDialog, QFormLayout, QDialogButtonBox, QFrame, QSplitter, QSizePolicy
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QSize
+from PyQt5.QtWidgets import QScrollArea
+from PyQt5.QtGui import QIcon
 from firebase.config import db
 import pandas as pd
 
+
 class ProductsPage(QWidget):
+    """
+    UI polish only — underlying UX, data flow and method names are unchanged.
+    - Softer look (rounded cards, spacing, typography)
+    - Better layout using a QSplitter
+    - Comfortable control sizes (bigger inputs, list item padding)
+    - Consistent button styling (primary / subtle)
+    - Subtle section headers
+    - Responsive tweaks for smaller screens (vertical stacking, compact paddings, scrollable form)
+    """
+
     def __init__(self, user_data):
         super().__init__()
         self.user_data = user_data
@@ -14,9 +28,57 @@ class ProductsPage(QWidget):
         if isinstance(self.branches, str):
             self.branches = [self.branches]
 
+        # ===== Window =====
         self.setWindowTitle("Products Management")
-        self.setGeometry(200, 100, 1100, 700)
-        self.setStyleSheet("background-color: #f4f6f9;")
+        self.resize(1200, 750)
+        self.setMinimumSize(900, 620)
+
+        # ===== Global Stylesheet (Qt-friendly — no box-shadow) =====
+        self._regular_styles = (
+            """
+            QWidget { background-color: #f5f7fb; color: #1f2937; font-size: 13px; }
+            QLabel#TitleLabel { font-size: 20px; font-weight: 700; color: #111827; }
+            QLabel#SectionLabel { font-size: 12px; font-weight: 600; color: #6b7280; margin: 6px 2px; text-transform: uppercase; }
+            QFrame#Card { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 14px; }
+            QFrame#Toolbar { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 14px; }
+            QLineEdit, QComboBox { 
+                border: 1px solid #e5e7eb; border-radius: 10px; padding: 8px 10px; min-height: 36px; 
+                background: #ffffff; selection-background-color: #c7d2fe; 
+            }
+            QLineEdit:focus, QComboBox:focus { border: 1px solid #6366f1; }
+            QListWidget { border: 1px solid #e5e7eb; border-radius: 10px; background: #fff; }
+            QListWidget::item { padding: 10px 12px; margin: 2px; border-radius: 8px; min-height: 34px; }
+            QListWidget::item:selected { background: #eef2ff; color: #111827; }
+            QPushButton { border: none; border-radius: 12px; padding: 9px 14px; font-weight: 600; }
+            QPushButton#Primary { background: #4f46e5; color: white; }
+            QPushButton#Primary:hover { background: #4338ca; }
+            QPushButton#Subtle { background: #eef2ff; color: #3730a3; }
+            QPushButton#Subtle:hover { background: #e0e7ff; }
+            QPushButton#Danger { background: #fee2e2; color: #b91c1c; }
+            QPushButton#Danger:hover { background: #fecaca; }
+            QLabel#DialogHeading { font-size: 14px; font-weight: 700; margin: 6px 0 10px 0; }
+            QProgressDialog { border: 1px solid #e5e7eb; border-radius: 12px; }
+            """
+        )
+        self._compact_styles = (
+            """
+            QWidget { background-color: #f5f7fb; color: #1f2937; font-size: 12px; }
+            QLabel#TitleLabel { font-size: 18px; font-weight: 700; color: #111827; }
+            QLabel#SectionLabel { font-size: 11px; font-weight: 600; color: #6b7280; margin: 4px 2px; text-transform: uppercase; }
+            QFrame#Card { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 12px; }
+            QLineEdit, QComboBox { 
+                border: 1px solid #e5e7eb; border-radius: 8px; padding: 6px 8px; min-height: 32px; 
+                background: #ffffff; selection-background-color: #c7d2fe; 
+            }
+            QListWidget { border: 1px solid #e5e7eb; border-radius: 8px; background: #fff; }
+            QListWidget::item { padding: 8px 10px; margin: 2px; border-radius: 8px; min-height: 30px; }
+            QPushButton { border: none; border-radius: 10px; padding: 7px 12px; font-weight: 600; }
+            QPushButton#Primary { background: #4f46e5; color: white; }
+            QPushButton#Subtle { background: #eef2ff; color: #3730a3; }
+            QPushButton#Danger { background: #fee2e2; color: #b91c1c; }
+            """
+        )
+        self.setStyleSheet(self._regular_styles)
 
         self.categories = []
         self.subcategories = []
@@ -27,78 +89,186 @@ class ProductsPage(QWidget):
         self.setup_ui()
         self.refresh_categories()
 
+    # ================= UI =================
+    def _card(self):
+        card = QFrame()
+        card.setObjectName("Card")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(10)
+        return card, lay
+
+    def _toolbar(self):
+        bar = QFrame()
+        bar.setObjectName("Toolbar")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
+        return bar, lay
+
+    def _btn(self, text, clicked, kind="primary", icon: QIcon = None):
+        btn = QPushButton(text)
+        if icon:
+            btn.setIcon(icon)
+            btn.setIconSize(QSize(16, 16))
+        if kind == "primary":
+            btn.setObjectName("Primary")
+        elif kind == "danger":
+            btn.setObjectName("Danger")
+        else:
+            btn.setObjectName("Subtle")
+        btn.clicked.connect(clicked)
+        return btn
+
     def setup_ui(self):
-        layout = QVBoxLayout(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
+
+        # Title + header actions (button snug with title, not full-width)
+        header_row = QHBoxLayout()
+        header_row.setSpacing(8)
+        header_row.setContentsMargins(0, 0, 0, 0)
 
         title = QLabel("📦 Product Setup Panel")
-        title.setStyleSheet("font-size: 16pt; font-weight: bold; color: #2d3436;")
-        layout.addWidget(title, alignment=Qt.AlignHCenter)
+        title.setObjectName("TitleLabel")
+        title.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        header_row.addWidget(title, 0, Qt.AlignLeft)
+        header_row.addStretch(1)
 
-        main_layout = QHBoxLayout()
-        layout.addLayout(main_layout)
+        import_btn = self._btn("Import Inventory", self.import_inventory, kind="primary")
+        import_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)  # avoid stretching full width
+        header_row.addWidget(import_btn, 0, Qt.AlignRight)
 
-        # Left panel: Categories
-        self.left_layout = QVBoxLayout()
-        main_layout.addLayout(self.left_layout, 1)
+        root.addLayout(header_row)
+
+        # Split main area
+        splitter = QSplitter()
+        splitter.setOrientation(Qt.Horizontal)
+        splitter.setHandleWidth(10)
+        splitter.setChildrenCollapsible(False)
+        self.splitter = splitter
+        root.addWidget(splitter, 1)
+
+        # ===== Left pane (Categories + Subcategories) =====
+        left_card, left_lay = self._card()
+        splitter.addWidget(left_card)
+
+        lbl_cat = QLabel("Main Categories")
+        lbl_cat.setObjectName("SectionLabel")
+        lbl_cat.setWordWrap(True)
+        left_lay.addWidget(lbl_cat)
 
         self.cat_list = QListWidget()
+        self.cat_list.setUniformItemSizes(False)
+        self.cat_list.setTextElideMode(Qt.ElideRight)
         self.cat_list.itemSelectionChanged.connect(self.on_main_category_selected)
-        self.left_layout.addWidget(QLabel("Main Categories:"))
-        self.left_layout.addWidget(self.cat_list)
+        self.cat_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        left_lay.addWidget(self.cat_list)
+
+        cat_row = QHBoxLayout()
         self.cat_input = QLineEdit()
-        self.left_layout.addWidget(self.cat_input)
-        # self.left_layout.addLayout(self.make_button_row_3("Add", self.add_category, "Edit", self.edit_category, "Delete", self.delete_category))
+        self.cat_input.setPlaceholderText("Add or rename main category…")
+        cat_row.addWidget(self.cat_input, 1)
+        cat_row.addWidget(self._btn("Add", self.add_category, kind="subtle"))
+        cat_row.addWidget(self._btn("Rename", self.edit_category, kind="subtle"))
+        cat_row.addWidget(self._btn("Delete", self.delete_category, kind="danger"))
+        left_lay.addLayout(cat_row)
+
+        left_lay.addSpacing(6)
+        lbl_sub = QLabel("Sub Categories")
+        lbl_sub.setObjectName("SectionLabel")
+        lbl_sub.setWordWrap(True)
+        left_lay.addWidget(lbl_sub)
 
         self.subcat_list = QListWidget()
+        self.subcat_list.setUniformItemSizes(False)
+        self.subcat_list.setTextElideMode(Qt.ElideRight)
         self.subcat_list.itemSelectionChanged.connect(self.on_sub_category_selected)
-        self.left_layout.addWidget(QLabel("Sub Categories:"))
-        self.left_layout.addWidget(self.subcat_list)
-        self.subcat_input = QLineEdit()
-        self.left_layout.addWidget(self.subcat_input)
-        self.left_layout.addLayout(self.make_button_row_3("Add", self.add_subcategory, "Edit", self.edit_subcategory, "Delete", self.delete_subcategory))
+        self.subcat_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        left_lay.addWidget(self.subcat_list)
 
-        # Right panel: Items
-        self.right_layout = QVBoxLayout()
-        main_layout.addLayout(self.right_layout, 2)
+        sub_row = QHBoxLayout()
+        self.subcat_input = QLineEdit()
+        self.subcat_input.setPlaceholderText("Add or rename sub category…")
+        sub_row.addWidget(self.subcat_input, 1)
+        sub_row.addWidget(self._btn("Add", self.add_subcategory, kind="subtle"))
+        sub_row.addWidget(self._btn("Rename", self.edit_subcategory, kind="subtle"))
+        sub_row.addWidget(self._btn("Delete", self.delete_subcategory, kind="danger"))
+        left_lay.addLayout(sub_row)
+
+        # ===== Right pane (Items + Form) =====
+        right_card, right_lay = self._card()
+        splitter.addWidget(right_card)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+
+        lbl_items = QLabel("Items") 
+        lbl_items.setObjectName("SectionLabel")
+        lbl_items.setWordWrap(True)
+        right_lay.addWidget(lbl_items)
 
         self.item_list = QListWidget()
+        self.item_list.setUniformItemSizes(False)
+        self.item_list.setTextElideMode(Qt.ElideRight)
         self.item_list.itemSelectionChanged.connect(self.on_item_selected)
-        self.right_layout.addWidget(QLabel("Items:"))
-        self.right_layout.addWidget(self.item_list)
+        right_lay.addWidget(self.item_list, 1)
 
-        self.item_form = self.build_item_form()
-        self.right_layout.addLayout(self.item_form)
-        self.right_layout.addLayout(self.make_button_row("Add", self.add_item, "Edit", self.edit_item, "Delete", self.delete_item, "Clear", self.clear_fields))
+        # Form card inside right pane (scrollable on small screens)
+        form_card, form_lay = self._card()
+        form_title = QLabel("Item Details")
+        form_title.setObjectName("SectionLabel")
+        form_title.setWordWrap(True)
+        form_lay.addWidget(form_title)
 
-        import_btn = QPushButton("📥 Import Inventory")
-        import_btn.clicked.connect(self.import_inventory)
-        layout.addWidget(import_btn)
+        form_grid = self.build_item_form()
+        form_lay.addLayout(form_grid)
 
+        self.form_scroll = QScrollArea()
+        self.form_scroll.setWidgetResizable(True)
+        self.form_container = QWidget()
+        self.form_container.setLayout(QVBoxLayout())
+        self.form_container.layout().setContentsMargins(0, 0, 0, 0)
+        self.form_container.layout().addWidget(form_card)
+        self.form_scroll.setWidget(self.form_container)
+        right_lay.addWidget(self.form_scroll, 2)
+
+        # Action row
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        actions.addWidget(self._btn("Add", self.add_item, kind="primary"))
+        actions.addWidget(self._btn("Edit", self.edit_item, kind="subtle"))
+        actions.addWidget(self._btn("Delete", self.delete_item, kind="danger"))
+        actions.addWidget(self._btn("Clear", self.clear_fields, kind="subtle"))
+        right_lay.addLayout(actions)
+
+        # Start in the right mode for current size
+        self._apply_responsive_layout()
+
+    # ================= Helpers (no logic change) =================
     def make_button_row(self, txt1, cmd1, txt2, cmd2, txt3, cmd3, txt4, cmd4):
+        # kept for compatibility
         row = QHBoxLayout()
         for txt, cmd in [(txt1, cmd1), (txt2, cmd2), (txt3, cmd3), (txt4, cmd4)]:
-            btn = QPushButton(txt)
-            btn.clicked.connect(cmd)
-            btn.setStyleSheet("padding: 5px 10px;")
+            btn = self._btn(txt, cmd, kind="subtle")
             row.addWidget(btn)
         return row
 
     def make_button_row_3(self, txt1, cmd1, txt2, cmd2, txt3, cmd3):
+        # kept for compatibility
         row = QHBoxLayout()
         for txt, cmd in [(txt1, cmd1), (txt2, cmd2), (txt3, cmd3)]:
-            btn = QPushButton(txt)
-            btn.clicked.connect(cmd)
-            btn.setStyleSheet("padding: 5px 10px;")
+            btn = self._btn(txt, cmd, kind="subtle")
             row.addWidget(btn)
         return row
-    
+
     def show_loader(self, parent, title="Please wait...", message="Processing..."):
         loader = QProgressDialog(message, None, 0, 0, parent)
         loader.setWindowModality(Qt.WindowModal)
         loader.setMinimumDuration(0)
         loader.setAutoClose(True)
         loader.setCancelButton(None)
-        loader.setWindowTitle(title)    
+        loader.setWindowTitle(title)
         loader.show()
         QApplication.processEvents()
         return loader
@@ -107,6 +277,8 @@ class ProductsPage(QWidget):
         self.fields = {}
         self.qty_fields = {}
         grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(8)
 
         # Fields before Metal Type
         labels_before_metal = [
@@ -116,9 +288,11 @@ class ProductsPage(QWidget):
 
         row = 0
         for label, readonly in labels_before_metal:
-            grid.addWidget(QLabel(label + ":"), row, 0)
+            lab = QLabel(label + ":")
+            grid.addWidget(lab, row, 0)
             entry = QLineEdit()
             entry.setReadOnly(readonly)
+            entry.setPlaceholderText(label)
             self.fields[label.lower().replace(" ", "_")] = entry
             grid.addWidget(entry, row, 1)
             row += 1
@@ -138,14 +312,16 @@ class ProductsPage(QWidget):
             ("Selling Price", False), ("Reorder Qty", False), ("Weight", False)
         ]
         for label, readonly in labels_after_metal:
-            grid.addWidget(QLabel(label + ":"), row, 0)
+            lab = QLabel(label + ":")
+            grid.addWidget(lab, row, 0)
             entry = QLineEdit()
             entry.setReadOnly(readonly)
+            entry.setPlaceholderText(label)
             self.fields[label.lower().replace(" ", "_")] = entry
             grid.addWidget(entry, row, 1)
             row += 1
 
-        # Unit selectors
+        # Unit selectors aligned with dimensions
         self.unit_fields = {}
         for i, dim in enumerate(["length", "width", "height"]):
             grid.addWidget(QLabel(dim.capitalize() + " Unit:"), i + 2, 2)  # align with length/width/height rows
@@ -162,14 +338,32 @@ class ProductsPage(QWidget):
         grid.addWidget(weight_unit_cb, row - 1, 3)
 
         # Instructional label
-        label = QLabel("Qty input will be prompted per branch and color when saving.")
-        label.setStyleSheet("font-style: italic; color: #636e72;")
-        grid.addWidget(label, row, 0, 1, 4)
+        hint = QLabel("Qty input will be prompted per branch and color when saving.")
+        hint.setStyleSheet("font-style: italic; color: #6b7280;")
+        grid.addWidget(hint, row, 0, 1, 4)
 
         return grid
 
+    # ================= Responsive helpers =================
+    def _apply_responsive_layout(self):
+        # Switch to vertical stack when narrow and apply compact styles
+        narrow = self.width() < 980
+        try:
+            if hasattr(self, 'splitter') and self.splitter is not None:
+                self.splitter.setOrientation(Qt.Vertical if narrow else Qt.Horizontal)
+                # When vertical, give right pane more stretch
+                if not narrow:
+                    self.splitter.setStretchFactor(0, 1)
+                    self.splitter.setStretchFactor(1, 2)
+        except Exception:
+            pass
+        self.setStyleSheet(self._compact_styles if narrow else self._regular_styles)
 
+    def resizeEvent(self, event):
+        self._apply_responsive_layout()
+        super().resizeEvent(event)
 
+    # ================= Behavior (unchanged) =================
     def on_main_category_selected(self):
         index = self.cat_list.currentRow()
         if index >= 0 and index < len(self.categories):
@@ -180,17 +374,12 @@ class ProductsPage(QWidget):
         selected_name = self.categories[index][1].strip().lower()
         is_raw_material = selected_name == "raw material"
 
-        # Correct: Set both label + combo visible
         self.metal_type_label.setVisible(is_raw_material)
         self.fields["metal_type"].setVisible(is_raw_material)
         self.fields["metal_type"].setEnabled(is_raw_material)
 
-        # Optional: disable instead of hide
-        self.fields["metal_type"].setEnabled(is_raw_material)
-
         if not is_raw_material:
             self.fields["metal_type"].setCurrentIndex(0)
-
 
     def on_sub_category_selected(self):
         index = self.subcat_list.currentRow()
@@ -222,14 +411,7 @@ class ProductsPage(QWidget):
                 unit = data.get(dim + "_unit", "Ft" if dim != "weight" else "kg")
                 if unit_cb:
                     idx = unit_cb.findText(unit)
-                    unit_cb.setCurrentIndex(idx if idx >= 0 else 0) 
-            # qty_data = data.get("qty", {})
-            # summary = []
-            # for branch, color_map in qty_data.items():
-            #     for color, qty in color_map.items():
-            #         summary.append(f"{branch} - {color}: {qty}")
-            # if summary:
-            #     QMessageBox.information(self, "Qty Summary", "\n".join(summary))
+                    unit_cb.setCurrentIndex(idx if idx >= 0 else 0)
 
     def validate_fields(self):
         length = self.fields["length"].text().strip()
@@ -272,7 +454,7 @@ class ProductsPage(QWidget):
             "reorder_qty": int(self.fields["reorder_qty"].text().strip() or 0),
             "sub_id": self.selected_sub_id,
         }
-        
+
     def fetch_colors(self):
         doc = db.collection("meta").document("colors").get()
         return doc.to_dict().get("pc_colors", [])
@@ -303,6 +485,7 @@ class ProductsPage(QWidget):
         self.subcat_list.clear()
         self.subcategories = []
         if not self.selected_main_id:
+            loader.close()
             return
         for doc in db.collection("product_sub_categories").where("main_id", "==", self.selected_main_id).stream():
             data = doc.to_dict()
@@ -311,10 +494,11 @@ class ProductsPage(QWidget):
         loader.close()
 
     def refresh_items(self):
-        loader = self.show_loader(self, "Loading Categories", "Refreasing Items...")
+        loader = self.show_loader(self, "Loading Categories", "Refreshing Items...")
         self.item_list.clear()
         self.items = []
         if not self.selected_sub_id:
+            loader.close()
             return
         query = db.collection("products").where("sub_id", "==", self.selected_sub_id)
         for doc in query.stream():
@@ -411,7 +595,6 @@ class ProductsPage(QWidget):
         self.refresh_items()
         self.clear_fields()
         loader.close()
-
 
     def edit_item(self):
         loader = self.show_loader(self, "Loading Categories", "Editing Item...")
@@ -518,9 +701,8 @@ class ProductsPage(QWidget):
             return str(new_code)
 
         return increment_code(transaction)
-    
-    def get_qty_per_branch_and_color(self):
 
+    def get_qty_per_branch_and_color(self):
         colors = self.fetch_colors()
         conditions = ["New", "Used", "Bad"]
         if not colors:
@@ -532,15 +714,17 @@ class ProductsPage(QWidget):
         for branch in self.branches:
             dialog = QDialog(self)
             dialog.setWindowTitle(f"Enter Qty for {branch}")
-            dialog.setMinimumWidth(500)
+            dialog.setMinimumWidth(520)
 
             layout = QVBoxLayout(dialog)
 
             heading = QLabel(f"Branch: {branch}")
-            heading.setStyleSheet("font-weight: bold; font-size: 14pt; margin-bottom: 10px;")
+            heading.setObjectName("DialogHeading")
             layout.addWidget(heading)
 
             form = QFormLayout()
+            form.setHorizontalSpacing(12)
+            form.setVerticalSpacing(8)
             input_map = {}  # color -> condition -> input
 
             for color in colors:
@@ -550,11 +734,12 @@ class ProductsPage(QWidget):
                 for cond in conditions:
                     input_field = QLineEdit()
                     input_field.setPlaceholderText(f"{cond}: 0")
-                    input_field.setFixedWidth(80)
+                    input_field.setFixedWidth(90)
+                    input_field.setMinimumHeight(32)
                     input_map[color][cond] = input_field
                     row.addWidget(input_field)
 
-                form.addRow(QLabel(f"{color}:"), row)
+                form.addRow(QLabel(f"{color}:") , row)
 
             layout.addLayout(form)
 
