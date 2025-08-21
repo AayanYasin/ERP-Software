@@ -17,9 +17,10 @@ from modules.view_manufacturing_orders import ViewManufacturingWindow
 from modules.settings import SettingsWindow
 from modules.chart_of_accounts import ChartOfAccounts
 from modules.view_journal_entries import JournalEntryViewer
-from modules.employee_master import EmployeeMaster
+from modules.employee_master import EmployeeModule
 from modules.clients_master import PartyModule
 from modules.invoice import InvoiceModule
+from modules.view_invoice import ViewInvoicesModule
 # from modules.whatsapp_module import WhatsAppIntegrationWidget
 from firebase.config import db
 
@@ -50,7 +51,7 @@ class DashboardApp(QMainWindow):
             ]),
 
             ("Emploees", [
-                ("Manage/View", lambda: self.launch_module("Emploee_window", EmployeeMaster, self.user_data)),
+                ("Manage/View", lambda: self.launch_module("Emploee_window", EmployeeModule, self.user_data)),
             ]),
 
             ("Accounting", [
@@ -60,6 +61,7 @@ class DashboardApp(QMainWindow):
 
             ("Sales", [
                 ("Invoice", lambda: self.launch_module("invoice_window", InvoiceModule, self.user_data)),
+                ("View Invoice", lambda: self.launch_module("view_invoice_window", ViewInvoicesModule, self.user_data)),
             ]),
 
             ("Purchase", [

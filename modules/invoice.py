@@ -87,6 +87,9 @@ class InvoiceModule(QWidget):
         self.default_type = default_type
         self.product_cards = []
 
+        # --- edit mode state ---
+        self._loaded_doc_id = None  # set by load_invoice when editing
+
         # Fetch colors & hard-code conditions
         try:
             doc = db.collection("meta").document("colors").get()
@@ -112,22 +115,23 @@ class InvoiceModule(QWidget):
         main = QVBoxLayout(self)
         main.setContentsMargins(12, 12, 12, 12)
         main.setSpacing(15)
-
-        # Sections
-        main.addWidget(self._build_header_section())
         
-        # Load data (now safe to use self.client_cb)
+        # Build sections first (combos now exist)
+        main.addWidget(self._build_header_section())
+        main.addWidget(self._build_items_section())
+        main.addWidget(self._build_summary_section())
+        self.load_postable_accounts()  # this needs received_account_cb already built
+        main.addWidget(self._build_notes_section())
+        main.addLayout(self._build_footer_layout())
+
+        # Now load data (these can safely touch the combos)
         self.load_clients()
         self.load_products()
         self.load_sales_reps()
         
-        main.addWidget(self._build_items_section())
-        main.addWidget(self._build_summary_section())
-        self.load_postable_accounts()
-        main.addWidget(self._build_notes_section())
-        main.addLayout(self._build_footer_layout())
-        
         self.status_cb.currentTextChanged.connect(self._update_invoice_no_preview)
+        self.status_cb.currentTextChanged.connect(self._toggle_payment_fields)
+        self._toggle_payment_fields(self.status_cb.currentText())
         if self.default_type and self.default_type in [self.status_cb.itemText(i) for i in range(self.status_cb.count())]:
             self.status_cb.setCurrentText(self.default_type)
         else:
@@ -167,24 +171,42 @@ class InvoiceModule(QWidget):
 
     def load_clients(self):
         self.clients.clear()
+        try:
+            client_docs = db.collection("parties").where("active", "==", True).stream()
+            for doc in client_docs:
+                d = doc.to_dict() or {}
+                id_field = d.get("id", doc.id)
+                name = d.get("name", "Unnamed")
+                client_type = (d.get("type") or "Customer").lower()
+                short_type = "SUP" if client_type == "supplier" else "CUST"
+                contact = d.get("phone") or d.get("email") or "No Contact"
+                display_text = f"[{id_field}] - {name} ({short_type}) - {contact}"
+                # map by Firestore doc.id → keep both the data and the display text
+                self.clients[doc.id] = {"data": d, "display": display_text}
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load clients: {e}")
+            return
+
+        if hasattr(self, "client_cb"):
+            self._refresh_client_combo()
+            
+    def _toggle_payment_fields(self, doc_type):
+        """
+        Disable Received account dropdown + amount field if type is Quotation.
+        Enable them otherwise.
+        """
+        is_quotation = (doc_type.strip().lower() == "quotation")
+        self.received_account_cb.setDisabled(is_quotation)
+        self.received.setDisabled(is_quotation)
+
+    def _refresh_client_combo(self):
+        self.client_cb.blockSignals(True)
         self.client_cb.clear()
-        self.client_cb.addItem("")  # Start with an empty selection
-
-        client_docs = db.collection("parties").where("active", "==", True).stream()
-
-        for doc in client_docs:
-            d = doc.to_dict()
-            id_field = d.get("id", doc.id)  # Use the 'id' field inside document, fallback to doc.id
-            name = d.get("name", "Unnamed")
-            client_type = d.get("type", "Customer")
-            short_type = "SUP" if client_type.lower() == "supplier" else "CUST"
-            contact = d.get("phone") or d.get("email") or "No Contact"
-
-            display_text = f"{id_field} - {name} ({short_type}) - {contact}"
-            self.client_cb.addItem(display_text, doc.id)  # Associate display_text with Firestore doc.id
-
-            # Store doc.id and the data for fast lookup
-            self.clients[doc.id] = {"data": d, "display": display_text}
+        self.client_cb.addItem("")  # optional blank
+        for doc_id, payload in self.clients.items():
+            self.client_cb.addItem(payload["display"], doc_id)  # store doc.id in itemData
+        self._apply_completer(self.client_cb)
+        self.client_cb.blockSignals(False)
 
         
     def load_products(self):
@@ -223,10 +245,32 @@ class InvoiceModule(QWidget):
 
     def load_sales_reps(self):
         self.sales_reps.clear()
+
+        items = []
         for doc in db.collection("employees").where("active", "==", True).stream():
-            d = doc.to_dict()
-            label = f"{d.get('name')} ({d.get('employee_code')})"
+            d = doc.to_dict() or {}
+            name = (d.get("name") or "Unnamed").strip()
+            code = (d.get("employee_code") or "").strip()
+
+            # NEW format: [Code] - Name  (fallback to Name if code missing)
+            label = f"[{code}] - {name}" if code else name
+
             self.sales_reps[label] = doc.id
+            items.append((label, doc.id))
+
+        if hasattr(self, "rep_cb"):
+            self.rep_cb.blockSignals(True)
+            self.rep_cb.clear()
+            self.rep_cb.addItem("")  # optional blank
+            for label, emp_id in items:
+                self.rep_cb.addItem(label, emp_id)
+            self._apply_completer(self.rep_cb)
+            self.rep_cb.blockSignals(False)
+            
+    def _fmt_employee_label(self, d: dict) -> str:
+        name = (d.get("name") or "Unnamed").strip()
+        code = (d.get("employee_code") or "").strip()
+        return f"[{code}] - {name}" if code else name
             
     def load_postable_accounts(self):
         self.postable_accounts = {}
@@ -284,7 +328,7 @@ class InvoiceModule(QWidget):
         self.invoice_no    = QLineEdit(); self.invoice_no.setReadOnly(True)
         self.invoice_date  = QDateEdit(QDate.currentDate()); self.invoice_date.setCalendarPopup(True)
         self.due_date      = QDateEdit(QDate.currentDate().addDays(7)); self.due_date.setCalendarPopup(True)
-        self.status_cb     = QComboBox(); self.status_cb.addItems(["Quotation", "Invoice", "Bill", "Cash Sale"])
+        self.status_cb     = QComboBox(); self.status_cb.addItems(["Quotation", "Cash Sale"])
         
         self.subject       = QLineEdit()
         self.payment_terms_btn = QPushButton("Select")
@@ -308,12 +352,15 @@ class InvoiceModule(QWidget):
         self.site_address  = QLineEdit()
 
         self.client_cb = QComboBox()
-        self.client_cb.addItem("")  # Add empty/default placeholder
+        self.client_cb.addItem("")
         self.client_cb.setInsertPolicy(QComboBox.NoInsert)
-        self.client_cb.addItems(self.clients.keys())
         self.client_cb.currentTextChanged.connect(self._autofill_site_address)
         self.client_cb.setEditable(True)
         self._apply_completer(self.client_cb)
+
+        # If clients were loaded earlier for any reason, reflect them now
+        if getattr(self, "clients", None):
+            self._refresh_client_combo()
         
         # ✅ Select first filtered item on Enter
         def select_first_from_completer():
@@ -328,7 +375,10 @@ class InvoiceModule(QWidget):
 
         # self.client_cb.lineEdit().returnPressed.connect(select_first_from_completer)
 
-        self.rep_cb = QComboBox(); self.rep_cb.addItems(self.sales_reps.keys())
+        self.rep_cb = QComboBox()
+        self.rep_cb.addItem("")  # optional
+        for label, emp_id in self.sales_reps.items():
+            self.rep_cb.addItem(label, emp_id)  # store Firestore doc.id
         self._apply_completer(self.rep_cb)
 
         # Row 0
@@ -610,9 +660,9 @@ class InvoiceModule(QWidget):
     def _build_footer_layout(self):
         h = QHBoxLayout()
         h.addStretch()
-        save_btn = QPushButton("Save Invoice")
-        save_btn.clicked.connect(self.finalize_invoice)
-        h.addWidget(save_btn)
+        self.save_btn = QPushButton("Save Invoice")
+        self.save_btn.clicked.connect(self.finalize_invoice)  # default action (new doc)
+        h.addWidget(self.save_btn)
         return h
 
     # — Calculations & actions —
@@ -649,214 +699,469 @@ class InvoiceModule(QWidget):
 
     def finalize_invoice(self):
         """
-        Save invoice document to Firestore. If a received amount and a received account
-        are provided, post a payment journal entry and update account balances.
+        Quotation:
+        - Save only (no JEs, no inventory).
+        Cash Sale:
+        - Validate AR link + payment account.
+        - Save.
+        - Post Revenue JE: DR AR (real) + CR 'Sales Revenue' (virtual, NO balance impact).
+        - Post Payment JE: DR Cash/Bank, CR AR (updates balances).
+        - (Inventory hook left for later.)
         """
         try:
-            # 1) ensure invoice number incremented & preview set
-            self._generate_invoice_number()
-            invoice_no = self.invoice_no.text()
-            
-            selected_index = self.client_cb.currentIndex()
-            client_doc_id = self.client_cb.itemData(selected_index)
-            client_info = self.clients.get(client_doc_id)
-            party_data = client_info["data"] if client_info else None
+            doc_type = self.status_cb.currentText().strip()  # "Quotation" or "Cash Sale"
 
-            # 2) gather invoice header & items
-            invoice_data = {
-                "invoice_no": invoice_no,
-                "doc_type": self.status_cb.currentText(),
-                "invoice_date": datetime.datetime.combine(self.invoice_date.date().toPyDate(), datetime.datetime.min.time()),
-                "due_date": datetime.datetime.combine(self.due_date.date().toPyDate(), datetime.datetime.min.time()),
-                "subject": self.subject.text().strip(),
-                "payment_terms": [a.text() for a in self.payment_terms_menu.actions() if a.isChecked()],
+            # --- Basic validations shared ---
+            if self.client_cb.currentIndex() <= 0:
+                QMessageBox.warning(self, "Missing Client", "Please select a client.")
+                return
+
+            items = self.get_invoice_data()
+            if not items:
+                QMessageBox.warning(self, "No Items", "Add at least one item before saving.")
+                return
+
+            # Totals from UI (+ % toggles)
+            def _num(s):
+                try: return float((s or "0").replace(",", ""))
+                except: return 0.0
+
+            subtotal = sum(i.get("total", 0.0) for i in items)
+            disc = _num(self.discount.text()); tax = _num(self.tax.text())
+            ship = _num(self.shipping.text()); labour = _num(self.labour.text())
+            if getattr(self, "discount_is_percent", False): disc = subtotal * disc / 100.0
+            if getattr(self, "tax_is_percent", False):      tax  = subtotal * tax  / 100.0
+            total = round(subtotal - disc + tax + ship + labour, 2)
+
+            # Dates & numbering
+            inv_date = self.invoice_date.date().toPyDate()
+            due_date = self.due_date.date().toPyDate()
+            self._generate_invoice_number()
+            inv_no = self.invoice_no.text().strip()
+
+            # Client & rep
+            client_id = self.client_cb.itemData(self.client_cb.currentIndex())
+            rep_id = self.rep_cb.itemData(self.rep_cb.currentIndex())
+
+            # Payment terms (multi)
+            pay_terms = [a.text() for a in self.payment_terms_menu.actions() if a.isChecked()]
+
+            # Received inputs (may be 0 for Quotation)
+            received_amount = _num(self.received.text())
+            recv_payload = self.received_account_cb.itemData(self.received_account_cb.currentIndex())
+            received_account_id = (recv_payload or {}).get("id")
+
+            # Branch meta
+            branch_val = self.user_data.get("branch")
+            if isinstance(branch_val, list): branch_val = branch_val[0] if branch_val else "-"
+            branch_val = branch_val or "-"
+
+            # Build doc
+            invoice_doc = {
+                "invoice_no": inv_no,
+                "type": doc_type,
+                "invoice_date": datetime.datetime.combine(inv_date, datetime.datetime.min.time()),
+                "due_date": datetime.datetime.combine(due_date, datetime.datetime.min.time()),
+                "client_id": client_id,
+                "sales_rep_id": rep_id if rep_id else None,
                 "site_address": self.site_address.text().strip(),
-                "client_display": self.client_cb.currentText(),
-                "client_id": party_data.get("id", client_doc_id) if party_data else "",
-                "sales_rep": self.rep_cb.currentText(),
-                "items": self.get_invoice_data(),
-                "notes": self.notes.toPlainText(),
-                "terms": self.terms.toPlainText(),
-                "created_at": datetime.datetime.now(),
+                "subject": self.subject.text().strip(),
+                "payment_terms": pay_terms,
+                "items": items,
+                "amounts": {
+                    "subtotal": float(subtotal),
+                    "discount": float(disc),
+                    "tax": float(tax),
+                    "shipping": float(ship),
+                    "labour": float(labour),
+                    "total": float(total),
+                    "received": float(received_amount if doc_type == "Cash Sale" else 0.0),
+                    "balance": float(max(0.0, total - (received_amount if doc_type == "Cash Sale" else 0.0))),
+                },
+                "notes": self.notes.toPlainText().strip(),
+                "terms": self.terms.toPlainText().strip(),
+                "created_at": firestore.SERVER_TIMESTAMP,
                 "created_by": self.user_data.get("email", "system"),
+                "branch": branch_val,
+                # Status: Open unless fully paid (for Cash Sale)
+                "status": ("Open" if (doc_type == "Quotation" or total - received_amount > 0) else "Paid"),
             }
 
-            # 3) totals (recompute to be safe)
-            subtotal = self._get_subtotal()
-            try:
-                disc = float(self.discount.text().replace(",", "") or 0)
-                tax = float(self.tax.text().replace(",", "") or 0)
-                ship = float(self.shipping.text().replace(",", "") or 0)
-                received_amt = float(self.received.text().replace(",", "") or 0)
-                labour = float(self.labour.text().replace(",", "") or 0)
-            except Exception:
-                disc = tax = ship = received_amt = labour = 0.0
+            # --- Quotation: save only ---
+            if doc_type == "Quotation":
+                inv_ref = db.collection("invoices").document()
+                inv_ref.set(invoice_doc)
+                QMessageBox.information(self, "Saved", f"Quotation {inv_no} saved.")
+                self.close()
+                return
 
-            if self.discount_is_percent:
-                disc = subtotal * disc / 100
-            if self.tax_is_percent:
-                tax = subtotal * tax / 100
+            # --- Cash Sale flow ---
+            # 1) AR must be linked on party; if missing, block (per your rule).
+            party_ref = db.collection("parties").document(client_id)
+            party_snap = party_ref.get()
+            if not party_snap.exists:
+                QMessageBox.critical(self, "Client Missing", "Selected client no longer exists.")
+                return
+            party = party_snap.to_dict() or {}
+            ar_account_id = party.get("coa_account_id")
+            if not ar_account_id:
+                QMessageBox.warning(
+                    self, "Link AR Account",
+                    "This client has no linked Accounts Receivable account.\n\n"
+                    "Open Clients/Suppliers and assign a CoA account first."
+                )
+                return
 
-            total = subtotal - disc + tax + ship + labour
-            balance = total - received_amt
+            # 2) Require a payment account + a non-zero received for Cash Sale (can be partial)
+            if received_amount <= 0 or not received_account_id:
+                QMessageBox.warning(self, "Payment Required",
+                                    "Cash Sale requires a Received amount and a Cash/Bank account.")
+                return
 
-            invoice_data.update({
-                "subtotal": subtotal,
-                "discount": disc,
-                "tax": tax,
-                "shipping": ship,
-                "labour": labour,
-                "total": total,
-                "received": received_amt,
-                "balance": balance,
-            })
-
-            # include received account selection (if any)
-            idx = self.received_account_cb.currentIndex()
-            received_payload = self.received_account_cb.itemData(idx)   # {"id": ..., "branch": ..., "data": ...} or None
-            received_account_label = self.received_account_cb.currentText().strip()
-
-            if received_payload:
-                invoice_data["received_account"] = {
-                    "label": received_account_label,
-                    "account_id": received_payload.get("id"),
-                    "branch": received_payload.get("branch"),
-                }
-            else:
-                invoice_data["received_account"] = None
-
-            # 4) Save invoice doc
+            # 3) Save doc first
             inv_ref = db.collection("invoices").document()
-            inv_ref.set(invoice_data)
+            inv_ref.set(invoice_doc)
 
-            # Post summarized invoice JE (AR vs Revenue/Tax/etc.)
+            # 4) Post Revenue JE (virtual credit line, real AR debit → updates AR only)
+            self._post_revenue_virtual_je(
+                invoice_ref_id=inv_ref.id,
+                client_id=client_id,
+                amount=total,
+                description=f"Cash Sale {inv_no} – revenue recognized (virtual revenue line)"
+            )
+
+            # 5) Post Payment JE (updates balances on Cash/Bank and AR)
+            self._post_payment_journal(
+                invoice_ref_id=inv_ref.id,
+                client_id=client_id,
+                received_account_id=received_account_id,
+                amount=received_amount,
+                description=f"Payment received for {inv_no}"
+            )
+
+            # 6) Inventory hook (left for future; non-blocking if present)
             try:
-                self._post_invoice_journal(inv_ref.id, invoice_data)
-            except Exception as e:
-                # Invoice saved; journal posting failed — show a warning but do not rollback invoice save
-                QMessageBox.warning(self, "Partial Save", f"Invoice saved but failed to post invoice journal entry: {e}")
+                if hasattr(self, "_adjust_inventory_on_sale"):
+                    # In future this will also create Delivery Chalan
+                    self._adjust_inventory_on_sale(items)
+            except Exception as inv_err:
+                QMessageBox.warning(self, "Inventory", f"Saved & posted, but inventory step skipped: {inv_err}")
 
-            # 5) If received money > 0 and account chosen => post payment journal + update balances
-            if received_amt > 0 and received_payload:
-                received_account_id = received_payload.get("id")
-                selected_index = self.client_cb.currentIndex()
-                client_doc_id = self.client_cb.itemData(selected_index)   # Firestore doc.id of the party
-                client_info = self.clients.get(client_doc_id)
-                client_account_id = None
-                if client_info:
-                    party_data = client_info["data"]
-                    client_account_id = party_data.get("coa_account_id")
-                    if not client_account_id:
-                        raise RuntimeError("Party does not have a linked Chart of Account. Please fix in Clients module.")
+            QMessageBox.information(self, "Saved", f"Cash Sale {inv_no} saved and posted.")
+            self.close()
 
-                # Post payment and update balances
-                try:
-                    self._post_payment_journal(
-                        received_account_id=received_account_id,
-                        received_account_label=received_account_label,
-                        amount=received_amt,
-                        client_account_id=client_account_id,
-                        invoice_ref=inv_ref.id,
-                        party_id=client_doc_id  # pass the actual party doc.id
-                    )
-                except Exception as e:
-                    QMessageBox.warning(self, "Partial Save", f"Invoice saved but failed to post payment journal: {e}")
-                    return
-
-            QMessageBox.information(self, "Invoice Saved", "Invoice has been saved successfully.")
         except Exception as e:
-            QMessageBox.critical(self, "Save Error", f"Failed to save invoice: {e}")
-            
-    def _post_payment_journal(self, received_account_id, received_account_label, amount, client_account_id=None, invoice_ref=None, party_id=None):
+            QMessageBox.critical(self, "Error", f"Failed to save: {e}")
+
+
+    def _post_revenue_virtual_je(self, invoice_ref_id, client_id, amount, description=""):
         """
-        Create a journal entry for payment:
-          Debit: received_account_id (e.g. Bank / Cash)
-          Credit: accounts receivable account (client_account_id OR fallback AR account)
-        Also update current_balance on both accounts within a Firestore transaction.
+        Revenue JE with a VIRTUAL credit line:
+        - DR Accounts Receivable (party)  -> updates balances (real account)
+        - CR 'Sales Revenue' (virtual)    -> NO balance impact, no account_id stored
         """
-        if not received_account_id:
-            raise ValueError("Received account id missing")
+        if amount <= 0:
+            return
 
-        # 1) resolve AR (accounts receivable) account:
-        ar_account_id = client_account_id
+        # Party & AR account (must exist — caller already validated)
+        party = db.collection("parties").document(client_id).get().to_dict() or {}
+        ar_account_id = party.get("coa_account_id")
         if not ar_account_id:
-            # try to find a postable Accounts Receivable account in CoA
-            ar_query = db.collection("accounts") \
-                         .where("is_posting", "==", True) \
-                         .where("active", "==", True) \
-                         .where("subtype", "==", "Accounts Receivable") \
-                         .limit(1).stream()
-            ar_docs = list(ar_query)
-            if ar_docs:
-                ar_account_id = ar_docs[0].id
+            raise RuntimeError("Client AR account missing while posting revenue JE.")
 
-        if not ar_account_id:
-            # Last fallback: try any posting account with subtype containing 'Receivable' or type Asset
-            ar_query2 = db.collection("accounts") \
-                          .where("is_posting", "==", True) \
-                          .where("active", "==", True) \
-                          .where("type", "==", "Asset") \
-                          .limit(1).stream()
-            ar_docs2 = list(ar_query2)
-            if ar_docs2:
-                ar_account_id = ar_docs2[0].id
+        # Snapshot current AR balance
+        try:
+            ar_snap = db.collection("accounts").document(ar_account_id).get()
+            ar_doc = ar_snap.to_dict() or {}
+            ar_pre = float(ar_doc.get("current_balance", 0.0) or 0.0)
+            ar_type = ar_doc.get("type", "Asset")
+        except Exception:
+            ar_pre, ar_type = 0.0, "Asset"
 
-        if not ar_account_id:
-            raise RuntimeError("No Accounts Receivable account found. Please create one in Chart of Accounts.")
-
-        # 2) Prepare JE document
-        now = datetime.datetime.now()
-        je_data = {
-            "date": now,
-            "description": f"Payment received for invoice {invoice_ref}" if invoice_ref else "Payment received",
-            "invoice_ref": invoice_ref,
-            "party_id": party_id,
-            "created_at": now,
-            "created_by": self.user_data.get("email", "system"),
-            "lines": [
-                {"account_id": received_account_id, "debit": amount, "credit": 0},
-                {"account_id": ar_account_id, "debit": 0, "credit": amount}
-            ]
+        # Lines: one real, one virtual
+        real_line = {
+            "account_id": ar_account_id,
+            "account_name": ar_doc.get("name", "Accounts Receivable"),
+            "debit": float(amount),
+            "credit": 0.0,
+            "balance_before": ar_pre
+        }
+        virtual_line = {
+            "virtual": True,
+            "virtual_account_name": "Sales Revenue",
+            "debit": 0.0,
+            "credit": float(amount)
         }
 
-        # 3) Use transaction to update balances atomically + save JE
-        transaction = firestore.client().transaction()
+        # Build JE (do not include virtual in lines_account_ids)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        branch_val = self.user_data.get("branch")
+        if isinstance(branch_val, list): branch_val = branch_val[0] if branch_val else "-"
+        je = {
+            "date": now,
+            "created_at": firestore.SERVER_TIMESTAMP,
+            "created_by": self.user_data.get("email", "system"),
+            "reference_no": f"JE-{uuid.uuid4().hex[:6].upper()}-{int(now.timestamp())}",
+            "description": description or "Invoice revenue (virtual counter line)",
+            "purpose": "Sale",
+            "branch": branch_val or "-",
+            "invoice_ref": invoice_ref_id,
+            "lines": [real_line, virtual_line],
+            "lines_account_ids": [real_line["account_id"]],
+            "meta": {"kind": "invoice_revenue", "virtual_credit": True}
+        }
 
-        received_acc_ref = db.collection("accounts").document(received_account_id)
-        ar_acc_ref = db.collection("accounts").document(ar_account_id)
-        je_ref = db.collection("journal_entries").document()
+        # Apply AR balance increment only (Assets rule: debit - credit)
+        net_change = float(amount) if ar_type in ["Asset", "Expense"] else -float(amount)
 
-        @firestore.transactional
-        def txn_post(tx):
-            # read accounts
-            r_snap = received_acc_ref.get(transaction=tx)
-            ar_snap = ar_acc_ref.get(transaction=tx)
+        db.collection("journal_entries").add(je)
+        db.collection("accounts").document(ar_account_id).update({
+            "current_balance": firestore.Increment(net_change)
+        })
+        
+    def _post_payment_journal(self, invoice_ref_id, client_id, received_account_id, amount, description=""):
+        """
+        Settlement JE (updates balances):
+        DR Cash/Bank (received_account_id)  amount = paid
+        CR Accounts Receivable (client AR)  amount = paid
+        """
+        if amount <= 0:
+            return
 
-            if not r_snap.exists or not ar_snap.exists:
-                raise RuntimeError("Account document missing when posting journal.")
+        # AR must exist (already enforced for Cash Sale)
+        party = db.collection("parties").document(client_id).get().to_dict() or {}
+        ar_account_id = party.get("coa_account_id")
+        if not ar_account_id:
+            raise RuntimeError("Client AR account missing while posting payment JE.")
 
-            r_data = r_snap.to_dict() or {}
-            ar_data = ar_snap.to_dict() or {}
+        # Pull account docs for snapshots
+        def _snap(acc_id):
+            try:
+                s = db.collection("accounts").document(acc_id).get()
+                d = s.to_dict() or {}; pre = float(d.get("current_balance", 0.0) or 0.0)
+                return d, pre
+            except Exception:
+                return {}, 0.0
 
-            # compute updated balances:
-            # For Assets: receiving money increases the asset account (debit)
-            r_balance = float(r_data.get("current_balance", 0.0))
-            r_balance_new = r_balance + amount
+        recv_doc, recv_pre = _snap(received_account_id)
+        ar_doc, ar_pre = _snap(ar_account_id)
 
-            # For AR (asset): receiving money reduces the AR balance (credit)
-            ar_balance = float(ar_data.get("current_balance", 0.0))
-            ar_balance_new = ar_balance - amount
+        lines = [
+            {"account_id": received_account_id, "account_name": recv_doc.get("name", ""), "debit": float(amount), "credit": 0.0, "balance_before": recv_pre},
+            {"account_id": ar_account_id,       "account_name": ar_doc.get("name", ""),   "debit": 0.0,           "credit": float(amount), "balance_before": ar_pre},
+        ]
 
-            # update account docs
-            tx.update(received_acc_ref, {"current_balance": r_balance_new})
-            tx.update(ar_acc_ref, {"current_balance": ar_balance_new})
+        now = datetime.datetime.now(datetime.timezone.utc)
+        branch_val = self.user_data.get("branch")
+        if isinstance(branch_val, list): branch_val = branch_val[0] if branch_val else "-"
+        je = {
+            "date": now,
+            "created_at": firestore.SERVER_TIMESTAMP,
+            "created_by": self.user_data.get("email", "system"),
+            "reference_no": f"JE-{uuid.uuid4().hex[:6].upper()}-{int(now.timestamp())}",
+            "description": (description or "Invoice payment"),
+            "purpose": "Sale",
+            "branch": branch_val or "-",
+            "invoice_ref": invoice_ref_id,
+            "lines": lines,
+            "lines_account_ids": [lines[0]["account_id"], lines[1]["account_id"]],
+            "meta": {"kind": "invoice_payment"}
+        }
 
-            # write journal entry (non-transactional write would still be okay, but include here)
-            tx.set(je_ref, je_data)
+        # Compute balance deltas using the same global rule as your JE screen
+        # Assets/Expenses: debit - credit; Others: credit - debit  
+        def _net(acc_dict, debit, credit):
+            typ = (acc_dict.get("type") or "Asset")
+            return (debit - credit) if typ in ["Asset", "Expense"] else (credit - debit)
 
-        txn_post(transaction)
+        updates = {
+            received_account_id: _net(recv_doc, float(amount), 0.0),
+            ar_account_id:       _net(ar_doc,   0.0,           float(amount)),
+        }
+
+        # Commit: add JE, then increment balances
+        db.collection("journal_entries").add(je)
+        for acc_id, delta in updates.items():
+            db.collection("accounts").document(acc_id).update({
+                "current_balance": firestore.Increment(delta)
+            })
 
 
+    # ======== EDIT SUPPORT (load + update) ========
+
+    def _to_qdate(self, val):
+        try:
+            import datetime as _dt
+            if val is None:
+                return QDate.currentDate()
+            if hasattr(val, "to_datetime"):
+                dt = val.to_datetime()
+            elif isinstance(val, _dt.datetime):
+                dt = val
+            elif isinstance(val, _dt.date):
+                dt = _dt.datetime(val.year, val.month, val.day)
+            else:
+                s = str(val)
+                if s.endswith("Z"):
+                    s = s.replace("Z", "+00:00")
+                dt = _dt.datetime.fromisoformat(s)
+            return QDate(dt.year, dt.month, dt.day)
+        except Exception:
+            return QDate.currentDate()
+
+    def _set_combo_by_data(self, combo, doc_id, fallback_label="(Unknown)"):
+        if not doc_id:
+            return
+        i = combo.findData(doc_id)
+        if i == -1:
+            combo.addItem(fallback_label, doc_id)
+            i = combo.count() - 1
+        combo.setCurrentIndex(i)
+
+    def _clear_items_ui(self):
+        # remove product cards and dividers
+        for i in reversed(range(self.items_layout.count())):
+            w = self.items_layout.itemAt(i).widget()
+            if w is not None:
+                w.setParent(None)
+        self.product_cards.clear()
+
+    def load_invoice(self, doc_id, data=None):
+        """
+        Populate the editor with an existing invoice for EDITING.
+        Call this from outside after constructing the window.
+        """
+        self._loaded_doc_id = doc_id
+
+        # fetch if data not passed
+        if data is None:
+            snap = db.collection("invoices").document(doc_id).get()
+            if not snap.exists:
+                QMessageBox.critical(self, "Missing", "Invoice not found.")
+                return
+            data = snap.to_dict() or {}
+
+        # Type / number
+        doc_type = data.get("type") or "Quotation"
+        if self.status_cb.findText(doc_type) != -1:
+            self.status_cb.setCurrentText(doc_type)
+        self.invoice_no.setText(data.get("invoice_no", ""))
+
+        # Dates
+        self.invoice_date.setDate(self._to_qdate(data.get("invoice_date")))
+        self.due_date.setDate(self._to_qdate(data.get("due_date")))
+
+        # Client / Rep
+        self._set_combo_by_data(self.client_cb, data.get("client_id"), "[?] - Unknown client")
+        self._set_combo_by_data(self.rep_cb,    data.get("sales_rep_id"), "Unknown")
+
+        # Text fields
+        self.subject.setText(data.get("subject", "") or "")
+        self.site_address.setText(data.get("site_address", "") or "")
+        self.notes.setPlainText(data.get("notes", "") or "")
+        self.terms.setPlainText(data.get("terms", "") or "")
+
+        # Payment terms (multi)
+        selected_terms = set(data.get("payment_terms") or [])
+        for act in self.payment_terms_menu.actions():
+            act.setChecked(act.text() in selected_terms)
+        self._update_payment_terms_display()
+
+        # Items
+        self._clear_items_ui()
+        for it in (data.get("items") or []):
+            self._add_main_product_card(it)
+
+        # Amounts
+        am = data.get("amounts") or {}
+        def _num(x):
+            try: return float(x or 0.0)
+            except: return 0.0
+        self.discount.setText(str(_num(am.get("discount"))))
+        self.tax.setText(str(_num(am.get("tax"))))
+        self.shipping.setText(str(_num(am.get("shipping"))))
+        self.labour.setText(str(_num(am.get("labour"))))
+        self.received.setText(str(_num(am.get("received"))))
+        self.total.setText(f"Rs {_num(am.get('total')):,.2f}")
+        self.balance.setText(f"Rs {_num(am.get('balance')):,.2f}")
+        self._toggle_payment_fields(self.status_cb.currentText())
+        self.calculate_totals()
+
+        # Switch footer button to Update action
+        try:
+            self.save_btn.clicked.disconnect()
+        except Exception:
+            pass
+        self.save_btn.setText("Update Invoice")
+        self.save_btn.clicked.connect(self.update_invoice)
+
+    def update_invoice(self):
+        """
+        Update the currently loaded invoice (no double JEs here).
+        Use the 'Record Payment' flow elsewhere for cash movements.
+        """
+        if not self._loaded_doc_id:
+            QMessageBox.warning(self, "No document", "Nothing loaded to update.")
+            return
+
+        # Rebuild items from cards
+        items = [card.data for card in self.product_cards]
+
+        # Numbers
+        def _numtxt(le):
+            try: return float((le.text() or "0").replace(",", ""))
+            except: return 0.0
+
+        try:
+            subtotal = sum(float(i.get("total", 0.0) or 0.0) for i in items)
+        except Exception:
+            subtotal = 0.0
+
+        disc   = _numtxt(self.discount)
+        tax    = _numtxt(self.tax)
+        ship   = _numtxt(self.shipping)
+        labour = _numtxt(self.labour)
+        total  = round(subtotal - disc + tax + ship + labour, 2)
+        received_amt = _numtxt(self.received)  # informational; payments should be through JE flow
+        balance = max(0.0, total - received_amt)
+
+        inv_date = self.invoice_date.date().toPyDate()
+        due_date = self.due_date.date().toPyDate()
+
+        payload = {
+            "type": self.status_cb.currentText(),
+            "invoice_no": self.invoice_no.text().strip(),
+            "invoice_date": datetime.datetime.combine(inv_date, datetime.datetime.min.time()),
+            "due_date": datetime.datetime.combine(due_date, datetime.datetime.min.time()),
+            "client_id": self.client_cb.itemData(self.client_cb.currentIndex()),
+            "sales_rep_id": self.rep_cb.itemData(self.rep_cb.currentIndex()),
+            "subject": self.subject.text().strip(),
+            "site_address": self.site_address.text().strip(),
+            "payment_terms": [a.text() for a in self.payment_terms_menu.actions() if a.isChecked()],
+            "items": items,
+            "amounts": {
+                "subtotal": float(subtotal),
+                "discount": float(disc),
+                "tax": float(tax),
+                "shipping": float(ship),
+                "labour": float(labour),
+                "total": float(total),
+                "received": float(received_amt),
+                "balance": float(balance),
+            },
+            "notes": self.notes.toPlainText().strip(),
+            "terms": self.terms.toPlainText().strip(),
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+        # Status: Open for Quotation, or until fully paid
+        payload["status"] = ("Open" if (payload["type"] == "Quotation" or balance > 0.01) else "Paid")
+
+        try:
+            db.collection("invoices").document(self._loaded_doc_id).set(payload, merge=True)
+            QMessageBox.information(self, "Updated", "Invoice updated.")
+            self.close()
+        except Exception as e:
+            QMessageBox.critical(self, "Update failed", f"Could not update invoice:\n{e}")
 
     # — Helpers —
     
