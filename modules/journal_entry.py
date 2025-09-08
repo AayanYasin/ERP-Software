@@ -108,7 +108,7 @@ class JournalEntryForm(QWidget):
         table_v.addWidget(self.table)
         root.addWidget(table_card)
 
-        # Load accounts BEFORE creating rows (so dropdowns populate)
+        # # Load accounts BEFORE creating rows (so dropdowns populate)
         self.accounts = []
         self.load_accounts()
 
@@ -361,17 +361,21 @@ class JournalEntryForm(QWidget):
     def load_accounts(self):
         self.accounts = []
         try:
-            for doc in db.collection("accounts").where("active", "==", True).stream():
-                data = doc.to_dict()
+            fields = ["code","name","type","current_balance","opening_balance","slug","is_posting","active"]
+            docs = db.collection("accounts")\
+                    .where("active", "==", True)\
+                    .select(fields)\
+                    .get()
+            for doc in docs:
+                data = doc.to_dict() or {}
 
-                # Skip Opening Balances Equity account by slug (visual/logic unchanged)
+                # Skip Opening Balances Equity account by slug (unchanged behavior)
                 if data.get("slug") == "opening_balances_equity":
                     continue
 
                 if data.get("is_posting", True):
-                    # Fallback logic
                     current_balance = data.get("current_balance")
-                    opening = data.get("opening_balance") or {}  # <-- SAFELY handles None
+                    opening = data.get("opening_balance") or {}
                     if current_balance is None:
                         current_balance = float(opening.get("amount", 0.0))
 
@@ -385,7 +389,7 @@ class JournalEntryForm(QWidget):
                     })
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load accounts: {e}")
-
+            
     def update_totals(self):
         debit, credit = 0, 0
         for row in range(self.table.rowCount()):
@@ -493,10 +497,16 @@ class JournalEntryForm(QWidget):
         }
 
         try:
-            db.collection("journal_entries").add(entry)
-            # Update balances atomically
+            # Atomically create the JE and bump both accounts
+            batch = db.batch()
+            je_ref = db.collection("journal_entries").document()
+            batch.set(je_ref, entry)
+
             for acc_id, net in balance_updates.items():
-                db.collection("accounts").document(acc_id).update({"current_balance": firestore.Increment(net)})
+                acc_ref = db.collection("accounts").document(acc_id)
+                batch.update(acc_ref, {"current_balance": firestore.Increment(net)})
+
+            batch.commit()
 
             QMessageBox.information(self, "Saved", "Journal Entry saved.")
             # Reset the two rows to zeros but keep them present

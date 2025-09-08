@@ -1,42 +1,37 @@
 # =============================
-# Enhanced UI for clients_master.py (with tabs + desktop export + required fields)
-# Drop-in replacement for PartyModule and PartyDialog with a modern, polished UI
+# clients_master.py — Parties (Customers/Suppliers) with single-field COA control
 # =============================
+# What's included:
+# - SINGLE COA DROPDOWN for Admins with a top option: "➕ Create New Account (auto)".
+# - Non-admins see a read-only COA label; new parties always auto-create a COA.
+# - Opening balance JE only when auto-creating on NEW.
+# - On EDIT, selecting the sentinel does nothing (prevents duplicate accounts).
+# - Exact party schema fields saved:
+#   {'gst', 'coa_account_id', 'ntn', 'contact_person', 'id', 'name', 'phone',
+#    'type', 'email', 'address', 'active', 'created_at', 'branches'} (+ updated_at on save)
+#
+# Dependencies: PyQt5, firebase-admin, your firebase.config module providing `db`
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QTableWidget,
     QTableWidgetItem, QDialog, QFormLayout, QComboBox, QTextEdit, QListWidget, QListWidgetItem,
     QDialogButtonBox, QMessageBox, QHeaderView, QAbstractItemView, QToolBar, QAction, QStyle,
-    QSizePolicy, QProgressDialog, QSplitter, QGroupBox, QGridLayout, QFrame, QShortcut, QTabWidget
+    QProgressDialog, QGroupBox, QShortcut, QTabWidget
 )
-from PyQt5.QtCore import Qt, QTimer, QSortFilterProxyModel, QRegExp
-from PyQt5.QtGui import QIcon, QRegExpValidator, QKeySequence, QColor
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QKeySequence, QColor, QBrush
+
 from firebase.config import db
 from firebase_admin import firestore
+
 import uuid, datetime, re, os, csv, tempfile
 
-ACCOUNT_TYPE_PREFIX = {
-    "Asset": "1",
-    "Liability": "2",
-    "Equity": "3",
-    "Income": "4",
-    "Expense": "5"
-}
-
+# -----------------------------
+# Styling
+# -----------------------------
 APP_STYLE = """
 /* Global */
 QWidget { font-size: 14px; }
-
-/* Buttons */
-QPushButton {
-    background: #2d6cdf; color: white; border: none; padding: 8px 14px; border-radius: 8px;
-}
-QPushButton:hover { background: #2458b2; }
-QPushButton:disabled { background: #a9b7d1; }
-
-/* Framed sections */
-QGroupBox { border: 1px solid #e3e7ef; border-radius: 10px; margin-top: 16px; }
-QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #4a5568; }
 
 /* Inputs */
 QLineEdit, QComboBox, QTextEdit {
@@ -47,27 +42,60 @@ QLineEdit:focus, QComboBox:focus, QTextEdit:focus { border-color: #2d6cdf; }
 /* Table */
 QTableWidget { gridline-color: #e6e9f2; }
 QHeaderView::section { background: #f7f9fc; padding: 6px; border: none; border-bottom: 1px solid #e6e9f2; }
-
-/* Status pill look using background colors set in code */
 """
 
+ACCOUNT_TYPE_PREFIX = {
+    "Asset": "1",
+    "Liability": "2",
+    "Equity": "3",
+    "Income": "4",
+    "Expense": "5"
+}
+
+# Top option sentinel for the admin COA dropdown
+AUTO_CREATE_SENTINEL = "__AUTO_CREATE__"
+
 # -----------------------------
-# PartyModule (List + actions)
+# Helpers
 # -----------------------------
+def _fmt_account_display(doc_id: str, acc: dict) -> str:
+    """Make a user-friendly account display label."""
+    if not acc:
+        return f"[{doc_id}]"
+    code = (acc.get("code") or acc.get("id") or "").strip()
+    name = (acc.get("name") or "").strip()
+    typ  = (acc.get("type") or "").strip()
+    bits = []
+    if code: bits.append(f"[{code}]")
+    if name: bits.append(name)
+    if typ:  bits.append(f"({typ})")
+    return " ".join(bits) if bits else f"[{doc_id}]"
+
+
+def _is_admin_user(user_data) -> bool:
+    try:
+        return str((user_data or {}).get("role", "")).strip().lower() == "admin"
+    except Exception:
+        return False
+
+
+# =============================
+# Main list module
+# =============================
 class PartyModule(QWidget):
     def __init__(self, user_data):
         super().__init__()
-        self.user_data = user_data
+        self.user_data = user_data or {}
         self.setMinimumSize(1100, 650)
         self.setStyleSheet(APP_STYLE)
         self._build_ui()
         QTimer.singleShot(0, self.load_parties)
 
-    # UI
+    # ---------- UI ----------
     def _build_ui(self):
         root = QVBoxLayout(self)
 
-        # Header row with title + search
+        # Header
         header = QHBoxLayout()
         title = QLabel("👥 Parties")
         title.setStyleSheet("font-size: 20px; font-weight: 700; padding: 4px 2px;")
@@ -78,194 +106,239 @@ class PartyModule(QWidget):
         self.search_box.setPlaceholderText("Search name / contact / phone / branch…  (Ctrl+F)")
         self.search_box.textChanged.connect(self._apply_filter_to_current_tab)
         header.addWidget(self.search_box)
+
+        self.count_lbl = QLabel("")
+        self.count_lbl.setStyleSheet("color:#6b7280; padding:4px 2px;")
+        header.addWidget(self.count_lbl)
+
         root.addLayout(header)
 
         # Toolbar
         toolbar = QToolBar()
-        toolbar.setIconSize(toolbar.iconSize())
         act_add = QAction(self.style().standardIcon(QStyle.SP_FileDialogNewFolder), "Add", self)
         act_add.setShortcut("Ctrl+N")
-        act_add.triggered.connect(self.add_party)
+        act_add.triggered.connect(self._add_party)
+
         act_refresh = QAction(self.style().standardIcon(QStyle.SP_BrowserReload), "Refresh", self)
         act_refresh.setShortcut("F5")
         act_refresh.triggered.connect(self.load_parties)
+
         act_export = QAction(self.style().standardIcon(QStyle.SP_DialogSaveButton), "Export CSV", self)
         act_export.triggered.connect(self._export_csv_current_tab)
+
         toolbar.addAction(act_add)
         toolbar.addAction(act_refresh)
         toolbar.addSeparator()
         toolbar.addAction(act_export)
+
+        # Admin-only action: Change COA of selected party
+        if _is_admin_user(self.user_data):
+            self.act_change_coa = QAction(self.style().standardIcon(QStyle.SP_ArrowRight), "Change COA (Admin)", self)
+            self.act_change_coa.setToolTip("Change the Chart of Accounts for the selected party (Admin only).")
+            self.act_change_coa.triggered.connect(self._change_coa_selected_party)
+            toolbar.addSeparator()
+            toolbar.addAction(self.act_change_coa)
+
         root.addWidget(toolbar)
 
-        # Tabs
+        # Tabs + tables
         self.tabs = QTabWidget()
         self.tabs.setTabPosition(QTabWidget.North)
         self.tabs.setDocumentMode(True)
 
-        # Customers Table
         self.table_customers = self._make_table()
-        cust_wrap = QWidget(); cust_lay = QVBoxLayout(cust_wrap); cust_lay.setContentsMargins(0,0,0,0)
-        cust_lay.addWidget(self.table_customers)
-        self.tabs.addTab(cust_wrap, "Customers")
+        w1 = QWidget(); l1 = QVBoxLayout(w1); l1.setContentsMargins(0,0,0,0); l1.addWidget(self.table_customers)
+        self.tabs.addTab(w1, "Customers")
 
-        # Suppliers Table
         self.table_suppliers = self._make_table()
-        supp_wrap = QWidget(); supp_lay = QVBoxLayout(supp_wrap); supp_lay.setContentsMargins(0,0,0,0)
-        supp_lay.addWidget(self.table_suppliers)
-        self.tabs.addTab(supp_wrap, "Suppliers")
+        w2 = QWidget(); l2 = QVBoxLayout(w2); l2.setContentsMargins(0,0,0,0); l2.addWidget(self.table_suppliers)
+        self.tabs.addTab(w2, "Suppliers")
+
+        # Double-click to edit
+        self.table_customers.itemDoubleClicked.connect(self._edit_selected_party)
+        self.table_suppliers.itemDoubleClicked.connect(self._edit_selected_party)
 
         self.tabs.currentChanged.connect(self._apply_filter_to_current_tab)
         root.addWidget(self.tabs, stretch=1)
 
-        # Shortcuts
+        # Shortcut
         QShortcut(QKeySequence("Ctrl+F"), self, activated=lambda: self.search_box.setFocus())
 
-        # Footer (row count)
-        footer = QHBoxLayout()
-        self.count_lbl = QLabel("")
-        self.count_lbl.setStyleSheet("color:#6b7280; padding:4px 2px;")
-        footer.addWidget(self.count_lbl)
-        footer.addStretch()
-        root.addLayout(footer)
-
     def _make_table(self):
-        table = QTableWidget(0, 7)
-        table.setHorizontalHeaderLabels(["Name", "Type", "Contact", "Phone", "Branches", "Status", "Balance"])
-        table.setAlternatingRowColors(True)
-        table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        table.verticalHeader().setVisible(False)
-        table.setSortingEnabled(True)
-        table.cellDoubleClicked.connect(self._edit_party_from_table)
-        table.setStyleSheet(self.styleSheet() + "\nQTableWidget::item { padding: 6px; }")
-
-        header = table.horizontalHeader()
-        header.setStretchLastSection(True)
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        t = QTableWidget(0, 7)
+        t.setSelectionBehavior(QAbstractItemView.SelectRows)
+        t.setSelectionMode(QAbstractItemView.SingleSelection)
+        t.setAlternatingRowColors(True)
+        t.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        t.verticalHeader().setVisible(False)
+        t.setSortingEnabled(True)
+        t.horizontalHeader().setStretchLastSection(True)
+        t.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         for c in range(1, 6):
-            header.setSectionResizeMode(c, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
-        return table
+            t.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        t.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        t.setHorizontalHeaderLabels(["Name", "Type", "Contact Person", "Phone", "Branches", "Status", "Balance"])
+        return t
 
     def _current_table(self):
         return self.table_customers if self.tabs.currentIndex() == 0 else self.table_suppliers
 
-    # Data
+    # ---------- Data load ----------
     def load_parties(self):
         progress = QProgressDialog("Loading parties…", None, 0, 0, self)
         progress.setWindowModality(Qt.WindowModal)
         progress.setAutoClose(True)
         progress.show()
 
+        # Disable sorting while inserting
+        self.table_customers.setSortingEnabled(False)
+        self.table_suppliers.setSortingEnabled(False)
+
         try:
             for t in (self.table_customers, self.table_suppliers):
+                t.clearContents()
                 t.setRowCount(0)
 
             parties = db.collection("parties").stream()
-            count_c, count_s = 0, 0
 
             for doc in parties:
                 data = doc.to_dict() or {}
-                ptype = (data.get("type") or "").strip()
-                # prepare row contents once
-                human_id = data.get("id", "")
-                party_name = data.get("name", "")
+
+                # Normalize
+                ptype_raw = (data.get("type") or "").strip()
+                ptype_lc = ptype_raw.lower()
+                ptype = ptype_lc.capitalize() if ptype_lc else ""
+                human_id = (data.get("id") or "").strip()
+                party_name = (data.get("name") or "").strip()
+
+                raw_active = data.get("active", True)
+                if isinstance(raw_active, str):
+                    is_active = raw_active.strip().lower() in ("active", "true", "1", "yes")
+                else:
+                    is_active = bool(raw_active)
+
+                branches_val = data.get("branches", [])
+                if isinstance(branches_val, str):
+                    branches_val = [branches_val]
+                branches_text = ", ".join("" if v is None else str(v) for v in branches_val)
+
                 name_item = QTableWidgetItem(f"[{human_id}] - {party_name}")
                 name_item.setData(Qt.UserRole, doc.id)
 
                 type_item = QTableWidgetItem(ptype)
-                contact_item = QTableWidgetItem(data.get("contact_person", ""))
-                phone_item = QTableWidgetItem(data.get("phone", ""))
-                branches_item = QTableWidgetItem(", ".join(data.get("branches", [])))
+                contact_item = QTableWidgetItem(data.get("contact_person", "") or "")
+                phone_item = QTableWidgetItem(data.get("phone", "") or "")
+                branches_item = QTableWidgetItem(branches_text)
 
-                status = "Active" if data.get("active", True) else "Inactive"
-                status_item = QTableWidgetItem(status)
-                # Subtle pill coloring
-                green_bg = QColor(50, 150, 50)    # green
-                red_bg   = QColor(200, 50, 50)     # red
+                status_text = "Active" if is_active else "Inactive"
+                status_item = QTableWidgetItem(status_text)
+                pill_brush = QBrush(QColor(50,150,50) if is_active else QColor(200,50,50))
+                status_item.setBackground(pill_brush)
+                status_item.setData(Qt.BackgroundRole, pill_brush)
+                status_item.setForeground(QBrush(QColor(Qt.white)))
 
-                status_item.setBackground(green_bg if status == "Active" else red_bg)
-                status_item.setForeground(Qt.white)
-
-                # Balance from linked CoA
-                balance_str = "-"
-                try:
-                    coa_id = data.get("coa_account_id")
-                    if coa_id:
-                        acc_snap = db.collection("accounts").document(coa_id).get()
-                        if acc_snap.exists:
-                            acc = acc_snap.to_dict() or {}
-                            curr = float(acc.get("current_balance", 0.0) or 0.0)
-                            a_type = (acc.get("type") or "Asset")
-                            dr = (curr >= 0) if a_type in ["Asset", "Expense"] else (curr < 0)
-                            balance_str = f"{abs(curr):,.2f} {'DR' if dr else 'CR'}"
-                except Exception:
-                    balance_str = "-"
+                # Balance
+                balance_str, balance_num = self._safe_balance(data)
                 balance_item = QTableWidgetItem(balance_str)
                 balance_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                balance_item.setData(Qt.UserRole, balance_num)  # numeric sort key
 
-                # Decide which tables to populate
-                goes_customers = ptype in ("Customer", "Both")
-                goes_suppliers = ptype in ("Supplier", "Both")
+                goes_customers = ptype_lc in ("customer", "both")
+                goes_suppliers = ptype_lc in ("supplier", "both")
 
                 if goes_customers:
-                    row = self.table_customers.rowCount()
-                    self.table_customers.insertRow(row)
-                    self.table_customers.setItem(row, 0, name_item.clone())
-                    self.table_customers.setItem(row, 1, type_item.clone())
-                    self.table_customers.setItem(row, 2, contact_item.clone())
-                    self.table_customers.setItem(row, 3, phone_item.clone())
-                    self.table_customers.setItem(row, 4, branches_item.clone())
-                    self.table_customers.setItem(row, 5, status_item.clone())
-                    self.table_customers.setItem(row, 6, balance_item.clone())
-                    # Preserve doc id on the "name" cell
-                    self.table_customers.item(row,0).setData(Qt.UserRole, doc.id)
-                    count_c += 1
+                    self._append_row(self.table_customers,
+                                     name_item, type_item, contact_item, phone_item,
+                                     branches_item, status_item, balance_item)
 
                 if goes_suppliers:
-                    row = self.table_suppliers.rowCount()
-                    self.table_suppliers.insertRow(row)
-                    self.table_suppliers.setItem(row, 0, name_item.clone())
-                    self.table_suppliers.setItem(row, 1, type_item.clone())
-                    self.table_suppliers.setItem(row, 2, contact_item.clone())
-                    self.table_suppliers.setItem(row, 3, phone_item.clone())
-                    self.table_suppliers.setItem(row, 4, branches_item.clone())
-                    self.table_suppliers.setItem(row, 5, status_item.clone())
-                    self.table_suppliers.setItem(row, 6, balance_item.clone())
-                    self.table_suppliers.item(row,0).setData(Qt.UserRole, doc.id)
-                    count_s += 1
+                    self._append_row(self.table_suppliers,
+                                     name_item.clone(), type_item.clone(), contact_item.clone(), phone_item.clone(),
+                                     branches_item.clone(), status_item.clone(), balance_item.clone())
 
             self._apply_filter_to_current_tab()
-            # Footer count
-            if self.tabs.currentIndex() == 0:
-                self.count_lbl.setText(f"Total: {count_c} customers")
-            else:
-                self.count_lbl.setText(f"Total: {count_s} suppliers")
+
         finally:
             progress.close()
+            self.table_customers.setSortingEnabled(True)
+            self.table_suppliers.setSortingEnabled(True)
+
+    def _append_row(self, table, *items):
+        row = table.rowCount()
+        table.insertRow(row)
+        for c, it in enumerate(items):
+            table.setItem(row, c, it)
+
+    def _safe_balance(self, party_data):
+        """Return (formatted, numeric) balance for sorting and display as a signed number.
+        Rules:
+        - Customer / Asset:  DR +
+        - Supplier / Liability: DR -
+        (These match the sign already stored in accounts.current_balance, so we display it as-is.)
+        """
+        try:
+            coa_id = party_data.get("coa_account_id")
+            if not coa_id:
+                return ("-", 0.0)
+            snap = db.collection("accounts").document(coa_id).get()
+            if not snap.exists:
+                return ("-", 0.0)
+
+            acc = snap.to_dict() or {}
+            curr = float(acc.get("current_balance", 0.0) or 0.0)
+
+            # Show the raw signed value (no DR/CR suffix)
+            disp = f"{curr:,.2f}"
+
+            # Keep the signed numeric for proper sort
+            return (disp, curr)
+        except Exception:
+            return ("-", 0.0)
+
+    # ---------- Filter & counts ----------
+    def _reapply_status_pills(self, table):
+        for r in range(table.rowCount()):
+            it = table.item(r, 5)
+            if not it:
+                continue
+            txt = (it.text() or "").strip().lower()
+            is_active = (txt == "active")
+            pill_brush = QBrush(QColor(50,150,50) if is_active else QColor(200,50,50))
+            it.setBackground(pill_brush)
+            it.setData(Qt.BackgroundRole, pill_brush)
+            it.setForeground(QBrush(QColor(Qt.white)))
+
+    def _update_row_count_label(self):
+        table = self._current_table()
+        visible = sum(not table.isRowHidden(r) for r in range(table.rowCount()))
+        noun = "customers" if self.tabs.currentIndex() == 0 else "suppliers"
+        self.count_lbl.setText(f"Total: {visible} {noun}")
 
     def _apply_filter_to_current_tab(self):
         table = self._current_table()
         term = (self.search_box.text() or "").lower()
+        was_sorting = table.isSortingEnabled()
+        table.setSortingEnabled(False)
+
         for r in range(table.rowCount()):
             row_text = " ".join(
                 (table.item(r, c).text() if table.item(r, c) else "")
                 for c in range(table.columnCount())
-            )
-            table.setRowHidden(r, term not in row_text.lower())
+            ).lower()
+            table.setRowHidden(r, term not in row_text)
 
-    def _table_to_export(self):
-        return self._current_table()
+        self._reapply_status_pills(table)
+        table.setSortingEnabled(was_sorting)
+        self._update_row_count_label()
 
+    # ---------- Export ----------
     def _export_csv_current_tab(self):
         try:
-            table = self._table_to_export()
-            # Prefer user's Desktop; fallback to temp
+            table = self._current_table()
             desktop = os.path.join(os.path.expanduser("~"), "Desktop")
             if not os.path.isdir(desktop):
                 desktop = tempfile.gettempdir()
             path = os.path.join(desktop, "parties_export.csv")
-
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 headers = [table.horizontalHeaderItem(c).text() for c in range(table.columnCount())]
@@ -275,177 +348,473 @@ class PartyModule(QWidget):
                         continue
                     row = [(table.item(r, c).text() if table.item(r, c) else "") for c in range(table.columnCount())]
                     writer.writerow(row)
-            QMessageBox.information(self, "Exported", f"CSV saved to: {path}")
+            QMessageBox.information(self, "Export complete", f"Saved to:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Export failed", str(e))
 
-    # Actions
-    def add_party(self):
-        dialog = PartyDialog(self.user_data)
-        if dialog.exec_():
+    # ---------- Add/Edit ----------
+    def _add_party(self):
+        dlg = PartyDialog(self.user_data)
+        if dlg.exec_() == QDialog.Accepted:
             self.load_parties()
 
-    def _edit_party_from_table(self, row, _col):
-        table = self._current_table()
+    def _edit_selected_party(self):
+        table = self.sender() if isinstance(self.sender(), QTableWidget) else self._current_table()
+        row = table.currentRow()
+        if row < 0:
+            return
         name_item = table.item(row, 0)
         if not name_item:
             QMessageBox.warning(self, "Not found", "Unable to locate selected party.")
             return
         doc_id = name_item.data(Qt.UserRole)
         if not doc_id:
-            # Fallback by human id if old rows
-            cell_text = name_item.text() or ""
-            guessed = cell_text.split("]")[0].replace("[", "").strip()
-            try:
-                match = list(db.collection("parties").where("id", "==", guessed).limit(1).stream())
-                doc_id = match[0].id if match else None
-            except Exception:
-                doc_id = None
-        if not doc_id:
-            QMessageBox.warning(self, "Missing", "Party document not found.")
+            QMessageBox.warning(self, "Missing id", "This row has no stored document id.")
             return
+
         snap = db.collection("parties").document(doc_id).get()
-        if not snap.exists:
-            QMessageBox.warning(self, "Missing", "Party document not found.")
-            return
-        dialog = PartyDialog(self.user_data, doc_id, snap.to_dict())
-        if dialog.exec_():
+        existing = snap.to_dict() if snap.exists else {}
+        dlg = PartyDialog(self.user_data, doc_id=doc_id, existing_data=existing)
+        if dlg.exec_() == QDialog.Accepted:
             self.load_parties()
 
+    # ---------- Admin-only COA change (quick action) ----------
+    def _change_coa_selected_party(self):
+        if not _is_admin_user(self.user_data):
+            QMessageBox.warning(self, "Not allowed", "Only admins can change the COA of a party.")
+            return
+        table = self._current_table()
+        row = table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "Select a party", "Please select a party first.")
+            return
+        name_item = table.item(row, 0)
+        if not name_item:
+            QMessageBox.warning(self, "Not found", "Unable to locate selected party.")
+            return
+        doc_id = name_item.data(Qt.UserRole)
+        if not doc_id:
+            QMessageBox.warning(self, "Missing id", "This row has no stored document id.")
+            return
 
-# -----------------------------
-# PartyDialog (nice form)
-# -----------------------------
+        snap = db.collection("parties").document(doc_id).get()
+        existing = snap.to_dict() if snap.exists else {}
+        dlg = ChangeCOADialog(self.user_data, existing_coa_id=existing.get("coa_account_id"))
+        if dlg.exec_() == QDialog.Accepted:
+            new_coa_id = dlg.selected_account_id
+            if new_coa_id:
+                try:
+                    db.collection("parties").document(doc_id).set({"coa_account_id": new_coa_id}, merge=True)
+                    QMessageBox.information(self, "COA updated", "The COA account was updated successfully.")
+                    self.load_parties()
+                except Exception as e:
+                    QMessageBox.critical(self, "Update failed", str(e))
+
+
+# =============================
+# Dialogs
+# =============================
 class PartyDialog(QDialog):
     def __init__(self, user_data, doc_id=None, existing_data=None):
         super().__init__()
-        self.user_data = user_data
+        self.user_data = user_data or {}
         self.doc_id = doc_id
         self.existing_data = existing_data or {}
         self.setWindowTitle("Edit Party" if doc_id else "Add Party")
-        self.new_customer_id = None
-        self.generated_code = None
-        self.setMinimumWidth(540)
+        self.setMinimumWidth(640)
         self.setStyleSheet(APP_STYLE)
-        self._init_ui()
+        self._build_form()
         if not self.doc_id:
-            self.fetch_next_code()
+            self._prefetch_next_code()
 
-    def fetch_next_code(self):
-        doc_ref = db.collection("meta").document("cust_supp")
-        doc = doc_ref.get()
-        current_code = 1
-        if doc.exists:
-            data = doc.to_dict()
-            current_code = int(data.get("code", 1))
-        self.generated_code = str(current_code).zfill(3)
+        # Keep the COA code preview in sync with type changes and initial state
+        self.cmb_type.currentIndexChanged.connect(self._update_coa_code_display)
+        self._update_coa_code_display()
 
-    def _init_ui(self):
-        main = QVBoxLayout(self)
-
-        # Title
+    # ---------- UI ----------
+    def _build_form(self):
+        lay = QVBoxLayout(self)
         subtitle = QLabel("Fill in the party details. Fields marked * are required.")
         subtitle.setStyleSheet("color:#6b7280;")
-        main.addWidget(subtitle)
+        lay.addWidget(subtitle)
 
-        # Form
         form_box = QGroupBox("Details")
         form = QFormLayout(form_box)
         form.setLabelAlignment(Qt.AlignRight)
 
-        self.name = QLineEdit(self.existing_data.get("name", ""))
-        self.name.setPlaceholderText("e.g., Ali Traders")
+        self.edt_name = QLineEdit(self.existing_data.get("name", ""))
+        self.edt_code = QLineEdit(self.existing_data.get("id", ""))
+        self.edt_code.setReadOnly(True)
+        self.edt_code.setToolTip("Assigned automatically when you save a new party.")
 
-        self.contact = QLineEdit(self.existing_data.get("contact_person", ""))
-        self.contact.setPlaceholderText("Contact person name")
+        self.cmb_type = QComboBox()
+        self.cmb_type.addItems(["Customer", "Supplier"])
+        t = (self.existing_data.get("type") or "").strip().lower()
+        idx = {"customer":0,"supplier":1,"both":2}.get(t, 0)
+        self.cmb_type.setCurrentIndex(idx)
 
-        self.phone = QLineEdit(self.existing_data.get("phone", ""))
-        self.phone.setPlaceholderText("03xx-xxxxxxx")
-        self.phone.setMaxLength(20)
+        self.edt_contact = QLineEdit(self.existing_data.get("contact_person", "") or "")
+        self.edt_phone = QLineEdit(self.existing_data.get("phone", "") or "")
 
-        self.email = QLineEdit(self.existing_data.get("email", ""))
-        self.email.setPlaceholderText("Optional")
+        # NEW FIELDS: gst, ntn, email, address
+        self.edt_gst = QLineEdit(self.existing_data.get("gst", "") or "")
+        self.edt_ntn = QLineEdit(self.existing_data.get("ntn", "") or "")
+        self.edt_email = QLineEdit(self.existing_data.get("email", "") or "")
+        self.edt_address = QTextEdit(self.existing_data.get("address", "") or "")
+        self.edt_address.setFixedHeight(60)
 
-        self.address = QTextEdit(self.existing_data.get("address", ""))
-        self.address.setFixedHeight(60)
-        self.address.setPlaceholderText("Street, City…")
-
-        self.gst = QLineEdit(self.existing_data.get("gst", ""))
-        self.gst.setPlaceholderText("Optional")
-
-        self.ntn = QLineEdit(self.existing_data.get("ntn", ""))
-        self.ntn.setPlaceholderText("Optional")
-
-        self.type = QComboBox()
-        self.type.addItems(["Customer", "Supplier"])
-        if self.existing_data.get("type"):
-            idx = self.type.findText(self.existing_data["type"]);  self.type.setCurrentIndex(max(0, idx))
-
-        self.branches = QListWidget()
+        # Branches (multi-select via checklist)
+        branches_val = self.existing_data.get("branches", [])
+        if isinstance(branches_val, str):
+            branches_val = [branches_val]
+        self.lst_branches = QListWidget()
         for b in self.user_data.get("branch", []):
-            item = QListWidgetItem(b)
+            item = QListWidgetItem(str(b))
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked if b in self.existing_data.get("branches", []) else Qt.Unchecked)
-            self.branches.addItem(item)
+            item.setCheckState(Qt.Checked if b in branches_val else Qt.Unchecked)
+            self.lst_branches.addItem(item)
 
-        # Opening balance only when adding new
-        self.balance = QLineEdit(str(self.existing_data.get("opening_balance", 0)))
-        self.balance.setPlaceholderText("0.00")
-        self.balance_type = QComboBox(); self.balance_type.addItems(["DR", "CR"])
-        if self.existing_data.get("opening_type") == "CR":
-            self.balance_type.setCurrentIndex(1)
-        ob_container = QWidget(); ob_layout = QHBoxLayout(ob_container); ob_layout.setContentsMargins(0,0,0,0)
-        ob_layout.addWidget(self.balance); ob_layout.addWidget(self.balance_type)
+        # Active
+        self.cmb_active = QComboBox()
+        self.cmb_active.addItems(["Active", "Inactive"])
+        raw_active = self.existing_data.get("active", True)
+        if isinstance(raw_active, str):
+            is_active = raw_active.strip().lower() in ("active", "true", "1", "yes")
+        else:
+            is_active = bool(raw_active)
+        self.cmb_active.setCurrentIndex(0 if is_active else 1)
+
+        # Opening balance (only when adding new)
+        self.edt_opening_bal = QLineEdit(str(self.existing_data.get("opening_balance", 0)))
+        self.cmb_opening_type = QComboBox()
+        self.cmb_opening_type.addItems(["DR", "CR"])
+        if (self.existing_data.get("opening_type") or "").upper() == "CR":
+            self.cmb_opening_type.setCurrentIndex(1)
+        # Default opening type based on party type selection
+        def _sync_opening_type(index):
+            party_type = self.cmb_type.currentText()
+            if party_type == "Customer":
+                self.cmb_opening_type.setCurrentIndex(0)  # DR
+            elif party_type == "Supplier":
+                self.cmb_opening_type.setCurrentIndex(1)  # CR
+
+        self.cmb_type.currentIndexChanged.connect(_sync_opening_type)
+
+        # Also run once initially for new records (only if not editing an existing party)
+        if not self.doc_id and not self.existing_data.get("opening_type"):
+            _sync_opening_type(self.cmb_type.currentIndex())
+        ob_container = QWidget()
+        ob_layout = QHBoxLayout(ob_container)
+        ob_layout.setContentsMargins(0,0,0,0)
+        ob_layout.addWidget(self.edt_opening_bal)
+        ob_layout.addWidget(self.cmb_opening_type)
         if self.doc_id:
-            ob_container.setDisabled(True)
-            self.balance.setToolTip("Opening balance can only be set when creating a party.")
+            self.edt_opening_bal.clear()
+            self.edt_opening_bal.setPlaceholderText("Managed from COA")
+            self.edt_opening_bal.setToolTip("Opening balance is managed from the COA module.")
+            self.edt_opening_bal.setDisabled(True)
+            self.cmb_opening_type.setDisabled(True)
 
-        self.status = QComboBox(); self.status.addItems(["Active", "Inactive"])
-        if not self.existing_data.get("active", True): self.status.setCurrentIndex(1)
+        # --- COA field (single dropdown with sentinel for Admins) ---
+        self._coa_accounts_cache = []
+        self.cmb_coa = None
+        self.lbl_coa = None
 
-        # NOTE: Mark all except Email, NTN, GST as important (*)
-        form.addRow("Name *", self.name)
-        form.addRow("Contact *", self.contact)
-        form.addRow("Phone *", self.phone)
-        form.addRow("Email", self.email)
-        form.addRow("Address *", self.address)
-        form.addRow("GST", self.gst)
-        form.addRow("NTN", self.ntn)
-        form.addRow("Type *", self.type)
-        form.addRow("Branches *", self.branches)
+        # NEW: read-only field to show the COA code (selected or predicted)
+        self.edt_coa_code = QLineEdit()
+        self.edt_coa_code.setReadOnly(True)
+        self.edt_coa_code.setStyleSheet("background:#f3f4f6;")
+        self.edt_coa_code.setPlaceholderText("Will be auto-generated")
+
+        current_coa_id = self.existing_data.get("coa_account_id")
+
+        if _is_admin_user(self.user_data):
+            # Admin sees one combo:
+            #   [0] ➕ Create New Account (auto)
+            #   [1..] Existing COA accounts
+            self.cmb_coa = QComboBox()
+            self.cmb_coa.setEditable(True)
+            self.cmb_coa.addItem("➕ Create New Account (auto)", AUTO_CREATE_SENTINEL)
+            self._populate_accounts_into_combo(self.cmb_coa, current_coa_id)
+
+            # If editing and there is a current account, preselect it; else default to sentinel
+            if self.doc_id and current_coa_id:
+                for i in range(1, self.cmb_coa.count()):  # skip sentinel
+                    if self.cmb_coa.itemData(i) == current_coa_id:
+                        self.cmb_coa.setCurrentIndex(i)
+                        break
+            else:
+                self.cmb_coa.setCurrentIndex(0)
+
+            # keep COA code preview updated when selection changes
+            self.cmb_coa.currentIndexChanged.connect(self._update_coa_code_display)
+            form.addRow("COA Account", self.cmb_coa)
+
+        else:
+            # Non-admins: read-only; always auto-create on Save for NEW
+            display = "-"
+            if current_coa_id:
+                try:
+                    snap = db.collection("accounts").document(current_coa_id).get()
+                    acc = snap.to_dict() if snap.exists else {}
+                    display = _fmt_account_display(current_coa_id, acc)
+                    # also show code if present
+                    self.edt_coa_code.setText(acc.get("code", ""))
+                except Exception:
+                    display = f"[{current_coa_id}]"
+            else:
+                display = "(Will auto-create on Save)"
+            self.lbl_coa = QLabel(display)
+            form.addRow("COA Account", self.lbl_coa)
+
+        # NEW: Add the read-only COA Code row just under the COA selector/label
+        form.addRow("COA Code", self.edt_coa_code)
+
+        # Add rows
+        form.addRow("Code *", self.edt_code)
+        form.addRow("Name *", self.edt_name)
+        form.addRow("Contact *", self.edt_contact)
+        form.addRow("Type *", self.cmb_type)
+        form.addRow("Phone *", self.edt_phone)
+        form.addRow("Email", self.edt_email)
+        form.addRow("GST", self.edt_gst)
+        form.addRow("NTN", self.edt_ntn)
+        form.addRow("Address *", self.edt_address)
+        form.addRow("Branches *", self.lst_branches)
         form.addRow("Opening Balance *", ob_container)
-        form.addRow("Status *", self.status)
-        main.addWidget(form_box)
+        form.addRow("Status *", self.cmb_active)
 
-        # Buttons
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Save).setShortcut("Ctrl+S")
-        buttons.accepted.connect(self.save)
+        lay.addWidget(form_box)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Save)
+        buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
-        main.addWidget(buttons)
+        lay.addWidget(buttons)
 
-    # -------- Business Logic --------
+
+    def _populate_accounts_into_combo(self, combo: QComboBox, current_coa_id: str):
+        # Keep sentinel if present
+        if combo.count() and combo.itemData(0) == AUTO_CREATE_SENTINEL:
+            while combo.count() > 1:
+                combo.removeItem(1)
+            start_index = 1
+        else:
+            combo.clear()
+            start_index = 0
+
+        self._coa_accounts_cache.clear()
+        try:
+            accounts = db.collection("accounts").stream()
+            current_index = -1
+            idx = start_index
+            for acc_doc in accounts:
+                acc = acc_doc.to_dict() or {}
+                display = _fmt_account_display(acc_doc.id, acc)
+                combo.addItem(display, acc_doc.id)
+                self._coa_accounts_cache.append((display, acc_doc.id))
+                if current_coa_id and acc_doc.id == current_coa_id:
+                    current_index = idx
+                idx += 1
+            if current_index >= 0:
+                combo.setCurrentIndex(current_index)
+        except Exception as e:
+            combo.addItem(f"(failed to load accounts: {e})", "")
+
+    def _selected_coa_id(self) -> str:
+        if self.cmb_coa is None:
+            return None
+        data = self.cmb_coa.currentData()
+        if data:
+            return data  # could be AUTO_CREATE_SENTINEL or an account id
+        # Fallback: match by display text (rare)
+        text = (self.cmb_coa.currentText() or "").strip()
+        if text.lower().startswith("➕ create new account"):
+            return AUTO_CREATE_SENTINEL
+        for display, acc_id in self._coa_accounts_cache:
+            if display == text:
+                return acc_id
+        return None
+    
+    def _peek_next_account_code(self, acc_type: str) -> str:
+        """Best-effort, non-writing prediction of the next COA code for an account type."""
+        try:
+            prefix = ACCOUNT_TYPE_PREFIX.get(acc_type, "9")
+            counter_ref = db.collection("meta").document("account_code_counters")
+            snap = counter_ref.get()
+            data = snap.to_dict() or {}
+            last = data.get(acc_type)
+            if not last:
+                # Fallback: scan accounts of this type to infer max
+                query = db.collection("accounts").where("type", "==", acc_type).get()
+                max_code = int(prefix + "000")
+                for d in query:
+                    code_str = str((d.to_dict() or {}).get("code", "")) or ""
+                    if code_str.startswith(prefix):
+                        try:
+                            max_code = max(max_code, int(code_str))
+                        except:
+                            pass
+                last = max_code
+            return str(int(last) + 1)
+        except Exception:
+            return ""
+
+    def _update_coa_code_display(self):
+        """Fill the read-only COA Code preview based on selection / auto-create."""
+        try:
+            # Determine account type from party type
+            party_type = self.cmb_type.currentText()
+            acc_type = "Asset" if party_type in ("Customer", "Both") else "Liability"
+
+            # Admin path with dropdown
+            if self.cmb_coa is not None:
+                sel = self._selected_coa_id()
+                if sel and sel != AUTO_CREATE_SENTINEL:
+                    snap = db.collection("accounts").document(sel).get()
+                    if snap.exists:
+                        acc = snap.to_dict() or {}
+                        self.edt_coa_code.setText(str(acc.get("code", "")))
+                        return
+                    self.edt_coa_code.setText("")
+                    return
+                # Sentinel (auto-create) – only show prediction on NEW
+                if not self.doc_id:
+                    self.edt_coa_code.setText(self._peek_next_account_code(acc_type))
+                else:
+                    self.edt_coa_code.setText("")
+                return
+
+            # Non-admin path (label only)
+            current_coa_id = self.existing_data.get("coa_account_id")
+            if current_coa_id:
+                snap = db.collection("accounts").document(current_coa_id).get()
+                if snap.exists:
+                    acc = snap.to_dict() or {}
+                    self.edt_coa_code.setText(str(acc.get("code", "")))
+                    return
+                self.edt_coa_code.setText("")
+                return
+
+            # New + auto-create (non-admin): predict
+            if not self.doc_id:
+                self.edt_coa_code.setText(self._peek_next_account_code(acc_type))
+            else:
+                self.edt_coa_code.setText("")
+        except Exception:
+            self.edt_coa_code.setText("")
+
+    # ---------- Logic ----------
+    def _generate_next_party_code(self) -> str:
+        """
+        Atomically increments the party code counter in meta/cust_supp
+        and returns a zero-padded string like '001', '002', ...
+        """
+        doc_ref = db.collection("meta").document("cust_supp")
+        transaction = firestore.client().transaction()
+
+        @firestore.transactional
+        def _tx(trans):
+            snap = doc_ref.get(transaction=trans)
+            data = snap.to_dict() or {}
+            last = data.get("code")
+            if last is None:
+                # Fallback: try to infer max existing numeric 'id' from parties
+                try:
+                    existing = db.collection("parties").stream()
+                    max_num = 0
+                    for d in existing:
+                        v = (d.to_dict() or {}).get("id")
+                        if v is None:
+                            continue
+                        s = str(v).strip()
+                        if s.isdigit():
+                            max_num = max(max_num, int(s))
+                    last = max_num
+                except Exception:
+                    last = 0
+            new_code = int(last) + 1
+            trans.set(doc_ref, {"code": new_code}, merge=True)
+            # zero-pad to at least 3 digits
+            return str(new_code).zfill(3)
+
+        return _tx(transaction)
+    
+    def _prefetch_next_code(self):
+        """
+        Show the NEXT party code (counter + 1) as actual text (read-only),
+        so the UI matches what will be saved on click.
+        """
+        try:
+            doc_ref = db.collection("meta").document("cust_supp")
+            doc = doc_ref.get()
+            last_code = 0
+            if doc.exists:
+                data = doc.to_dict() or {}
+                # 'code' stores the last issued number; next will be +1
+                last_code = int(data.get("code", 0))
+            next_code = str(last_code + 1).zfill(3)
+
+            # Write as TEXT (not placeholder) to avoid 001 vs 002 mismatch
+            if not (self.edt_code.text() or "").strip():
+                self.edt_code.setText(next_code)
+        except Exception:
+            # best-effort; leave blank if anything goes wrong
+            pass
+
     def _normalize_drcr(self, val):
         v = (val or "").strip().lower()
         if v in ("dr", "debit"): return "debit"
         if v in ("cr", "credit"): return "credit"
         return "debit"
 
-    def post_opening_journal_entry(self, account_id, account_name, amount, drcr):
-        try:
-            if not amount or amount <= 0:
-                return
-            drcr = self._normalize_drcr(drcr)
+    def _generate_code_once(self, acc_type):
+        prefix = ACCOUNT_TYPE_PREFIX.get(acc_type, "9")
+        counter_ref = db.collection("meta").document("account_code_counters")
+        transaction = firestore.client().transaction()
 
-            # Find or create Opening Balances Equity (by slug)
+        @firestore.transactional
+        def increment_code(trans):
+            snapshot = counter_ref.get(transaction=trans)
+            data = snapshot.to_dict() or {}
+            last = data.get(acc_type)
+            if not last:
+                query = db.collection("accounts").where("type", "==", acc_type).get()
+                codes = []
+                for d in query:
+                    code_str = str((d.to_dict() or {}).get("code", ""))
+                    if code_str.startswith(prefix):
+                        try: codes.append(int(code_str))
+                        except: pass
+                last = max(codes) if codes else int(prefix + "000")
+            new_code = int(last) + 1
+            data[acc_type] = new_code
+            trans.set(counter_ref, data, merge=True)
+            return str(new_code)
+
+        return increment_code(transaction)
+
+    def _post_opening_journal_entry(self, account_id, account_name, amount, drcr):
+        """
+        Create the opening JE but always show Previous Balance = 0.00 in the JE lines.
+        We DO NOT read the live account balance for the snapshot; we force it to zero.
+        Everything else (your preloaded current_balance on account creation) stays as-is.
+        """
+        try:
+            amount = float(amount or 0)
+            if amount <= 0:
+                return
+            drcr = self._normalize_drcr(drcr)  # "debit" / "credit"
+
+            # Find or create Opening Balances Equity
             equity_q = db.collection("accounts").where("slug", "==", "opening_balances_equity").limit(1).get()
             if equity_q:
                 equity_account_id = equity_q[0].id
-                equity_account_name = equity_q[0].to_dict().get("name", "Opening Balances Equity")
+                equity_account_name = (equity_q[0].to_dict() or {}).get("name", "Opening Balances Equity")
             else:
-                code = self.generate_code_once("Equity")
+                code = self._generate_code_once("Equity")
                 branch_list = self.user_data.get("branch", [])
-                if isinstance(branch_list, str): branch_list = [branch_list]
+                if isinstance(branch_list, str):
+                    branch_list = [branch_list]
                 equity_doc = {
                     "name": "Opening Balances Equity",
                     "slug": "opening_balances_equity",
@@ -457,31 +826,53 @@ class PartyDialog(QDialog):
                     "active": True,
                     "is_posting": True,
                     "opening_balance": None,
-                    "current_balance": 0.0
+                    "current_balance": 0.0,
                 }
-                ref = db.collection("accounts").document(); ref.set(equity_doc)
-                equity_account_id = ref.id; equity_account_name = "Opening Balances Equity"
+                ref = db.collection("accounts").document()
+                ref.set(equity_doc)
+                equity_account_id = ref.id
+                equity_account_name = "Opening Balances Equity"
 
-            # balance_before snapshots
-            a_pre = 0.0; e_pre = 0.0
+            # ---- KEY CHANGE: force the "previous balance" snapshot to ZERO
+            a_pre = 0.0   # previous balance for party line (forced)
+            e_pre = 0.0   # previous balance for equity line (forced)
+            
+            # Normalize inputs
             try:
-                a_doc = db.collection("accounts").document(account_id).get().to_dict() or {}
-                a_pre = float(a_doc.get("current_balance", 0.0) or 0.0)
-            except Exception: pass
-            try:
-                e_doc = db.collection("accounts").document(equity_account_id).get().to_dict() or {}
-                e_pre = float(e_doc.get("current_balance", 0.0) or 0.0)
-            except Exception: pass
+                amount = float(amount or 0)
+            except Exception:
+                amount = 0.0
+            drcr = self._normalize_drcr(drcr)  # -> "debit" or "credit"
 
-            debit_line = {"account_id": account_id, "account_name": account_name, "debit": amount, "credit": 0, "balance_before": a_pre}
-            credit_line = {"account_id": equity_account_id, "account_name": equity_account_name, "debit": 0, "credit": amount, "balance_before": e_pre}
+            # Build lines with the correct side for the PARTY based on drcr
             if drcr == "credit":
-                debit_line, credit_line = credit_line, debit_line
+                # Party gets CREDIT, Equity gets DEBIT
+                party_line = {
+                    "account_id": account_id, "account_name": account_name,
+                    "debit": 0, "credit": amount, "balance_before": a_pre
+                }
+                equity_line = {
+                    "account_id": equity_account_id, "account_name": equity_account_name,
+                    "debit": amount, "credit": 0, "balance_before": e_pre
+                }
+            else:
+                # Party gets DEBIT, Equity gets CREDIT
+                party_line = {
+                    "account_id": account_id, "account_name": account_name,
+                    "debit": amount, "credit": 0, "balance_before": a_pre
+                }
+                equity_line = {
+                    "account_id": equity_account_id, "account_name": equity_account_name,
+                    "debit": 0, "credit": amount, "balance_before": e_pre
+                }
 
+            # Header
             now_server = firestore.SERVER_TIMESTAMP
             branch_val = self.user_data.get("branch")
-            if isinstance(branch_val, list): branch_val = branch_val[0] if branch_val else "-"
-            if not branch_val: branch_val = "-"
+            if isinstance(branch_val, list):
+                branch_val = branch_val[0] if branch_val else "-"
+            if not branch_val:
+                branch_val = "-"
 
             je = {
                 "date": now_server,
@@ -491,45 +882,39 @@ class PartyDialog(QDialog):
                 "purpose": "Adjustment",
                 "branch": branch_val,
                 "description": f"Opening balance for {account_name}",
-                "lines": [debit_line, credit_line],
-                "lines_account_ids": [debit_line["account_id"], credit_line["account_id"]],
-                "meta": {"kind": "opening_balance"}
+                "lines": [party_line, equity_line],
+                "lines_account_ids": [party_line["account_id"], equity_line["account_id"]],
+                "meta": {"kind": "opening_balance", "assume_prev_zero": True},
             }
             db.collection("journal_entries").document().set(je)
+
+            # NOTE: No balance increments here; you are keeping current_balance
+            # preloaded when the account is created, per your chosen approach.
+
         except Exception as e:
             QMessageBox.critical(self, "Journal Error", f"Failed to post JE: {e}")
 
-    def generate_code_once(self, acc_type):
-        prefix = ACCOUNT_TYPE_PREFIX.get(acc_type, "9")
-        counter_ref = db.collection("meta").document("account_code_counters")
-        transaction = firestore.client().transaction()
-        @firestore.transactional
-        def increment_code(trans):
-            snapshot = counter_ref.get(transaction=trans)
-            data = snapshot.to_dict() or {}
-            last = data.get(acc_type)
-            if not last:
-                query = db.collection("accounts").where("type", "==", acc_type).get()
-                codes = [int(doc.to_dict().get("code", "0")) for doc in query if doc.to_dict().get("code", "").startswith(prefix)]
-                last = max(codes) if codes else int(prefix + "000")
-            new_code = last + 1
-            data[acc_type] = new_code
-            trans.set(counter_ref, data, merge=True)
-            return str(new_code)
-        return increment_code(transaction)
 
-    def create_coa_account_for_party(self, name, type_, party_type, party_id, opening_balance, drcr, branches):
+    def _create_coa_account_for_party(self, name, type_, party_type, party_id, opening_balance, drcr, branches):
         def _slugify(text: str) -> str:
-            s = (text or "").strip().lower(); s = re.sub(r"[^a-z0-9]+", "_", s); return s.strip("_")
+            s = (text or "").strip().lower()
+            s = re.sub(r"[^a-z0-9]+", "_", s)
+            return s.strip("_")
+
         def ensure_parent_account(name, acc_type, slug_value, branches_list):
             existing = db.collection("accounts").where("slug", "==", slug_value).limit(1).get()
-            if existing: return existing[0].id
-            code = self.generate_code_once(acc_type)
+            if existing:
+                return existing[0].id
+            code = self._generate_code_once(acc_type)
             parent_doc = {
-                "name": name, "slug": slug_value, "type": acc_type, "code": code, "parent": None, "branch": branches_list,
-                "description": f"System-generated parent for {name.lower()}", "active": True, "is_posting": False, "current_balance": 0.0
+                "name": name, "slug": slug_value, "type": acc_type, "code": code,
+                "parent": None, "branch": branches_list,
+                "description": f"System-generated parent for {name.lower()}",
+                "active": True, "is_posting": False, "current_balance": 0.0
             }
-            ref = db.collection("accounts").document(); ref.set(parent_doc); return ref.id
+            ref = db.collection("accounts").document()
+            ref.set(parent_doc)
+            return ref.id
 
         if isinstance(branches, str) or branches is None:
             branches = [branches] if branches else []
@@ -537,89 +922,215 @@ class PartyDialog(QDialog):
             ob_amount = float(opening_balance or 0.0)
         except Exception:
             ob_amount = 0.0
-        drcr_norm = self._normalize_drcr(drcr)
+        drcr_norm = self._normalize_drcr(drcr)  # -> "debit" or "credit"
 
-        parent_name = "Clients" if party_type == "Customer" else "Suppliers"
-        parent_slug = "clients_parent" if party_type == "Customer" else "suppliers_parent"
+        parent_name = "Clients" if party_type == "Customer" else ("Suppliers" if party_type == "Supplier" else "Clients_Suppliers")
+        parent_slug = "clients_parent" if party_type == "Customer" else ("suppliers_parent" if party_type == "Supplier" else "clients_suppliers_parent")
         parent_id = ensure_parent_account(parent_name, type_, parent_slug, branches)
 
+        # Signed balance cached in current_balance (your existing convention)
         computed_balance = ob_amount if drcr_norm == "debit" else -ob_amount
-        if type_ not in ["Asset", "Expense"]: computed_balance *= -1
+        if type_ not in ["Asset", "Expense"]:
+            computed_balance *= -1
 
-        account_code = self.generate_code_once(type_)
+        account_code = self._generate_code_once(type_)
         child_slug = _slugify(name)
-        coa_data = {
-            "name": name, "slug": child_slug, "type": type_, "code": account_code, "parent": parent_id,
-            "branch": branches, "description": f"{party_type} account for {name}", "active": True, "is_posting": True,
-            "linked_party_id": party_id, "opening_balance": {"amount": ob_amount, "type": drcr_norm}, "current_balance": 0.0
-        }
-        coa_ref = db.collection("accounts").document(); coa_ref.set(coa_data)
 
-        self.post_opening_journal_entry(account_id=coa_ref.id, account_name=name, amount=ob_amount, drcr=drcr_norm)
+        # IMPORTANT: opening_balance must be a DICT to match chart_of_accounts expectations
+        opening_dict = None
         if ob_amount > 0:
-            db.collection("accounts").document(coa_ref.id).update({"current_balance": computed_balance})
-        return coa_ref.id
+            opening_dict = {"amount": ob_amount, "type": drcr_norm}
 
-    def _validate_required(self):
+        coa_data = {
+            "name": name,
+            "slug": child_slug,
+            "type": type_,
+            "code": account_code,
+            "parent": parent_id,
+            "branch": branches,
+            "description": f"Auto-generated for {party_type} {name}",
+            "active": True,
+            "is_posting": True,
+            "opening_balance": opening_dict,   # <- back to dict shape
+            "current_balance": computed_balance
+        }
+        ref = db.collection("accounts").document()
+        ref.set(coa_data)
+        return ref.id
+
+
+    def _collect_branches_from_ui(self):
+        branches = []
+        for i in range(self.lst_branches.count()):
+            item = self.lst_branches.item(i)
+            if item.checkState() == Qt.Checked:
+                branches.append(item.text())
+        return branches
+
+    def _save(self):
+        name = self.edt_name.text().strip()
+        # code is readonly; we won't require it on create
+        code_current = (self.edt_code.text() or "").strip()
+
+        contact = self.edt_contact.text().strip()
+        phone = self.edt_phone.text().strip()
+        address = (self.edt_address.toPlainText() or "").strip()
+
+        # Required: Name, Contact, Phone, Address
         missing = []
-        if not self.name.text().strip(): missing.append("Name")
-        if not self.contact.text().strip(): missing.append("Contact")
-        if not self.phone.text().strip(): missing.append("Phone")
-        if not self.address.toPlainText().strip(): missing.append("Address")
-        if self.type.currentText().strip() == "": missing.append("Type")
-        # Branches: require at least one checked
-        checked = [self.branches.item(i).text() for i in range(self.branches.count()) if self.branches.item(i).checkState() == Qt.Checked]
-        if not self.doc_id and len(checked) == 0:
-            # when adding, force a branch; when editing, keep as-is if none were set earlier
-            missing.append("Branches")
-        # Opening balance: field present but zero is allowed; just ensure numeric
-        try:
-            float(self.balance.text() or "0")
-        except Exception:
-            missing.append("Opening Balance (number)")
-        if missing:
-            QMessageBox.warning(self, "Validation", "Please fill required fields: " + ", ".join(missing))
-            return None
-        return checked
+        if not name:    missing.append("Name")
+        if not contact: missing.append("Contact Person")
+        if not phone:   missing.append("Phone")
+        if not address: missing.append("Address")
 
-    def save(self):
-        checked_branches = self._validate_required()
-        if checked_branches is None:
+        branches = self._collect_branches_from_ui()
+        # NEW: Branch required
+        if not branches:
+            QMessageBox.warning(self, "Missing Branch", "Please select at least one Branch.")
             return
 
-        name = self.name.text().strip()
-        opening_balance = float(self.balance.text() or "0")
-        opening_type_raw = self.balance_type.currentText().lower()
-        opening_type = self._normalize_drcr(opening_type_raw)
-        party_type = self.type.currentText()
-        acc_type = "Asset" if party_type == "Customer" else "Liability"
-        code = self.generated_code if not self.doc_id else self.existing_data.get("id", "000")
+        if missing:
+            QMessageBox.warning(self, "Missing fields", "Please fill: " + ", ".join(missing))
+            return
 
-        party_data = {
-            "id": code,
+        # On CREATE, auto-generate the client code; on EDIT, keep existing
+        if not self.doc_id:
+            try:
+                generated_code = self._generate_next_party_code()
+                self.edt_code.setText(generated_code)  # show it in the UI
+            except Exception as e:
+                QMessageBox.critical(self, "Code Error", f"Could not generate client code: {e}")
+                return
+            code_to_save = generated_code
+        else:
+            code_to_save = code_current  # existing id stays
+
+        payload = {
+            # EXACT party schema fields:
+            "gst": (self.edt_gst.text() or "").strip(),
+            "coa_account_id": self.existing_data.get("coa_account_id"),  # may be set/overridden below
+            "ntn": (self.edt_ntn.text() or "").strip(),
+            "contact_person": contact,
+            "id": code_to_save,
             "name": name,
-            "contact_person": self.contact.text().strip(),
-            "phone": self.phone.text().strip(),
-            "email": self.email.text().strip(),          # optional
-            "address": self.address.toPlainText().strip(),
-            "gst": self.gst.text().strip(),              # optional
-            "ntn": self.ntn.text().strip(),              # optional
-            "type": party_type,
-            "branches": checked_branches if checked_branches is not None else [],
-            "active": self.status.currentText() == "Active",
-            "created_at": self.existing_data.get("created_at") or datetime.datetime.now(),
+            "phone": phone,
+            "type": self.cmb_type.currentText(),
+            "email": (self.edt_email.text() or "").strip(),
+            "address": address,
+            "active": (self.cmb_active.currentText() == "Active"),
+            "branches": branches,
+            "updated_at": firestore.SERVER_TIMESTAMP,
         }
 
-        if self.doc_id:
-            db.collection("parties").document(self.doc_id).set(party_data, merge=True)
-            self.new_customer_id = self.doc_id
-        else:
-            new_id = str(uuid.uuid4())
-            party_data["coa_account_id"] = self.create_coa_account_for_party(
-                name=name, type_=acc_type, party_type=party_type, party_id=new_id,
-                opening_balance=opening_balance, drcr=opening_type, branches=party_data["branches"]
-            )
-            db.collection("parties").document(new_id).set(party_data)
-            db.collection("meta").document("cust_supp").set({"code": int(self.generated_code) + 1}, merge=True)
-            self.new_customer_id = new_id
+        try:
+            if self.doc_id:
+                # -------- Edit existing --------
+                if _is_admin_user(self.user_data) and self.cmb_coa:
+                    sel = self._selected_coa_id()
+                    if sel and sel != AUTO_CREATE_SENTINEL:
+                        # Admin linked an existing COA
+                        payload["coa_account_id"] = sel
+                    # If sentinel selected during edit, do nothing (no auto-create on edits)
+
+                db.collection("parties").document(self.doc_id).set(payload, merge=True)
+                self.accept()
+
+            else:
+                # -------- New --------
+                party_ref = db.collection("parties").document()
+                payload["created_at"] = firestore.SERVER_TIMESTAMP
+
+                party_type = self.cmb_type.currentText()
+                # Map party -> account type (Customer/Both: Asset, Supplier: Liability)
+                acc_type = "Asset" if party_type in ("Customer", "Both") else "Liability"
+
+                use_auto_create = True
+                selected_existing_id = None
+
+                if _is_admin_user(self.user_data) and self.cmb_coa:
+                    sel = self._selected_coa_id()
+                    if sel and sel != AUTO_CREATE_SENTINEL:
+                        use_auto_create = False
+                        selected_existing_id = sel
+
+                if not use_auto_create and selected_existing_id:
+                    # Admin chose an existing COA → link without opening JE
+                    payload["coa_account_id"] = selected_existing_id
+                    party_ref.set(payload)
+                    self.accept()
+                else:
+                    # Auto-create a fresh posting account + optional opening JE
+                    coa_id = self._create_coa_account_for_party(
+                        name, acc_type, party_type, party_ref.id,
+                        self.edt_opening_bal.text().strip(),
+                        self.cmb_opening_type.currentText(),
+                        branches
+                    )
+                    payload["coa_account_id"] = coa_id
+                    party_ref.set(payload)
+
+                    # Post opening JE only if amount > 0
+                    try:
+                        ob_amount = float(self.edt_opening_bal.text() or 0)
+                    except Exception:
+                        ob_amount = 0
+                    if ob_amount > 0:
+                        self._post_opening_journal_entry(
+                            coa_id, name, ob_amount, self.cmb_opening_type.currentText()
+                        )
+                    self.accept()
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed", str(e))
+
+
+
+class ChangeCOADialog(QDialog):
+    def __init__(self, user_data, existing_coa_id=None):
+        super().__init__()
+        self.user_data = user_data or {}
+        self.selected_account_id = None
+        self.setWindowTitle("Change COA (Admin)")
+        self.setMinimumWidth(480)
+        self.setStyleSheet(APP_STYLE)
+
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        self.cmb = QComboBox(); self.cmb.setEditable(True)
+        self._cache = []
+        try:
+            accounts = db.collection("accounts").stream()
+            cur_index = -1; idx = 0
+            for acc_doc in accounts:
+                acc = acc_doc.to_dict() or {}
+                display = _fmt_account_display(acc_doc.id, acc)
+                self.cmb.addItem(display, acc_doc.id)
+                self._cache.append((display, acc_doc.id))
+                if existing_coa_id and acc_doc.id == existing_coa_id:
+                    cur_index = idx
+                idx += 1
+            if cur_index >= 0:
+                self.cmb.setCurrentIndex(cur_index)
+        except Exception as e:
+            self.cmb.addItem(f"(failed to load accounts: {e})", "")
+        form.addRow("New COA Account", self.cmb)
+        lay.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Save)
+        buttons.accepted.connect(self._ok)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def _ok(self):
+        data = self.cmb.currentData()
+        if not data:
+            # try by display
+            text = (self.cmb.currentText() or "").strip()
+            for disp, acc_id in self._cache:
+                if disp == text:
+                    data = acc_id
+                    break
+        if not data:
+            QMessageBox.warning(self, "Select", "Please select a valid account.")
+            return
+        self.selected_account_id = data
         self.accept()

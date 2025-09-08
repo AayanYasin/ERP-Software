@@ -400,6 +400,16 @@ class JournalEntryViewer(QWidget):
         hh.setSectionResizeMode(5, QHeaderView.Stretch)
         hh.setSectionResizeMode(6, QHeaderView.Stretch)
         self.total_label.setText(f"Total Debit: {total_debit:,.2f}  —  Total Credit: {total_credit:,.2f}")
+        
+    def _signed_amount(self, debit: float, credit: float, acc_type: str,
+                   *, is_opening: bool = False, is_ob_equity: bool = False) -> float:
+        # Base sign rule (unchanged)
+        amt = (debit - credit) if acc_type in ("Asset", "Expense") else (credit - debit)
+        # Special DISPLAY override: in Opening Balance JEs, flip "Opening Balances Equity"
+        if is_opening and is_ob_equity:
+            amt = -amt
+        return amt
+
 
     # ===== Detail dialog (visual polish only) =====
     def view_entry_details(self, row, column):
@@ -431,7 +441,8 @@ class JournalEntryViewer(QWidget):
         lines_box = QFrame(); lines_box.setStyleSheet("QFrame{background:#FFFFFF;border:1px solid #E2E8F0;border-radius:10px}")
         lv = QVBoxLayout(lines_box); lv.setContentsMargins(12,10,12,10); lv.setSpacing(6)
         lv.addWidget(QLabel("Lines"))
-        table = QTableWidget(0,5); table.setHorizontalHeaderLabels(["Account","DR/CR","Amount","Previous Balance","New Balance"])
+        table = QTableWidget(0,5)
+        table.setHorizontalHeaderLabels(["Account","DR/CR","Amount","Previous Balance","New Balance"])
         h = table.horizontalHeader(); h.setStretchLastSection(False); h.setSectionResizeMode(0, QHeaderView.Stretch)
         for c in (1,2,3,4): h.setSectionResizeMode(c, QHeaderView.ResizeToContents)
         table.setAlternatingRowColors(True); table.setEditTriggers(QTableWidget.NoEditTriggers); table.setSelectionMode(QTableWidget.NoSelection)
@@ -441,35 +452,52 @@ class JournalEntryViewer(QWidget):
         for ln in (data.get("_lines", []) or []):
             acc_name = ln.get("account_name","-")
             acc_id   = ln.get("account_id","")
-            d_amt = float(ln.get("debit",0) or 0.0); c_amt = float(ln.get("credit",0) or 0.0)
+            d_amt = float(ln.get("debit",0) or 0.0)
+            c_amt = float(ln.get("credit",0) or 0.0)
             prev   = float(ln.get("balance_before",0) or 0.0)
+
             side = "DR" if d_amt>0 else ("CR" if c_amt>0 else "-")
-            amt  = d_amt if d_amt>0 else c_amt
-
             acc_type = self._account_type(acc_id)
-            net = (d_amt - c_amt) if acc_type in ("Asset","Expense") else (c_amt - d_amt)
 
-            # Opening balance JE: don't move Opening Balances Equity display balance
+            # ↓↓↓ add these three lines / replace your existing flags + signed_amt calc
             is_opening = (data.get("meta",{}) or {}).get("kind") == "opening_balance"
             eq_id = self._opening_equity_id()
-            is_equity_ob_line = is_opening and (acc_id == eq_id or acc_name == "Opening Balances Equity")
+            is_ob_equity = (acc_id == eq_id) or (acc_name == "Opening Balances Equity")
+
+            signed_amt = self._signed_amount(d_amt, c_amt, acc_type,
+                                            is_opening=is_opening, is_ob_equity=is_ob_equity)
+
+            # Net movement for balances (same as signed amount),
+            # but OB Equity in opening JEs keeps balance frozen below.
+            net = self._signed_amount(d_amt, c_amt, acc_type)  # base rule for movement
+
+            is_equity_ob_line = is_opening and is_ob_equity
             new_signed = prev if is_equity_ob_line else (prev + net)
 
             r = table.rowCount(); table.insertRow(r)
             table.setItem(r,0,QTableWidgetItem(acc_name))
-            table.setItem(r,1,QTableWidgetItem(side))
-            amt_item = QTableWidgetItem(f"{amt:,.2f}"); amt_item.setTextAlignment(Qt.AlignRight|Qt.AlignVCenter); amt_item.setFont(mono); table.setItem(r,2,amt_item)
-            prev_item = QTableWidgetItem(self._fmt_balance(prev, acc_type)); prev_item.setTextAlignment(Qt.AlignRight|Qt.AlignVCenter); prev_item.setFont(mono); table.setItem(r,3,prev_item)
-            new_item = QTableWidgetItem(self._fmt_balance(new_signed, acc_type)); new_item.setTextAlignment(Qt.AlignRight|Qt.AlignVCenter); new_item.setFont(mono); table.setItem(r,4,new_item)
+            table.setItem(r,1,QTableWidgetItem(side))  # keep side column for reference
+            amt_item = QTableWidgetItem(f"{signed_amt:,.2f}")             # ← signed (no DR/CR text)
+            amt_item.setTextAlignment(Qt.AlignRight|Qt.AlignVCenter); amt_item.setFont(mono); table.setItem(r,2,amt_item)
+
+            prev_item = QTableWidgetItem(f"{prev:,.2f}")                  # ← signed previous balance
+            prev_item.setTextAlignment(Qt.AlignRight|Qt.AlignVCenter); prev_item.setFont(mono); table.setItem(r,3,prev_item)
+
+            new_item = QTableWidgetItem(f"{new_signed:,.2f}")             # ← signed new balance
+            new_item.setTextAlignment(Qt.AlignRight|Qt.AlignVCenter); new_item.setFont(mono); table.setItem(r,4,new_item)
+
             debit_total += d_amt; credit_total += c_amt
 
         table.resizeColumnsToContents(); lv.addWidget(table)
-        tot = QHBoxLayout(); tot.addStretch(1); t = QLabel(f"Total: {debit_total:,.2f} DR  •  {credit_total:,.2f} CR"); t.setStyleSheet("color:#334155;font-weight:600"); tot.addWidget(t)
+        tot = QHBoxLayout(); tot.addStretch(1)
+        t = QLabel(f"Total: {debit_total:,.2f} DR  •  {credit_total:,.2f} CR")  # totals label unchanged
+        t.setStyleSheet("color:#334155;font-weight:600"); tot.addWidget(t)
         lv.addLayout(tot)
         root.addWidget(lines_box)
 
         btns = QDialogButtonBox(QDialogButtonBox.Close); btns.rejected.connect(dlg.reject); root.addWidget(btns)
         dlg.exec_()
+
 
     def table_menu(self, position):
         item = self.table.itemAt(position)
@@ -556,21 +584,45 @@ class JournalEntryViewer(QWidget):
             # NEW: bold styles for main rows
             bold_style = ParagraphStyle("bold", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=7.5, leading=9.2)
             bold_wrap_style = ParagraphStyle("bold_wrap", parent=wrap_style, fontName="Helvetica-Bold")
-            elements += [Paragraph("Journal Entries", title_style), Paragraph(f"<font size='8.5'>Range: {self.from_date.date().toString('yyyy-MM-dd')} → {self.to_date.date().toString('yyyy-MM-dd')}</font>", styles["Normal"]), Spacer(1,6)]
-            headers = ["Date","Reference","Description","Purpose","Branch","Account","Amount (DR/CR)","New Balance"]
+
+            elements += [
+                Paragraph("Journal Entries", title_style),
+                Paragraph(f"<font size='8.5'>Range: {self.from_date.date().toString('yyyy-MM-dd')} → {self.to_date.date().toString('yyyy-MM-dd')}</font>", styles["Normal"]),
+                Spacer(1,6)
+            ]
+
+            # Header text changed: remove (DR/CR)
+            headers = ["Date","Reference","Description","Purpose","Branch","Account","Amount","New Balance"]
             data = [headers]
+
             for e in self.filtered_entries:
                 desc_p = Paragraph(e.get("_description", "") or "-", wrap_style)
                 line_rows = []
                 for ln in (e.get("_lines",[]) or []):
-                    name = ln.get("account_name") or "-"; acc_id = ln.get("account_id","")
-                    d = float(ln.get("debit",0) or 0.0); c = float(ln.get("credit",0) or 0.0); prev = float(ln.get("balance_before",0) or 0.0)
-                    side = "DR" if d>0 else ("CR" if c>0 else ""); amt = d if d>0 else c
-                    acc_type = self._account_type(acc_id); net = (d-c) if acc_type in ("Asset","Expense") else (c-d)
+                    name = ln.get("account_name") or "-"
+                    acc_id = ln.get("account_id","")
+                    d = float(ln.get("debit",0) or 0.0)
+                    c = float(ln.get("credit",0) or 0.0)
+                    prev = float(ln.get("balance_before",0) or 0.0)
+
+                    acc_type = self._account_type(acc_id)
+
                     is_opening = (e.get("meta",{}) or {}).get("kind") == "opening_balance"
-                    eq_id = self._opening_equity_id(); is_equity_ob_line = is_opening and (acc_id == eq_id or name == "Opening Balances Equity")
-                    new_signed = prev if is_equity_ob_line else (prev + net); new_fmt = self._fmt_balance(new_signed, acc_type)
-                    line_rows.append(["","","","","", name, f"{amt:,.2f} {side}" if side else f"{amt:,.2f}", new_fmt])
+                    eq_id = self._opening_equity_id()
+                    is_ob_equity = (acc_id == eq_id) or (name == "Opening Balances Equity")
+
+                    # DISPLAY sign (with OB Equity flip on opening JEs)
+                    signed_amt = self._signed_amount(d, c, acc_type,
+                                                    is_opening=is_opening, is_ob_equity=is_ob_equity)
+
+                    # Movement uses the base rule; we’ll freeze OB Equity below
+                    net = self._signed_amount(d, c, acc_type)
+
+                    is_equity_ob_line = is_opening and is_ob_equity
+                    new_signed = prev if is_equity_ob_line else (prev + net)
+
+                    line_rows.append(["","","","","", name, f"{signed_amt:,.2f}", f"{new_signed:,.2f}"])
+
                 # Main row: bold cells, no amount
                 main_row = [
                     Paragraph(e.get("_date_str","") or "-", bold_style),
@@ -584,23 +636,25 @@ class JournalEntryViewer(QWidget):
                 ]
                 data.append(main_row)
                 data.extend(line_rows)
+
             def maxlen(col):
                 m = 0
                 for r in data[1:]:
                     v = r[col]
                     if isinstance(v, Paragraph):
-                        # Convert Paragraph content to plain text for measuring length
                         from xml.sax.saxutils import unescape
                         v = unescape(v.getPlainText())
                     m = max(m, len(str(v)))
                 return m
+
             w=[maxlen(0)*0.8, maxlen(1)*0.85, 28, maxlen(3)*0.5, maxlen(4)*0.6, 26, maxlen(6)*0.7, maxlen(7)*0.7]
             mins=[40,85,120,55,55,140,80,90]; avail=pdf.width; total=sum(max(a,b) for a,b in zip(w,mins))
             col_widths=[avail*(max(a,b)/total) for a,b in zip(w,mins)]
+
             tbl = Table(data, colWidths=col_widths, repeatRows=1)
             tbl.setStyle(TableStyle([
-                ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#FAFBFC")),  # light gray
-                ("TEXTCOLOR", (0,0), (-1,0), colors.HexColor("#334E68")),   # dark gray text
+                ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#FAFBFC")),
+                ("TEXTCOLOR", (0,0), (-1,0), colors.HexColor("#334E68")),
                 ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
                 ("FONTSIZE", (0,0), (-1,0), 9),
                 ("ALIGN", (0,0), (-1,0), "CENTER"),

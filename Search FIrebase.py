@@ -2,7 +2,8 @@ from firebase.config import db
 
 # Reference to a document
 # doc_ref = db.collection('manufacturing_orders').document('B69BaArBpBueG6bvUV48')
-doc_ref = db.collection('products').document('SgjwlthxwdenHKvQC84c')
+a = input("Enter Collection: "); b = input('Enter Document: ')
+doc_ref = db.collection(a).document(b)
 # doc_ref = db.collection('manufacturing_orders').document('cgUejys5SJdiCYWdwd8P')
 
 # Fetch the document

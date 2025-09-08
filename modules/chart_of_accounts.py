@@ -1,26 +1,32 @@
 # modules/chart_of_accounts.py
-# Refined UI/UX + safe business logic kept intact
 # ------------------------------------------------
-# Highlights:
-# - Clean header with title, counters, and quick actions
-# - Toolbar (Add, Edit, Delete, Refresh, Expand/Collapse, Export CSV)
-# - Fast search + multi-filter (Type, Status, Postable)
-# - Better tree visuals (badges, zebra rows, condensed spacing, autosizing)
-# - Context menu + keyboard shortcuts (Ins=Add, F2=Edit, Del=Delete, F5=Refresh)
-# - Non-blocking loader overlay during fetch
-# - Same AccountDialog logic preserved (including opening-balance JE flow with slug)
+# Performance + UX upgrades with logic preserved:
+# - NO journal_entries scan on refresh (uses current_balance or opening fallback)
+# - Background QThread for Firestore fetch (fast, responsive UI)
+# - Background QThread for Save (no "Not Responding" on save)
+# - Robust opening-edit guard: allows true opening-only state, blocks real activity
+# - Parent accounts list comes from already-loaded tree data (no network on dialog open)
+# - Tree build with repaint suppression + single-pass column resize
+# ------------------------------------------------
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTreeWidget, QTreeWidgetItem,
     QPushButton, QMessageBox, QLineEdit, QComboBox, QCheckBox, QAbstractItemView,
     QDialog, QFormLayout, QListWidget, QListWidgetItem, QDialogButtonBox,
-    QProgressDialog, QApplication, QFrame, QMenu, QFileDialog, QHeaderView
+    QProgressDialog, QApplication, QFrame, QMenu, QFileDialog, QHeaderView, QWidget as QtWidget
 )
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
+
 from firebase.config import db
 from firebase_admin import firestore
-import datetime, re, uuid, csv, os
+
+import datetime
+import re
+import uuid
+import csv
+import os
+
 
 # ------------------------------------------------
 # Constants
@@ -33,8 +39,9 @@ ACCOUNT_TYPE_PREFIX = {
     "Expense": "5"
 }
 
+
 # ------------------------------------------------
-# Helpers
+# UI helpers
 # ------------------------------------------------
 def _badge(text: str, kind: str = "neutral") -> str:
     colors = {
@@ -45,8 +52,8 @@ def _badge(text: str, kind: str = "neutral") -> str:
         "chip": "#2563EB",         # blue
         "neutral": "#374151"
     }
-    bg = colors.get(kind, colors["neutral"]) + "20"  # translucent
-    fg = colors.get(kind, colors["neutral"])         # solid
+    bg = colors.get(kind, colors["neutral"]) + "20"
+    fg = colors.get(kind, colors["neutral"])
     return f"<span style='padding:2px 8px;border-radius:10px;background:{bg};color:{fg};font-weight:600'>{text}</span>"
 
 
@@ -58,19 +65,308 @@ def _fmt_amount(val: float) -> str:
 
 
 # ------------------------------------------------
-# Account Dialog (business logic intact; minor UI polish)
+# Domain helpers (pure; safe to call from threads)
+# ------------------------------------------------
+def _signed_opening(acc_t: str, amount: float, drcr: str) -> float:
+    drcr = (drcr or "debit").lower()
+    if acc_t in ("Asset", "Expense"):
+        return amount if drcr == "debit" else -amount
+    else:
+        return amount if drcr == "credit" else -amount
+
+
+def _drcr_for_increase(acc_t: str) -> str:
+    return "debit" if acc_t in ("Asset", "Expense") else "credit"
+
+
+def _is_opening_like_je(doc_dict: dict) -> bool:
+    """Treat legacy 'Opening balance' entries as opening-like even if meta.kind is missing."""
+    d = doc_dict or {}
+    meta_kind = ((d.get("meta") or {}).get("kind") or "").lower()
+    if meta_kind == "opening_balance":
+        return True
+    desc = (d.get("description") or "").lower()
+    if "opening balance" in desc:
+        return True
+    purpose = (d.get("purpose") or "").lower()
+    if purpose == "adjustment" and "opening" in desc:
+        return True
+    return False
+
+
+def _has_non_opening_activity(db_ref, account_id: str, sample_size: int = 25) -> bool:
+    """
+    True iff there's at least ONE JE touching this account that is NOT opening-like.
+    Uses small, bounded reads to avoid heavy scans.
+    """
+    q = db_ref.collection("journal_entries") \
+              .where("lines_account_ids", "array_contains", account_id) \
+              .select(["description", "purpose", "meta.kind"]) \
+              .limit(sample_size)
+    docs = q.get()
+    if not docs:
+        return False
+    for d in docs:
+        if not _is_opening_like_je(d.to_dict() or {}):
+            return True
+    # If we hit the sample limit, peek one more page conservatively
+    if len(docs) == sample_size:
+        more = q.offset(sample_size).limit(sample_size).get()
+        for d in more:
+            if not _is_opening_like_je(d.to_dict() or {}):
+                return True
+    return False
+
+
+def _generate_code_once_tx(db_ref, acc_type: str) -> str:
+    """Transactional, thread-safe account code generation for a given type."""
+    prefix = ACCOUNT_TYPE_PREFIX.get(acc_type, "9")
+    counter_ref = db_ref.collection("meta").document("account_code_counters")
+    transaction = firestore.client().transaction()
+
+    @firestore.transactional
+    def _inc(trans):
+        snap = counter_ref.get(transaction=trans)
+        data = snap.to_dict() or {}
+        last = data.get(acc_type)
+        if not last:
+            query = db_ref.collection("accounts").where("type", "==", acc_type).get()
+            codes = []
+            for doc in query:
+                code = str((doc.to_dict() or {}).get("code", "") or "")
+                if code.isdigit() and code.startswith(prefix):
+                    try:
+                        codes.append(int(code))
+                    except Exception:
+                        pass
+            last = max(codes) if codes else int(prefix + "000")
+        new_code = int(last) + 1
+        data[acc_type] = new_code
+        trans.set(counter_ref, data, merge=True)
+        return str(new_code)
+
+    return _inc(transaction)
+
+
+def _post_opening_balance_je(db_ref, user_data: dict, account_id: str, account_name: str,
+                             amount: float, drcr: str, acc_type: str, description: str = None):
+    """Pure DB helper: create (if needed) 'Opening Balances Equity' and post a two-line JE."""
+    if not amount or amount <= 0:
+        return
+
+    drcr = (drcr or "debit").strip().lower()
+    if drcr not in ("debit", "credit"):
+        drcr = "debit"
+
+    # Locate or create equity account by slug
+    eq_q = db_ref.collection("accounts").where("slug", "==", "opening_balances_equity").limit(1).get()
+    if eq_q:
+        equity_account_id = eq_q[0].id
+        equity_account_name = (eq_q[0].to_dict() or {}).get("name", "Opening Balances Equity")
+    else:
+        equity_code = _generate_code_once_tx(db_ref, "Equity")
+        branches = user_data.get("branch", [])
+        if isinstance(branches, str):
+            branches = [branches]
+        equity_account = {
+            "name": "Opening Balances Equity",
+            "slug": "opening_balances_equity",
+            "type": "Equity",
+            "code": equity_code,
+            "parent": None,
+            "branch": branches,
+            "description": "System-generated equity account for opening balances",
+            "active": True,
+            "is_posting": True,
+            "opening_balance": None,
+            "current_balance": 0.0
+        }
+        doc_ref = db_ref.collection("accounts").document()
+        doc_ref.set(equity_account)
+        equity_account_id = doc_ref.id
+        equity_account_name = "Opening Balances Equity"
+
+    # Get 'before' balances (best-effort)
+    try:
+        a_doc = (db_ref.collection("accounts").document(account_id).get().to_dict() or {})
+        a_pre = float(a_doc.get("current_balance", 0.0) or 0.0)
+    except Exception:
+        a_pre = 0.0
+    try:
+        e_doc = (db_ref.collection("accounts").document(equity_account_id).get().to_dict() or {})
+        e_pre = float(e_doc.get("current_balance", 0.0) or 0.0)
+    except Exception:
+        e_pre = 0.0
+
+    debit_line = {"account_id": account_id, "account_name": account_name, "debit": amount, "credit": 0, "balance_before": a_pre}
+    credit_line = {"account_id": equity_account_id, "account_name": equity_account_name, "debit": 0, "credit": amount, "balance_before": e_pre}
+
+    if drcr == "credit":
+        debit_line, credit_line = credit_line, debit_line
+
+    now_server = firestore.SERVER_TIMESTAMP
+    branch_val = user_data.get("branch")
+    if isinstance(branch_val, list):
+        branch_val = branch_val[0] if branch_val else "-"
+    branch_val = branch_val or "-"
+
+    je_data = {
+        "date": now_server,
+        "created_at": now_server,
+        "created_by": user_data.get("email", "system"),
+        "purpose": "Adjustment",
+        "reference_no": f"JE-{uuid.uuid4().hex[:6].upper()}-{int(datetime.datetime.now(datetime.timezone.utc).timestamp())}",
+        "branch": branch_val,
+        "description": (description or f"Opening balance for {account_name}"),
+        "lines": [debit_line, credit_line],
+        "lines_account_ids": [debit_line["account_id"], credit_line["account_id"]],
+        "meta": {"kind": "opening_balance"}
+    }
+    db_ref.collection("journal_entries").document().set(je_data)
+
+
+# ------------------------------------------------
+# Background workers
+# ------------------------------------------------
+class AccountsLoader(QThread):
+    loaded = pyqtSignal(list, dict, int, int)  # rows, parent_map, active_cnt, inactive_cnt
+    failed = pyqtSignal(str)
+
+    def run(self):
+        try:
+            fields = ["name", "code", "type", "branch", "active", "is_posting",
+                      "parent", "current_balance", "opening_balance"]
+            account_docs = db.collection("accounts").select(fields).get()
+
+            rows = []
+            parent_map = {}
+            active_count = 0
+            inactive_count = 0
+
+            for doc in account_docs:
+                data = doc.to_dict() or {}
+                acc_id = doc.id
+
+                # Prefer cached current_balance; fall back to opening-only
+                if "current_balance" in data:
+                    base_balance = float(data.get("current_balance", 0.0) or 0.0)
+                else:
+                    opening = data.get("opening_balance") or {}
+                    opening_amount = float(opening.get("amount", 0.0) or 0.0)
+                    opening_type = (opening.get("type", "debit") or "debit").lower()
+                    if data.get("type") in ("Asset", "Expense"):
+                        base_balance = opening_amount if opening_type == "debit" else -opening_amount
+                    else:
+                        base_balance = -opening_amount if opening_type == "debit" else opening_amount
+
+                rows.append((acc_id, data, base_balance))
+                parent_map[acc_id] = data.get("parent")
+                if data.get("active", True):
+                    active_count += 1
+                else:
+                    inactive_count += 1
+
+            self.loaded.emit(rows, parent_map, active_count, inactive_count)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class _SaveAccountWorker(QThread):
+    ok = pyqtSignal(dict)    # e.g., {"id": "..."}
+    fail = pyqtSignal(str)
+
+    def __init__(self, payload: dict, parent=None):
+        super().__init__(parent)
+        self.p = payload
+
+    def run(self):
+        try:
+            # Unpack
+            doc_id = self.p["doc_id"]
+            is_new = self.p["is_new"]
+            doc = self.p["doc"]
+            user_data = self.p["user_data"]
+            name = self.p["name"]
+            acc_type = self.p["acc_type"]
+            opening = self.p["opening"]
+            guard_needed = self.p["guard_needed"]
+            prev_signed = self.p["prev_signed"]
+            new_signed = self.p["new_signed"]
+            tol = self.p["tol"]
+
+            doc_ref = db.collection("accounts").document(doc_id)
+
+            # Guard: block opening edits if there is non-opening activity
+            if guard_needed:
+                if _has_non_opening_activity(db, doc_id, sample_size=25):
+                    self.fail.emit(
+                        "Opening balance cannot be edited after other (non-opening) transactions exist.\n"
+                        "Please post an adjusting journal entry instead."
+                    )
+                    return
+
+            # Persist account doc (set or update)
+            if is_new:
+                doc_ref.set(doc)
+            else:
+                doc_ref.update(doc)
+
+            # Opening/Delta handling
+            if is_new:
+                if opening["has"]:
+                    # Post opening JE
+                    _post_opening_balance_je(
+                        db_ref=db,
+                        user_data=user_data,
+                        account_id=doc_id,
+                        account_name=name,
+                        amount=opening["amount"],
+                        drcr=opening["type"],
+                        acc_type=acc_type,
+                        description=f"Opening balance for {name}"
+                    )
+                    # Seed current_balance
+                    doc_ref.update({"current_balance": _signed_opening(acc_type, opening["amount"], opening["type"])})
+                else:
+                    doc_ref.update({"current_balance": 0.0})
+            else:
+                # Edit: if opening changed, post delta and bump cache atomically
+                delta = new_signed - prev_signed
+                if abs(delta) > tol:
+                    inc_dir = _drcr_for_increase(acc_type)  # debit for A/E, credit for L/Eq/Inc
+                    delta_drcr = inc_dir if delta > 0 else ("credit" if inc_dir == "debit" else "debit")
+                    _post_opening_balance_je(
+                        db_ref=db,
+                        user_data=user_data,
+                        account_id=doc_id,
+                        account_name=name,
+                        amount=abs(delta),
+                        drcr=delta_drcr,
+                        acc_type=acc_type,
+                        description=f"Opening balance adjustment Δ={delta:+,.2f}"
+                    )
+                    # Atomic bump to avoid race
+                    doc_ref.update({"current_balance": firestore.Increment(delta)})
+
+            self.ok.emit({"id": doc_id})
+        except Exception as e:
+            self.fail.emit(str(e))
+
+
+# ------------------------------------------------
+# Account Dialog (business logic intact; fast save; preloaded parents)
 # ------------------------------------------------
 class AccountDialog(QDialog):
-    def __init__(self, user_data, existing=None, parent=None):
+    def __init__(self, user_data, existing=None, parent=None, parents_seed=None):
         super().__init__(parent)
         self.user_data = user_data
         self.existing = existing
+        self._parents_seed = parents_seed or []  # list[(acc_id, data)] of non-posting accounts
         self.setWindowTitle("Edit Account" if existing else "Add New Account")
         self.setMinimumWidth(460)
 
         layout = QVBoxLayout(self)
 
-        # Header
         header = QLabel("<div style='font-size:18px;font-weight:700'>" + ("Edit Account" if existing else "Add New Account") + "</div>")
         header.setTextFormat(Qt.RichText)
         layout.addWidget(header)
@@ -103,7 +399,7 @@ class AccountDialog(QDialog):
         self.parent_combo = QComboBox()
         self.parent_combo.addItem("-- None --", None)
         self.parent_map = {}
-        self.load_parent_accounts()
+        self._populate_parents_from_seed()  # instant; no I/O
         form.addRow("Parent Account:", self.parent_combo)
 
         self.branch_list = QListWidget()
@@ -124,7 +420,7 @@ class AccountDialog(QDialog):
         self.posting_checkbox.setChecked(True)
         form.addRow("Account Nature:", self.posting_checkbox)
 
-        # Opening Balance block (always visible for consistency)
+        # Opening Balance block
         self.opening_amount = QLineEdit()
         self.opening_amount.setPlaceholderText("0.00")
         self.opening_type = QComboBox()
@@ -132,13 +428,12 @@ class AccountDialog(QDialog):
         ob_row = QHBoxLayout()
         ob_row.addWidget(self.opening_amount)
         ob_row.addWidget(self.opening_type)
-        ob_wrap = QWidget()
+        ob_wrap = QtWidget()
         ob_wrap.setLayout(ob_row)
         form.addRow("Opening Balance:", ob_wrap)
 
         layout.addLayout(form)
 
-        # Buttons
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.save_account)
         buttons.rejected.connect(self.reject)
@@ -149,56 +444,40 @@ class AccountDialog(QDialog):
         else:
             self.code_edit.setText("(will be auto-generated)")
 
-    # ---------- Business helpers (unchanged core logic) ----------
+        QTimer.singleShot(0, self.name_edit.setFocus)
+
     def _slugify(self, text: str) -> str:
         s = (text or "").strip().lower()
         s = re.sub(r"[^a-z0-9]+", "_", s)
         return s.strip("_")
 
-    def load_parent_accounts(self):
-        self.parent_combo.clear()
-        self.parent_combo.addItem("-- None --", None)
+    def _populate_parents_from_seed(self):
+        """Fill parent combo from preloaded non-posting accounts (no network)."""
+        self.parent_combo.blockSignals(True)
+        while self.parent_combo.count() > 1:
+            self.parent_combo.removeItem(1)
         self.parent_map = {}
-        try:
-            for acc in db.collection("accounts").stream():
-                acc_id = acc.id
-                data = acc.to_dict() or {}
-                if self.existing and acc_id == self.existing.get("id"):
-                    continue
-                # Only non-posting accounts can be parents
-                if not data.get("is_posting", True):
-                    self.parent_combo.addItem(f"[{data.get('code','')}] {data.get('name','')}", acc_id)
-                    self.parent_map[acc_id] = data
-        except Exception:
-            # Fallback – allow any
-            for acc in db.collection("accounts").stream():
-                acc_id = acc.id
-                data = acc.to_dict() or {}
-                if self.existing and acc_id == self.existing.get("id"):
-                    continue
+        me_id = self.existing.get("id") if self.existing else None
+
+        sorted_seed = sorted(self._parents_seed, key=lambda t: str((t[1] or {}).get("code", "")))
+        for acc_id, data in sorted_seed:
+            if me_id and acc_id == me_id:
+                continue  # cannot be own parent
+            # Only non-posting accounts can be parents (same rule as before)
+            if not (data or {}).get("is_posting", True):
                 self.parent_combo.addItem(f"[{data.get('code','')}] {data.get('name','')}", acc_id)
                 self.parent_map[acc_id] = data
 
+        if self.existing:
+            parent_id = self.existing.get("parent")
+            if parent_id:
+                idx = self.parent_combo.findData(parent_id)
+                self.parent_combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+        self.parent_combo.blockSignals(False)
+
     def generate_code_once(self, acc_type):
-        prefix = ACCOUNT_TYPE_PREFIX.get(acc_type, "9")
-        counter_ref = db.collection("meta").document("account_code_counters")
-        transaction = firestore.client().transaction()
-
-        @firestore.transactional
-        def increment_code(trans):
-            snapshot = counter_ref.get(transaction=trans)
-            data = snapshot.to_dict() or {}
-            last = data.get(acc_type)
-            if not last:
-                query = db.collection("accounts").where("type", "==", acc_type).get()
-                codes = [int(doc.to_dict().get("code", "0")) for doc in query if str(doc.to_dict().get("code", "")).startswith(prefix)]
-                last = max(codes) if codes else int(prefix + "000")
-            new_code = last + 1
-            data[acc_type] = new_code
-            trans.set(counter_ref, data, merge=True)
-            return str(new_code)
-
-        return increment_code(transaction)
+        return _generate_code_once_tx(db, acc_type)
 
     def load_existing_data(self):
         acc = self.existing
@@ -226,90 +505,8 @@ class AccountDialog(QDialog):
             self.opening_amount.setText(str(opening.get("amount", "")))
             self.opening_type.setCurrentText((opening.get("type", "Debit")).capitalize())
 
-    def post_opening_balance_journal(self, account_id, account_name, amount, drcr, acc_type, description=None, reverse=False):
-        try:
-            if not amount or amount <= 0:
-                return
-
-            drcr = (drcr or "debit").strip().lower()
-            if drcr not in ("debit", "credit"):
-                drcr = "debit"
-
-            # Find or create Opening Balances Equity by slug
-            eq_q = db.collection("accounts").where("slug", "==", "opening_balances_equity").limit(1).get()
-            if eq_q:
-                equity_account_id = eq_q[0].id
-                equity_account_name = eq_q[0].to_dict().get("name", "Opening Balances Equity")
-            else:
-                equity_code = self.generate_code_once("Equity")
-                branches = self.user_data.get("branch", [])
-                if isinstance(branches, str):
-                    branches = [branches]
-                equity_account = {
-                    "name": "Opening Balances Equity",
-                    "slug": "opening_balances_equity",
-                    "type": "Equity",
-                    "code": equity_code,
-                    "parent": None,
-                    "branch": branches,
-                    "description": "System-generated equity account for opening balances",
-                    "active": True,
-                    "is_posting": True,
-                    "opening_balance": None,
-                    "current_balance": 0.0
-                }
-                doc_ref = db.collection("accounts").document()
-                doc_ref.set(equity_account)
-                equity_account_id = doc_ref.id
-                equity_account_name = "Opening Balances Equity"
-
-            try:
-                a_snap = db.collection("accounts").document(account_id).get()
-                a_doc = a_snap.to_dict() or {}
-                a_pre = float(a_doc.get("current_balance", 0.0) or 0.0)
-            except Exception:
-                a_pre = 0.0
-            try:
-                e_snap = db.collection("accounts").document(equity_account_id).get()
-                e_doc = e_snap.to_dict() or {}
-                e_pre = float(e_doc.get("current_balance", 0.0) or 0.0)
-            except Exception:
-                e_pre = 0.0
-
-            debit_line = {"account_id": account_id, "account_name": account_name, "debit": amount, "credit": 0, "balance_before": a_pre}
-            credit_line = {"account_id": equity_account_id, "account_name": equity_account_name, "debit": 0, "credit": amount, "balance_before": e_pre}
-
-            if drcr == "credit":
-                debit_line, credit_line = credit_line, debit_line
-
-            if reverse:
-                debit_line, credit_line = credit_line, debit_line
-                debit_line["debit"], debit_line["credit"] = debit_line["credit"], debit_line["debit"]
-                credit_line["debit"], credit_line["credit"] = credit_line["credit"], credit_line["debit"]
-
-            now_server = firestore.SERVER_TIMESTAMP
-            branch_val = self.user_data.get("branch")
-            if isinstance(branch_val, list):
-                branch_val = branch_val[0] if branch_val else "-"
-            branch_val = branch_val or "-"
-
-            je_data = {
-                "date": now_server,
-                "created_at": now_server,
-                "created_by": self.user_data.get("email", "system"),
-                "purpose": "Adjustment",
-                "reference_no": f"JE-{uuid.uuid4().hex[:6].upper()}-{int(datetime.datetime.now(datetime.timezone.utc).timestamp())}",
-                "branch": branch_val,
-                "description": (description or f"Opening balance for {account_name}"),
-                "lines": [debit_line, credit_line],
-                "lines_account_ids": [debit_line["account_id"], credit_line["account_id"]],
-                "meta": {"kind": "opening_balance", "reverse": bool(reverse)}
-            }
-            db.collection("journal_entries").document().set(je_data)
-        except Exception as e:
-            QMessageBox.critical(self, "Journal Error", f"Failed to post opening balance journal entry: {e}")
-
     def save_account(self):
+        # -------- gather + validate form --------
         name = self.name_edit.text().strip()
         acc_type = self.type_combo.currentText()
         parent = self.parent_combo.currentData()
@@ -322,12 +519,14 @@ class AccountDialog(QDialog):
             QMessageBox.warning(self, "Validation Error", "Account name is required.")
             return
 
+        # Block converting to posting if there are children
         if self.existing and is_posting:
-            children = db.collection("accounts").where("parent", "==", self.existing["id"]).get()
+            children = db.collection("accounts").where("parent", "==", self.existing["id"]).limit(1).get()
             if children:
                 QMessageBox.warning(self, "Invalid Action", "Cannot convert to posting account — it has child accounts.")
                 return
 
+        # Validate/normalize parent and inherit type from a non-posting parent
         if parent:
             parent_doc = db.collection("accounts").document(parent).get()
             if parent_doc.exists:
@@ -337,7 +536,7 @@ class AccountDialog(QDialog):
                     return
                 acc_type = parent_data.get("type", acc_type)
 
-        prev_opening = None
+        # Previous opening (for comparison)
         prev_amt = 0.0
         prev_type = "debit"
         if self.existing:
@@ -348,6 +547,7 @@ class AccountDialog(QDialog):
                 prev_amt = 0.0
             prev_type = (prev_opening.get("type") or "debit").lower()
 
+        # New opening from form
         opening_balance = None
         new_amt = 0.0
         new_type = "debit"
@@ -363,6 +563,7 @@ class AccountDialog(QDialog):
                 QMessageBox.warning(self, "Validation Error", "Opening balance must be a positive number.")
                 return
 
+        # Account code
         if not self.existing:
             try:
                 code = self.generate_code_once(acc_type)
@@ -372,9 +573,11 @@ class AccountDialog(QDialog):
         else:
             code = self.code_edit.text()
 
+        # Slug
         existing_slug = (self.existing or {}).get("slug") if self.existing else None
         slug_val = existing_slug or self._slugify(name)
 
+        # Document payload
         doc = {
             "name": name,
             "slug": slug_val,
@@ -389,80 +592,58 @@ class AccountDialog(QDialog):
             "opening_balance": opening_balance
         }
 
-        try:
-            if self.existing:
-                doc_ref = db.collection("accounts").document(self.existing["id"])
-                doc_ref.update(doc)
-            else:
-                doc_ref = db.collection("accounts").document()
-                doc_ref.set(doc)
+        # Compute signed values for delta calc (thread passes these; no UI I/O)
+        prev_signed = _signed_opening(acc_type, prev_amt, prev_type) if self.existing and prev_amt > 0 else 0.0
+        new_signed = _signed_opening(acc_type, new_amt, new_type) if opening_balance and new_amt > 0 else 0.0
 
-            # Opening balance JE + current_balance sync
-            if not self.existing:
-                if opening_balance and new_amt > 0:
-                    self.post_opening_balance_journal(
-                        account_id=doc_ref.id,
-                        account_name=name,
-                        amount=new_amt,
-                        drcr=new_type,
-                        acc_type=acc_type,
-                        description=f"Opening balance for {name}"
-                    )
+        # Determine whether the opening actually changed
+        tol = 1e-6
+        prev_has_opening = (prev_amt > 0)
+        new_has_opening = (opening_balance is not None) and (new_amt > 0)
+        same_opening = (
+            (not prev_has_opening and not new_has_opening)
+            or (prev_has_opening and new_has_opening and abs(prev_amt - new_amt) < tol and prev_type == new_type)
+        )
 
-                if opening_balance:
-                    balance = new_amt
-                    if new_type == "credit":
-                        balance *= -1
-                    if acc_type not in ["Asset", "Expense"]:
-                        balance *= -1
-                    doc_ref.update({"current_balance": balance})
-                else:
-                    doc_ref.update({"current_balance": 0.0})
-            else:
-                tol = 1e-6
-                prev_has_opening = prev_amt > 0
-                new_has_opening = (opening_balance is not None) and (new_amt > 0)
-                same_opening = ((not prev_has_opening and not new_has_opening) or (prev_has_opening and new_has_opening and abs(prev_amt - new_amt) < tol and prev_type == new_type))
+        # Pre-assign / reuse doc id, avoid passing object refs across threads
+        if self.existing:
+            doc_id = self.existing["id"]
+            is_new = False
+        else:
+            doc_id = db.collection("accounts").document().id
+            is_new = True
 
-                if not same_opening:
-                    if prev_has_opening:
-                        self.post_opening_balance_journal(
-                            account_id=doc_ref.id,
-                            account_name=name,
-                            amount=prev_amt,
-                            drcr=prev_type,
-                            acc_type=acc_type,
-                            description=f"Reversal: opening balance correction for {name} (was {prev_amt} {prev_type})",
-                            reverse=True
-                        )
-                    if new_has_opening:
-                        corr_note = f" (was {prev_amt} {prev_type})" if prev_has_opening else ""
-                        self.post_opening_balance_journal(
-                            account_id=doc_ref.id,
-                            account_name=name,
-                            amount=new_amt,
-                            drcr=new_type,
-                            acc_type=acc_type,
-                            description=f"Corrected opening balance for {name}{corr_note}"
-                        )
+        # Spinner + disable dialog while saving in background
+        spinner = QProgressDialog("Saving account…", None, 0, 0, self)
+        spinner.setWindowModality(Qt.WindowModal)
+        spinner.setCancelButton(None)
+        spinner.setMinimumDuration(0)
+        spinner.show()
+        self.setEnabled(False)
+        QApplication.processEvents()
 
-                if new_has_opening:
-                    balance = new_amt
-                    if new_type == "credit":
-                        balance *= -1
-                    if acc_type not in ["Asset", "Expense"]:
-                        balance *= -1
-                    doc_ref.update({"current_balance": balance})
-                else:
-                    doc_ref.update({"current_balance": 0.0})
+        payload = {
+            "doc_id": doc_id,
+            "is_new": is_new,
+            "doc": doc,
+            "user_data": self.user_data,
+            "name": name,
+            "acc_type": acc_type,
+            "opening": {"has": new_has_opening, "amount": new_amt, "type": new_type},
+            "guard_needed": (self.existing is not None) and (not same_opening),
+            "prev_signed": prev_signed,
+            "new_signed": new_signed,
+            "tol": tol,
+        }
 
-            self.accept()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save: {e}")
+        self._save_worker = _SaveAccountWorker(payload, parent=self)
+        self._save_worker.ok.connect(lambda _: (spinner.close(), self.setEnabled(True), self.accept()))
+        self._save_worker.fail.connect(lambda msg: (spinner.close(), self.setEnabled(True), QMessageBox.warning(self, "Save Failed", msg)))
+        self._save_worker.start()
 
 
 # ------------------------------------------------
-# Chart of Accounts — Enhanced UI
+# Chart of Accounts (non-blocking + parent cache)
 # ------------------------------------------------
 class ChartOfAccounts(QWidget):
     def __init__(self, user_data):
@@ -471,11 +652,16 @@ class ChartOfAccounts(QWidget):
         self.setWindowTitle("Chart of Accounts")
         self.resize(1000, 680)
 
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(300)  # debounce filters
+
         self._build_ui()
         self._wire_shortcuts()
+        self._loader_thread = None
+        self._parents_seed = []  # cache of non-posting accounts for dialogs
         self.refresh()
 
-    # ---------- UI ----------
     def _build_ui(self):
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 14)
@@ -494,14 +680,15 @@ class ChartOfAccounts(QWidget):
         header.addWidget(self.badge_inactive)
         root.addLayout(header)
 
-        # Toolbar / Filters Row
+        # Toolbar / Filters
         tools = QHBoxLayout()
         tools.setSpacing(8)
 
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Search name/code/branch… (Ctrl+F)")
-        self.search_edit.textChanged.connect(self._apply_filters)
         self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(lambda: self._filter_timer.start())
+        self._filter_timer.timeout.connect(self._apply_filters)
         tools.addWidget(self.search_edit, 2)
 
         self.filter_type = QComboBox()
@@ -521,31 +708,32 @@ class ChartOfAccounts(QWidget):
         self.filter_post.currentIndexChanged.connect(self._apply_filters)
         tools.addWidget(self.filter_post)
 
-        # Quick action buttons
-        btn_add = QPushButton("➕ Add")
-        btn_add.clicked.connect(self.add_account)
-        btn_edit = QPushButton("✏️ Edit")
-        btn_edit.clicked.connect(self.edit_selected)
-        btn_delete = QPushButton("🗑️ Delete")
-        btn_delete.clicked.connect(self.delete_selected)
-        btn_refresh = QPushButton("🔄 Refresh")
-        btn_refresh.clicked.connect(self.refresh)
-        btn_expand = QPushButton("▾ Expand All")
-        btn_expand.clicked.connect(lambda: self._expand_collapse(True))
-        btn_collapse = QPushButton("▸ Collapse All")
-        btn_collapse.clicked.connect(lambda: self._expand_collapse(False))
-        btn_export = QPushButton("📤 Export CSV")
-        btn_export.clicked.connect(self.export_csv)
+        # Actions
+        self.btn_add = QPushButton("➕ Add")
+        self.btn_add.clicked.connect(self.add_account)
+        self.btn_edit = QPushButton("✏️ Edit")
+        self.btn_edit.clicked.connect(self.edit_selected)
+        self.btn_delete = QPushButton("🗑️ Delete")
+        self.btn_delete.clicked.connect(self.delete_selected)
+        self.btn_refresh = QPushButton("🔄 Refresh")
+        self.btn_refresh.clicked.connect(self.refresh)
+        self.btn_expand = QPushButton("▾ Expand All")
+        self.btn_expand.clicked.connect(lambda: self._expand_collapse(True))
+        self.btn_collapse = QPushButton("▸ Collapse All")
+        self.btn_collapse.clicked.connect(lambda: self._expand_collapse(False))
+        self.btn_export = QPushButton("📤 Export CSV")
+        self.btn_export.clicked.connect(self.export_csv)
 
-        for b in [btn_add, btn_edit, btn_delete, btn_refresh, btn_expand, btn_collapse, btn_export]:
+        for b in [self.btn_add, self.btn_edit, self.btn_delete, self.btn_refresh, self.btn_expand, self.btn_collapse, self.btn_export]:
             b.setCursor(Qt.PointingHandCursor)
-        tools.addWidget(btn_add)
-        tools.addWidget(btn_edit)
-        tools.addWidget(btn_delete)
-        tools.addWidget(btn_refresh)
-        tools.addWidget(btn_expand)
-        tools.addWidget(btn_collapse)
-        tools.addWidget(btn_export)
+
+        tools.addWidget(self.btn_add)
+        tools.addWidget(self.btn_edit)
+        tools.addWidget(self.btn_delete)
+        tools.addWidget(self.btn_refresh)
+        tools.addWidget(self.btn_expand)
+        tools.addWidget(self.btn_collapse)
+        tools.addWidget(self.btn_export)
         root.addLayout(tools)
 
         # Separator
@@ -565,7 +753,6 @@ class ChartOfAccounts(QWidget):
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._context_menu)
 
-        # Bigger, clearer font + padding
         base_font = QFont(self.tree.font())
         base_font.setPointSize(12)
         self.tree.setFont(base_font)
@@ -576,7 +763,6 @@ class ChartOfAccounts(QWidget):
             QHeaderView::section { background: #f8fafc; padding: 10px 12px; font-weight:600; font-size:13px; }
         ''')
 
-        # Column sizing: make name stretch, others resize to content
         header = self.tree.header()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.Stretch)
@@ -586,30 +772,24 @@ class ChartOfAccounts(QWidget):
         root.addWidget(self.tree, 1)
 
     def _wire_shortcuts(self):
-        # Lightweight shortcuts without QShortcut objects to avoid extra imports
         self.tree.keyPressEvent = self._tree_keypress_wrapper(self.tree.keyPressEvent)
 
     def _tree_keypress_wrapper(self, original):
         def handler(event):
             key = event.key()
             if key == Qt.Key_Insert:
-                self.add_account()
-                return
+                self.add_account(); return
             if key == Qt.Key_F2:
-                self.edit_selected()
-                return
+                self.edit_selected(); return
             if key == Qt.Key_Delete:
-                self.delete_selected()
-                return
+                self.delete_selected(); return
             if key == Qt.Key_F5:
-                self.refresh()
-                return
+                self.refresh(); return
             if key == Qt.Key_F and (event.modifiers() & Qt.ControlModifier):
                 self.search_edit.setFocus(); self.search_edit.selectAll(); return
             return original(event)
         return handler
 
-    # ---------- Data ops ----------
     def show_loader(self, title="Please wait…", message="Processing…"):
         loader = QProgressDialog(message, None, 0, 0, self)
         loader.setWindowModality(Qt.WindowModal)
@@ -621,104 +801,111 @@ class ChartOfAccounts(QWidget):
         QApplication.processEvents()
         return loader
 
+    def _set_toolbar_enabled(self, enabled: bool):
+        for b in [self.btn_add, self.btn_edit, self.btn_delete, self.btn_refresh, self.btn_expand, self.btn_collapse, self.btn_export]:
+            b.setEnabled(enabled)
+        self.search_edit.setEnabled(enabled)
+        self.filter_type.setEnabled(enabled)
+        self.filter_status.setEnabled(enabled)
+        self.filter_post.setEnabled(enabled)
+
     def refresh(self):
-        loader = self.show_loader("Loading Accounts", "Fetching chart of accounts…")
+        self.loader_dialog = self.show_loader("Loading Accounts", "Fetching chart of accounts…")
+        self._set_toolbar_enabled(False)
+
+        if self._loader_thread and self._loader_thread.isRunning():
+            self._loader_thread.terminate()
+            self._loader_thread.wait()
+
+        self._loader_thread = AccountsLoader(self)
+        self._loader_thread.loaded.connect(self._on_loaded_accounts)
+        self._loader_thread.failed.connect(self._on_load_failed)
+        self._loader_thread.start()
+
+    def _on_load_failed(self, msg: str):
         try:
-            self._load_accounts()
-            self._apply_filters()  # re-run filters after fresh load
-        finally:
-            QTimer.singleShot(200, loader.close)
+            self.loader_dialog.close()
+        except Exception:
+            pass
+        self._set_toolbar_enabled(True)
+        QMessageBox.critical(self, "Load Error", msg)
 
-    def _load_accounts(self):
-        self.tree.clear()
-        self._account_map = {}
+    def _on_loaded_accounts(self, rows, parent_map, active_count, inactive_count):
+        self.tree.setUpdatesEnabled(False)
+        try:
+            self.tree.clear()
+            self._account_map = {}
+            for acc_id, data, base_balance in rows:
+                name_txt = f"[{data.get('code','')}] {data.get('name','')}"
+                type_txt = data.get("type", "")
+                branches_txt = ", ".join(data.get("branch", []))
+                status_txt = "🟢" if data.get("active", True) else "🔴"
+                post_txt = "📝" if data.get("is_posting", True) else "📁"
 
-        query = db.collection("accounts").stream()
-        active_count = 0
-        inactive_count = 0
+                item = QTreeWidgetItem([name_txt, type_txt, _fmt_amount(base_balance), branches_txt, status_txt, post_txt])
+                item.setData(0, Qt.UserRole, acc_id)
+                item.setData(1, Qt.UserRole, data)
 
-        for doc in query:
-            data = doc.to_dict() or {}
-            acc_id = doc.id
+                if not data.get("is_posting", True):
+                    font = item.font(0)
+                    font.setBold(True)
+                    item.setFont(0, font)
+                    item.setForeground(0, Qt.darkGray)
 
-            # Use precomputed current_balance if present
-            if "current_balance" in data:
-                closing_balance = float(data.get("current_balance", 0.0))
-            else:
-                # Fallback to historical computation (slower, legacy safety)
-                opening = data.get("opening_balance") or {}
-                opening_amount = float(opening.get("amount", 0.0))
-                opening_type = (opening.get("type", "debit")).lower()
-                if data.get("type") in ["Asset", "Expense"]:
-                    opening_balance = opening_amount if opening_type == "debit" else -opening_amount
+                self._account_map[acc_id] = (item, parent_map.get(acc_id), base_balance)
+
+            # Build adjacency + totals (memoized)
+            children_of = {}
+            for acc_id, (_, parent_id, _) in self._account_map.items():
+                children_of.setdefault(parent_id, []).append(acc_id)
+
+            memo_total = {}
+
+            def compute_total(aid):
+                if aid in memo_total:
+                    return memo_total[aid]
+                item, _, base = self._account_map[aid]
+                total = base
+                for cid in children_of.get(aid, []):
+                    total += compute_total(cid)
+                memo_total[aid] = total
+                return total
+
+            roots = []
+            for acc_id in list(self._account_map.keys()):
+                total_balance = compute_total(acc_id)
+                self._account_map[acc_id][0].setText(2, _fmt_amount(total_balance))
+
+            for acc_id, (item, parent_id, _) in self._account_map.items():
+                if parent_id and parent_id in self._account_map:
+                    self._account_map[parent_id][0].addChild(item)
                 else:
-                    opening_balance = -opening_amount if opening_type == "debit" else opening_amount
-                debit_total = credit_total = 0.0
-                for journal_doc in db.collection("journal_entries").stream():
-                    entry = journal_doc.to_dict() or {}
-                    for line in entry.get("lines", []):
-                        if line.get("account_id") == acc_id:
-                            debit_total += float(line.get("debit", 0))
-                            credit_total += float(line.get("credit", 0))
-                closing_balance = opening_balance + debit_total - credit_total
+                    roots.append(item)
 
-            # Plain, always-visible text (no QLabel widgets)
-            name_txt = f"[{data.get('code','')}] {data.get('name','')}"
-            type_txt = data.get("type", "")
-            branches_txt = ", ".join(data.get("branch", []))
-            status_txt = "🟢" if data.get("active", True) else "🔴"
-            post_txt = "📝" if data.get("is_posting", True) else "📁"
+            if roots:
+                self.tree.addTopLevelItems(roots)
+                for it in roots:
+                    it.setExpanded(True)
 
-            item = QTreeWidgetItem([name_txt, type_txt, _fmt_amount(closing_balance), branches_txt, status_txt, post_txt])
-            item.setData(0, Qt.UserRole, acc_id)
-            item.setData(1, Qt.UserRole, data)
-
-            # Visual weight for non-posting (parents)
-            if not data.get("is_posting", True):
-                font = item.font(0)
-                font.setBold(True)
-                item.setFont(0, font)
-                item.setForeground(0, Qt.darkGray)
-
-            self._account_map[acc_id] = (item, data.get("parent"), closing_balance)
-            if data.get("active", True):
-                active_count += 1
-            else:
-                inactive_count += 1
-
-        # Propagate balances upward
-        def compute_balance(account_id):
-            item, parent_id, balance = self._account_map[account_id]
-            total = balance
-            for cid, (citem, cparent, cbalance) in self._account_map.items():
-                if cparent == account_id:
-                    total += compute_balance(cid)
-            return total
-
-        for acc_id in list(self._account_map.keys()):
-            total_balance = compute_balance(acc_id)
-            self._account_map[acc_id][0].setText(2, _fmt_amount(total_balance))
-
-        # Build hierarchy
-        roots = []
-        for acc_id, (item, parent_id, _) in self._account_map.items():
-            if parent_id and parent_id in self._account_map:
-                self._account_map[parent_id][0].addChild(item)
-            else:
-                roots.append(item)
-        for it in roots:
-            self.tree.addTopLevelItem(it)
-            it.setExpanded(True)
-
-        # Resize once after population; name column will stretch due to header policy
-        for i in range(self.tree.columnCount()):
-            if i != 0:
+            for i in range(1, self.tree.columnCount()):
                 self.tree.resizeColumnToContents(i)
 
-        self.badge_active.setText(_badge(f"Active: {active_count}", "ok"))
-        self.badge_inactive.setText(_badge(f"Inactive: {inactive_count}", "muted"))
+            self.badge_active.setText(_badge(f"Active: {active_count}", "ok"))
+            self.badge_inactive.setText(_badge(f"Inactive: {inactive_count}", "muted"))
 
-    # ---------- Filters & Search ----------
+            # Build non-posting parent cache for dialogs
+            self._parents_seed = [
+                (acc_id, (itm.data(1, Qt.UserRole) or {}))
+                for acc_id, (itm, _parent, _base) in self._account_map.items()
+                if not (itm.data(1, Qt.UserRole) or {}).get("is_posting", True)
+            ]
+
+            self._apply_filters()
+        finally:
+            self.tree.setUpdatesEnabled(True)
+            QTimer.singleShot(200, self.loader_dialog.close)
+            self._set_toolbar_enabled(True)
+
     def _apply_filters(self):
         query = (self.search_edit.text() or "").strip().lower()
         type_sel = self.filter_type.currentData()
@@ -726,10 +913,8 @@ class ChartOfAccounts(QWidget):
         post_sel = self.filter_post.currentText()
 
         def match_item(item: QTreeWidgetItem) -> bool:
-            acc_id = item.data(0, Qt.UserRole)
             data = item.data(1, Qt.UserRole) or {}
             text_blob = f"{data.get('name','')} {data.get('code','')} {', '.join(data.get('branch', []))}".lower()
-
             if query and query not in text_blob:
                 return False
             if type_sel and data.get("type") != type_sel:
@@ -744,7 +929,6 @@ class ChartOfAccounts(QWidget):
                 return False
             return True
 
-        # We also keep parents visible if any child matches
         def apply_visibility(item: QTreeWidgetItem) -> bool:
             visible = match_item(item)
             for i in range(item.childCount()):
@@ -753,10 +937,13 @@ class ChartOfAccounts(QWidget):
             item.setHidden(not visible)
             return visible
 
-        for i in range(self.tree.topLevelItemCount()):
-            apply_visibility(self.tree.topLevelItem(i))
+        self.tree.setUpdatesEnabled(False)
+        try:
+            for i in range(self.tree.topLevelItemCount()):
+                apply_visibility(self.tree.topLevelItem(i))
+        finally:
+            self.tree.setUpdatesEnabled(True)
 
-    # ---------- Context/Actions ----------
     def _on_double_click(self, item):
         if item:
             self.edit_account(item)
@@ -766,7 +953,7 @@ class ChartOfAccounts(QWidget):
         menu = QMenu(self)
         a_add = menu.addAction("➕ Add")
         a_edit = menu.addAction("✏️ Edit")
-        a_del  = menu.addAction("🗑️ Delete")
+        a_del = menu.addAction("🗑️ Delete")
         menu.addSeparator()
         a_expand = menu.addAction("▾ Expand All")
         a_collapse = menu.addAction("▸ Collapse All")
@@ -792,7 +979,7 @@ class ChartOfAccounts(QWidget):
 
     # ---------- CRUD ----------
     def add_account(self):
-        dialog = AccountDialog(self.user_data, parent=self)
+        dialog = AccountDialog(self.user_data, parent=self, parents_seed=self._parents_seed)
         if dialog.exec_():
             self.refresh()
 
@@ -808,14 +995,14 @@ class ChartOfAccounts(QWidget):
     def edit_account(self, item):
         acc_id = item.data(0, Qt.UserRole)
         acc_data = item.data(1, Qt.UserRole)
-        dialog = AccountDialog(self.user_data, {"id": acc_id, **(acc_data or {})}, parent=self)
+        dialog = AccountDialog(self.user_data, {"id": acc_id, **(acc_data or {})}, parent=self, parents_seed=self._parents_seed)
         if dialog.exec_():
             self.refresh()
 
     def edit_selected(self):
         acc = self.get_selected_account()
         if acc:
-            dialog = AccountDialog(self.user_data, acc, parent=self)
+            dialog = AccountDialog(self.user_data, acc, parent=self, parents_seed=self._parents_seed)
             if dialog.exec_():
                 self.refresh()
 
@@ -825,12 +1012,12 @@ class ChartOfAccounts(QWidget):
             return
 
         # 1) Block if it has children
-        children = db.collection("accounts").where("parent", "==", acc["id"]).get()
+        children = db.collection("accounts").where("parent", "==", acc["id"]).limit(1).get()
         if children:
             QMessageBox.warning(self, "Cannot Delete", "This account has child accounts.")
             return
 
-        # 2) Block if referenced in any journal entry (requires index on lines_account_ids)
+        # 2) Block if referenced in any journal entry
         je_refs = db.collection("journal_entries").where("lines_account_ids", "array_contains", acc["id"]).limit(1).get()
         if je_refs:
             QMessageBox.warning(self, "Cannot Delete", "This account is used in journal entries. Deletion is not allowed.")
@@ -850,9 +1037,7 @@ class ChartOfAccounts(QWidget):
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
 
-    # ---------- Export ----------
     def export_csv(self):
-        # Default to user's Desktop (per your preference in other modules)
         default_dir = os.path.join(os.path.expanduser("~"), "Desktop")
         try:
             os.makedirs(default_dir, exist_ok=True)
@@ -865,6 +1050,7 @@ class ChartOfAccounts(QWidget):
             return
         try:
             rows = []
+
             def collect(item):
                 data = item.data(1, Qt.UserRole) or {}
                 rows.append([
@@ -891,7 +1077,7 @@ class ChartOfAccounts(QWidget):
             QMessageBox.critical(self, "Export Error", f"Failed to export: {e}")
 
 
-# If you want to quickly test this widget alone, you can uncomment below:
+# If you want to test standalone:
 # if __name__ == "__main__":
 #     import sys
 #     app = QApplication(sys.argv)

@@ -1,0 +1,24 @@
+# GUI
+PyQt5>=5.15.10
+
+# Firebase / Google
+firebase-admin>=6.5.0
+google-cloud-firestore>=2.11.0
+google-api-core>=2.11.0
+
+# Encryption / Credentials
+pycryptodome>=3.19.0   # for Crypto.Cipher (AES etc.)
+
+# HTTP Requests
+requests>=2.31.0
+
+# Data / Export
+pandas>=2.2.2
+fpdf>=1.7.2
+
+# Selenium & Chrome driver (for WhatsApp module)
+selenium>=4.11.2
+webdriver-manager>=4.0.2
+
+# Optional utilities
+uuid

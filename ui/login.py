@@ -147,10 +147,8 @@ class LoginWindow(QWidget):
     def handle_login(self):
         # email = self.entry_email.text().strip()
         # password = self.entry_pass.text().strip()
-        email = "db.storagesolutions@gmail.com"
-        password = "10485766"
-        # email = "aayan06pk@gmail.com"
-        # password = "10485766"
+        email = "aayan06pk@gmail.com"
+        password = "A10485766a"
 
         if not email or not password:
             QMessageBox.warning(self, "Login Failed", "Please fill in all fields.")
