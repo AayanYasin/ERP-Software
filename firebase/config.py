@@ -26,3 +26,4 @@ db = firestore.client()
 # Load API key from secure store
 FIREBASE_API_KEY = get_api_key()
 FIREBASE_LOGIN_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}"
+SECURE_TOKEN_URL = f"https://securetoken.googleapis.com/v1/token?key={FIREBASE_API_KEY}"

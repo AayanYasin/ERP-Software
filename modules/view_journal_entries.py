@@ -2,35 +2,30 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget, QTableWidgetItem,
     QLineEdit, QDateEdit, QDialog, QDialogButtonBox, QHeaderView,
     QMessageBox, QPushButton, QFileDialog, QMenu, QComboBox, QApplication,
-    QGridLayout, QFrame, QToolButton, QGraphicsDropShadowEffect   # ← add
+    QGridLayout, QFrame, QToolButton, QGraphicsDropShadowEffect
 )
-from PyQt5.QtCore import QDate, Qt, QSize
+from PyQt5.QtCore import QDate, Qt, QSize, QTimer
 from PyQt5.QtGui import QIcon, QFont, QColor
 from firebase.config import db
 from firebase_admin import firestore
 import datetime
+import os
+import json
 
 from modules.journal_entry import JournalEntryForm
 
 
-# ============================
-# JournalEntryViewer (UI Rev B)
-# ============================
-# Goals (UI-only, no UX logic changed):
-# - High-contrast, enterprise-neutral look (no emojis)
-# - Bigger, readable fonts; stronger header; clearer row spacing
-# - Numbers right-aligned + monospace
-# - Table columns sized sanely with less jitter
-# - Subtle zebra stripes, clearer selection
-# - Keep all signals/flows untouched
-#
-# If you want ultra-compact or dark theme variant, shout and I'll switch presets.
-
 class JournalEntryViewer(QWidget):
+    OFFLINE_CACHE_SAFE = True  # allow opening in offline mode
+
     def __init__(self, user_data):
         super().__init__()
         self.user_data = user_data
-        self.setWindowTitle("Journal Entry Viewer")
+
+        # must exist before any method references it
+        self._offline_read_only = False
+
+        self.setWindowTitle("Journal Entries")
         self.resize(1380, 760)
 
         # ===== Root layout =====
@@ -59,6 +54,22 @@ class JournalEntryViewer(QWidget):
         header.addWidget(self.btn_clear)
         header.addWidget(self.btn_export)
         header.addWidget(self.btn_refresh)
+
+        # --- Offline badge (hidden by default; small pill)
+        self.badge_offline = QLabel("⚠️ Offline — showing cached")
+        self.badge_offline.setVisible(False)
+        self.badge_offline.setStyleSheet("""
+            QLabel {
+                background-color: #FFF3CD;
+                color: #7A5D00;
+                border: 1px solid #FFECB5;
+                border-radius: 12px;
+                padding: 4px 10px;
+                font-weight: 600;
+            }
+        """)
+        header.addWidget(self.badge_offline)
+
         root.addLayout(header)
 
         # ===== Filters row =====
@@ -68,7 +79,8 @@ class JournalEntryViewer(QWidget):
 
         self.account_filter = QComboBox(); self.account_filter.addItem("— All Accounts —", None)
         self.account_map, self.account_disp_map = {}, {}
-        self.load_account_list(); self.account_filter.currentIndexChanged.connect(self.apply_filters)
+        # (deferred initial load; see _initial_load)
+        self.account_filter.currentIndexChanged.connect(self.apply_filters)
 
         self.branch_filter = QComboBox(); self.load_branch_filter(); self.branch_filter.currentIndexChanged.connect(self.apply_filters)
 
@@ -97,7 +109,6 @@ class JournalEntryViewer(QWidget):
 
         hh = self.table.horizontalHeader()
         hh.setStretchLastSection(False)
-        # Reasonable defaults: fixed for meta, stretch for account columns
         for col in range(10):
             hh.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(5, QHeaderView.Stretch)
@@ -111,17 +122,34 @@ class JournalEntryViewer(QWidget):
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.table_menu)
-        self.table.cellDoubleClicked.connect(self.view_entry_details)
+        self.table.cellDoubleClicked.connect(self.view_entry_details)  # keep double-click active
         self.table.setHorizontalScrollMode(QTableWidget.ScrollPerPixel)
 
         root.addWidget(self.table)
+
+        # ===== Loader overlay (added) =====
+        self.loader_overlay = QFrame(self)
+        self.loader_overlay.setStyleSheet("""
+            QFrame {
+                background: rgba(255,255,255,200);
+                border: 1px solid #E2E8F0;
+                border-radius: 10px;
+            }
+        """)
+        self.loader_overlay.setVisible(False)
+        self.loader_label = QLabel("Loading…", self.loader_overlay)
+        self.loader_label.setAlignment(Qt.AlignCenter)
+        self.loader_label.setStyleSheet("font-weight:600; padding:10px;")
+        # position overlay over the table
+        self.loader_overlay.resize(self.table.width(), 48)
+        self.loader_overlay.move(self.table.x(), self.table.y() + 8)
 
         # ===== Totals =====
         self.total_label = QLabel("Total Debit: 0.00  —  Total Credit: 0.00")
         self.total_label.setObjectName("TotalsPill")
         root.addWidget(self.total_label)
 
-        # ===== Global style (light, high-contrast) =====
+        # ===== Global style =====
         self.setStyleSheet(
             """
             QWidget { font-family: 'Segoe UI', 'Inter', sans-serif; font-size:14px; }
@@ -134,31 +162,29 @@ class JournalEntryViewer(QWidget):
             """
         )
 
-        # ===== Data caches & first load =====
+        # ===== Data caches =====
         self.entries_cache = []
         self.filtered_entries = []
-        self.load_entries()
 
-        # ===== Floating Add button (visual only; behavior unchanged) =====
+        # ===== Floating Add button (disabled in offline mode only) =====
         self.btn_add_entry = QToolButton(self)
         self.btn_add_entry.setObjectName("FabAdd")
-        self.btn_add_entry.setText("＋")                           # clean plus
+        self.btn_add_entry.setText("＋")
         self.btn_add_entry.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.btn_add_entry.setCursor(Qt.PointingHandCursor)
         self.btn_add_entry.setAutoRaise(True)
-        self.btn_add_entry.setFixedSize(56, 56)                   # circle size
+        self.btn_add_entry.setFixedSize(56, 56)
         self.btn_add_entry.setStyleSheet("""
             QToolButton#FabAdd {
-                background: #10B981;        /* emerald */
+                background: #10B981;
                 color: white;
                 font-size: 26px;
                 font-weight: 700;
-                border-radius: 28px;        /* half of 56 = perfect circle */
+                border-radius: 28px;
             }
             QToolButton#FabAdd:hover { background: #0EA371; }
             QToolButton#FabAdd:pressed { background: #0C8D62; }
         """)
-        # soft drop shadow
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setOffset(0, 4)
         shadow.setBlurRadius(22)
@@ -170,25 +196,238 @@ class JournalEntryViewer(QWidget):
         self._position_fab()
         self.btn_add_entry.raise_()
 
+        # ===== Defer initial load so Dashboard can set offline mode first =====
+        QTimer.singleShot(0, self._initial_load)
+
+    # ===== Loader helpers =====
+    def show_loader(self, text: str):
+        try:
+            self.loader_label.setText(text)
+            # keep overlay aligned with table width/pos
+            self.loader_overlay.resize(self.table.width(), 48)
+            self.loader_overlay.move(self.table.x(), self.table.y() + 8)
+            self.loader_overlay.raise_()
+            self.loader_overlay.setVisible(True)
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+    def hide_loader(self):
+        try:
+            self.loader_overlay.setVisible(False)
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+    # ----- deferred first load (prevents blocking init when offline) -----
+    def _initial_load(self):
+        if getattr(self, "_offline_read_only", False):
+            self.show_loader("Loading cached journal entries…")
+            self._render_from_cache_if_any()
+            self._set_offline_badge(True)
+            # keep FAB disabled in offline
+            if hasattr(self, "btn_add_entry"):
+                self.btn_add_entry.setEnabled(False)
+                self.btn_add_entry.setToolTip("Offline — disabled")
+            self.hide_loader()
+            return
+        # online path (original behavior)
+        self.show_loader("Fetching journal entries…")
+        self.load_account_list()
+        self.load_entries()
+        if hasattr(self, "btn_add_entry"):
+            self.btn_add_entry.setEnabled(True)
+            self.btn_add_entry.setToolTip("Add journal entry")
+        self.hide_loader()
+
+    # ===== Offline helpers =====
+    def _app_dir(self) -> str:
+        base = os.environ.get("APPDATA") if os.name == "nt" else os.path.join(os.path.expanduser("~"), ".config")
+        root = os.path.join(base, "PlayWithAayan-ERP_Software", "cache")
+        os.makedirs(root, exist_ok=True)
+        return root
+
+    def _cache_file(self) -> str:
+        return os.path.join(self._app_dir(), "journal_entries_snapshot.json")
+
+    def _save_cache(self):
+        try:
+            serial_entries = []
+            for e in (self.entries_cache or []):
+                serial_lines = []
+                is_opening = ((e.get("meta", {}) or {}).get("kind") == "opening_balance")
+                for ln in (e.get("_lines", []) or []):
+                    acc_id = ln.get("account_id")
+                    acc_name = ln.get("account_name")
+                    d = float(ln.get("debit") or 0)
+                    c = float(ln.get("credit") or 0)
+                    prev = float(ln.get("balance_before") or 0)
+
+                    # account type + signed amount for consistent offline rendering
+                    a_type = self._account_type(acc_id)
+                    is_ob_equity = (acc_name == "Opening Balances Equity")
+                    signed_amt = self._signed_amount(
+                        d, c, a_type,
+                        is_opening=is_opening,
+                        is_ob_equity=is_ob_equity
+                    )
+
+                    serial_lines.append({
+                        "account_id": acc_id,
+                        "account_name": acc_name,
+                        "debit": d,
+                        "credit": c,
+                        "balance_before": prev,
+                        "signed_amt": signed_amt,  # <-- NEW
+                    })
+
+                serial_entries.append({
+                    "doc_id": e.get("doc_id"),
+                    "date_str": e.get("_date_str") or "",
+                    "created_at_str": e.get("_created_at_str") or "",
+                    "reference": e.get("_reference") or "-",
+                    "description": e.get("_description") or "",
+                    "purpose": e.get("_purpose") or "-",
+                    "branch": e.get("_branch") or "-",
+                    "user": e.get("_user") or "-",
+                    "lines": serial_lines,
+                    "debit_sum": float(e.get("_debit_sum") or 0.0),
+                    "credit_sum": float(e.get("_credit_sum") or 0.0),
+                    "meta_kind": (e.get("meta", {}) or {}).get("kind", ""),  # <-- keep OB flag
+                })
+
+            payload = {
+                "entries": serial_entries,
+                "accounts": self.account_map or {},
+                "account_disp": self.account_disp_map or {},
+            }
+            tmp = self._cache_file() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, self._cache_file())
+        except Exception:
+            pass
+
+
+    def _load_cache(self):
+        try:
+            if os.path.exists(self._cache_file()):
+                with open(self._cache_file(), "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def _rehydrate_entries(self, serial_entries):
+        restored = []
+        for s_ in (serial_entries or []):
+            fixed_lines = []
+            for ln in (s_.get("lines") or []):
+                fixed_lines.append({
+                    "account_id": ln.get("account_id"),
+                    "account_name": ln.get("account_name"),
+                    "debit": float(ln.get("debit", 0)),
+                    "credit": float(ln.get("credit", 0)),
+                    "balance_before": float(ln.get("balance_before", 0)),
+                    "signed_amt": float(ln.get("signed_amt", 0)),  # <-- restored
+                })
+
+            deb_str, cr_str = self._format_lines_by_side(fixed_lines)
+
+            restored.append({
+                "doc_id": s_.get("doc_id"),
+                "_date_str": s_.get("date_str") or "",
+                "_date_q": self._to_qdate(s_.get("date_str") or ""),
+                "_reference": s_.get("reference") or "-",
+                "_description": s_.get("description") or "",
+                "_purpose": s_.get("purpose") or "-",
+                "_branch": s_.get("branch") or "-",
+                "_user": s_.get("user") or "-",
+                "_created_at_str": s_.get("created_at_str") or "",
+                "_lines": fixed_lines,
+                "_debit_sum": float(s_.get("debit_sum") or 0.0),
+                "_credit_sum": float(s_.get("credit_sum") or 0.0),
+                "_debited_str": deb_str,
+                "_credited_str": cr_str,
+                "meta": {"kind": s_.get("meta_kind", "")} if s_.get("meta_kind") else {},  # <-- OB hint back
+            })
+        return restored
+
+
+    def _render_from_cache_if_any(self):
+        cached = self._load_cache()
+        if not cached:
+            # nothing cached yet; keep table empty but badge visible if offline
+            self.apply_filters()
+            return
+        # restore accounts map first (used by rendering)
+        self.account_map = cached.get("accounts", {}) or self.account_map
+        self.account_disp_map = cached.get("account_disp", {}) or self.account_disp_map
+
+        # rebuild the Account dropdown from cache (so user can filter while offline)
+        self.account_filter.blockSignals(True)
+        self.account_filter.clear()
+        self.account_filter.addItem("— All Accounts —", None)
+        for acc_id, disp in sorted(self.account_disp_map.items(), key=lambda kv: kv[1]):
+            self.account_filter.addItem(disp, acc_id)
+        self.account_filter.blockSignals(False)
+
+        # restore journal entries cache and paint table
+        self.entries_cache = self._rehydrate_entries(cached.get("entries", [])) or self.entries_cache
+        self.apply_filters()
+
+    def _set_offline_badge(self, visible: bool):
+        try:
+            self.badge_offline.setVisible(bool(visible))
+        except Exception:
+            pass
+
+    def set_offline_mode(self, read_only: bool):
+        """External hook (e.g., NetworkMonitor). Locks 'Add' FAB, avoids network, shows cached."""
+        self._offline_read_only = bool(read_only)
+        # Disable only the floating Add button in offline
+        if hasattr(self, "btn_add_entry"):
+            self.btn_add_entry.setEnabled(not self._offline_read_only)
+            self.btn_add_entry.setToolTip("Add journal entry" if not self._offline_read_only else "Offline — disabled")
+
+        if self._offline_read_only:
+            # show cache instantly, badge ON; do not call network loaders
+            self.show_loader("Loading cached journal entries…")
+            self._render_from_cache_if_any()
+            self._set_offline_badge(True)
+            self.hide_loader()
+        else:
+            # back online: badge OFF and refresh from network
+            self._set_offline_badge(False)
+            self.show_loader("Fetching journal entries…")
+            self.load_account_list()
+            self.load_entries()
+            self.hide_loader()
+
     # ===== Helpers: visuals =====
     def _position_fab(self):
-        if not hasattr(self, "btn_add_entry"):
-            return
-        margin_x = 30   # distance from right edge
-        margin_y = 80   # distance from bottom edge
-        s = self.btn_add_entry.height()  # button size (50px)
+        if not hasattr(self, "btn_add_entry"): return
+        margin_x = 30
+        margin_y = 80
+        s = self.btn_add_entry.height()
         hsb = getattr(self.table, "horizontalScrollBar", None)
         bar_h = self.table.horizontalScrollBar().height() if (hsb and self.table.horizontalScrollBar().isVisible()) else 0
         x = max(margin_x, self.width() - s - margin_x)
         y = max(margin_y, self.height() - s - margin_y - bar_h)
         self.btn_add_entry.move(x, y)
+        # keep loader overlay aligned with table on resize
+        self.loader_overlay.resize(self.table.width(), 48)
+        self.loader_overlay.move(self.table.x(), self.table.y() + 8)
 
     def resizeEvent(self, event):
-        self._position_fab();
+        self._position_fab()
         super().resizeEvent(event)
 
     # ===== Open form (logic untouched) =====
     def add_journal_entry(self):
+        if getattr(self, "_offline_read_only", False):
+            # Respect offline read-only: ignore click (button is disabled anyway)
+            return
         try:
             form = JournalEntryForm(self.user_data, parent=self)
         except TypeError:
@@ -281,6 +520,22 @@ class JournalEntryViewer(QWidget):
             self.branch_filter.setDisabled(True)
 
     def load_account_list(self):
+        # Offline: use cache and skip network
+        if getattr(self, "_offline_read_only", False):
+            cached = self._load_cache()
+            if cached:
+                self.account_map = cached.get("accounts", {}) or self.account_map
+                self.account_disp_map = cached.get("account_disp", {}) or self.account_disp_map
+                # rebuild the dropdown
+                self.account_filter.blockSignals(True)
+                self.account_filter.clear()
+                self.account_filter.addItem("— All Accounts —", None)
+                for acc_id, disp in sorted(self.account_disp_map.items(), key=lambda kv: kv[1]):
+                    self.account_filter.addItem(disp, acc_id)
+                self.account_filter.blockSignals(False)
+            return
+
+        # Online fetch (original logic)
         self.account_map.clear(); self.account_disp_map.clear()
         self.account_filter.clear(); self.account_filter.addItem("— All Accounts —", None)
         for doc in db.collection("accounts").stream():
@@ -290,9 +545,16 @@ class JournalEntryViewer(QWidget):
             self.account_map[doc.id] = name
             self.account_disp_map[doc.id] = disp
             self.account_filter.addItem(disp, doc.id)
+        # Save accounts to cache (along with entries after load)
+        self._save_cache()
 
     # ===== Load entries =====
     def load_entries(self):
+        # If offline, render from cache and stop
+        if getattr(self, "_offline_read_only", False):
+            self._render_from_cache_if_any()
+            return
+
         try:
             self.entries_cache = []
             query = db.collection("journal_entries").order_by("created_at", direction=firestore.Query.DESCENDING).stream()
@@ -325,9 +587,20 @@ class JournalEntryViewer(QWidget):
 
                 self.entries_cache.append(data)
 
+            # Save a fresh snapshot (including accounts from prior fetch)
+            self._save_cache()
             self.apply_filters()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load journal entries:{e}")
+            # On failure, fall back to cache without changing UX
+            cached = self._load_cache()
+            if cached and cached.get("entries"):
+                self._set_offline_badge(True)
+                self.entries_cache = self._rehydrate_entries(cached.get("entries", []))
+                self.account_map = cached.get("accounts", {}) or self.account_map
+                self.account_disp_map = cached.get("account_disp", {}) or self.account_disp_map
+                self.apply_filters()
+            else:
+                QMessageBox.critical(self, "Error", f"Failed to load journal entries:{e}")
 
     # ===== Balance helpers =====
     def _fmt_balance(self, amount, acc_type):
@@ -338,11 +611,15 @@ class JournalEntryViewer(QWidget):
     def _account_type(self, acc_id: str) -> str:
         if not hasattr(self, "_acct_type_cache"): self._acct_type_cache = {}
         if acc_id in self._acct_type_cache: return self._acct_type_cache[acc_id]
-        try:
-            snap = db.collection("accounts").document(acc_id).get()
-            a_type = (snap.to_dict() or {}).get("type", "Asset")
-        except Exception:
+        # If offline, avoid network; best-effort default
+        if getattr(self, "_offline_read_only", False):
             a_type = "Asset"
+        else:
+            try:
+                snap = db.collection("accounts").document(acc_id).get()
+                a_type = (snap.to_dict() or {}).get("type", "Asset")
+            except Exception:
+                a_type = "Asset"
         self._acct_type_cache[acc_id] = a_type
         return a_type
 
@@ -400,7 +677,7 @@ class JournalEntryViewer(QWidget):
         hh.setSectionResizeMode(5, QHeaderView.Stretch)
         hh.setSectionResizeMode(6, QHeaderView.Stretch)
         self.total_label.setText(f"Total Debit: {total_debit:,.2f}  —  Total Credit: {total_credit:,.2f}")
-        
+
     def _signed_amount(self, debit: float, credit: float, acc_type: str,
                    *, is_opening: bool = False, is_ob_equity: bool = False) -> float:
         # Base sign rule (unchanged)
@@ -409,7 +686,6 @@ class JournalEntryViewer(QWidget):
         if is_opening and is_ob_equity:
             amt = -amt
         return amt
-
 
     # ===== Detail dialog (visual polish only) =====
     def view_entry_details(self, row, column):
@@ -449,6 +725,9 @@ class JournalEntryViewer(QWidget):
         mono = QFont("Consolas"); mono.setStyleHint(QFont.Monospace)
 
         debit_total = credit_total = 0.0
+        is_opening = (data.get("meta",{}) or {}).get("kind") == "opening_balance"
+        eq_id = self._opening_equity_id()
+
         for ln in (data.get("_lines", []) or []):
             acc_name = ln.get("account_name","-")
             acc_id   = ln.get("account_id","")
@@ -459,38 +738,34 @@ class JournalEntryViewer(QWidget):
             side = "DR" if d_amt>0 else ("CR" if c_amt>0 else "-")
             acc_type = self._account_type(acc_id)
 
-            # ↓↓↓ add these three lines / replace your existing flags + signed_amt calc
-            is_opening = (data.get("meta",{}) or {}).get("kind") == "opening_balance"
-            eq_id = self._opening_equity_id()
             is_ob_equity = (acc_id == eq_id) or (acc_name == "Opening Balances Equity")
 
-            signed_amt = self._signed_amount(d_amt, c_amt, acc_type,
-                                            is_opening=is_opening, is_ob_equity=is_ob_equity)
+            # Prefer cached signed amount if present (offline), else compute (online / fallback)
+            signed_amt = ln.get("signed_amt")
+            if signed_amt is None:
+                signed_amt = self._signed_amount(d_amt, c_amt, acc_type,
+                                                is_opening=is_opening, is_ob_equity=is_ob_equity)
 
-            # Net movement for balances (same as signed amount),
-            # but OB Equity in opening JEs keeps balance frozen below.
-            net = self._signed_amount(d_amt, c_amt, acc_type)  # base rule for movement
-
+            # New Balance follows base movement rule; OB equity stays frozen at prev
+            net = self._signed_amount(d_amt, c_amt, acc_type)
             is_equity_ob_line = is_opening and is_ob_equity
             new_signed = prev if is_equity_ob_line else (prev + net)
 
             r = table.rowCount(); table.insertRow(r)
             table.setItem(r,0,QTableWidgetItem(acc_name))
-            table.setItem(r,1,QTableWidgetItem(side))  # keep side column for reference
-            amt_item = QTableWidgetItem(f"{signed_amt:,.2f}")             # ← signed (no DR/CR text)
+            table.setItem(r,1,QTableWidgetItem(side))
+            amt_item = QTableWidgetItem(f"{float(signed_amt):,.2f}")
             amt_item.setTextAlignment(Qt.AlignRight|Qt.AlignVCenter); amt_item.setFont(mono); table.setItem(r,2,amt_item)
-
-            prev_item = QTableWidgetItem(f"{prev:,.2f}")                  # ← signed previous balance
+            prev_item = QTableWidgetItem(f"{prev:,.2f}")
             prev_item.setTextAlignment(Qt.AlignRight|Qt.AlignVCenter); prev_item.setFont(mono); table.setItem(r,3,prev_item)
-
-            new_item = QTableWidgetItem(f"{new_signed:,.2f}")             # ← signed new balance
+            new_item = QTableWidgetItem(f"{new_signed:,.2f}")
             new_item.setTextAlignment(Qt.AlignRight|Qt.AlignVCenter); new_item.setFont(mono); table.setItem(r,4,new_item)
 
             debit_total += d_amt; credit_total += c_amt
 
         table.resizeColumnsToContents(); lv.addWidget(table)
         tot = QHBoxLayout(); tot.addStretch(1)
-        t = QLabel(f"Total: {debit_total:,.2f} DR  •  {credit_total:,.2f} CR")  # totals label unchanged
+        t = QLabel(f"Total: {debit_total:,.2f} DR  •  {credit_total:,.2f} CR")
         t.setStyleSheet("color:#334155;font-weight:600"); tot.addWidget(t)
         lv.addLayout(tot)
         root.addWidget(lines_box)
@@ -522,6 +797,15 @@ class JournalEntryViewer(QWidget):
 
     def _opening_equity_id(self):
         if hasattr(self, "_opening_equity_id_cache"): return self._opening_equity_id_cache
+        # If offline
+        if getattr(self, "_offline_read_only", False):
+            # Try to resolve from cached accounts
+            for acc_id, disp in (self.account_disp_map or {}).items():
+                if "Opening Balances Equity" in disp:
+                    self._opening_equity_id_cache = acc_id
+                    return acc_id
+            self._opening_equity_id_cache = None
+            return None
         try:
             q = db.collection("accounts").where("slug","==","opening_balances_equity").limit(1).get()
             self._opening_equity_id_cache = q[0].id if q else None
@@ -532,6 +816,9 @@ class JournalEntryViewer(QWidget):
     def _delete_entry_with_reversal(self, data):
         if self.user_data.get("role") != "admin":
             QMessageBox.warning(self, "Not Allowed", "Only admins can delete journal entries.")
+            return
+        if getattr(self, "_offline_read_only", False):
+            QMessageBox.warning(self, "Offline", "Cannot delete entries while offline.")
             return
         ref = data.get("_reference","-")
         if QMessageBox.question(self, "Confirm Deletion", f"Delete journal entry {ref}? This will reverse balances on all impacted accounts.", QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes:
@@ -580,8 +867,6 @@ class JournalEntryViewer(QWidget):
                 "wrap", parent=styles["Normal"], fontName="Helvetica",
                 fontSize=7.5, leading=9.2, wordWrap="CJK"
             )
-
-            # NEW: bold styles for main rows
             bold_style = ParagraphStyle("bold", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=7.5, leading=9.2)
             bold_wrap_style = ParagraphStyle("bold_wrap", parent=wrap_style, fontName="Helvetica-Bold")
 
@@ -591,13 +876,18 @@ class JournalEntryViewer(QWidget):
                 Spacer(1,6)
             ]
 
-            # Header text changed: remove (DR/CR)
             headers = ["Date","Reference","Description","Purpose","Branch","Account","Amount","New Balance"]
             data = [headers]
 
+            # === build body rows ===
             for e in self.filtered_entries:
                 desc_p = Paragraph(e.get("_description", "") or "-", wrap_style)
                 line_rows = []
+
+                # Keep online/offline consistency for signs and Opening-Equity handling
+                is_opening = (e.get("meta", {}) or {}).get("kind") == "opening_balance"
+                eq_id = self._opening_equity_id()
+
                 for ln in (e.get("_lines",[]) or []):
                     name = ln.get("account_name") or "-"
                     acc_id = ln.get("account_id","")
@@ -606,37 +896,35 @@ class JournalEntryViewer(QWidget):
                     prev = float(ln.get("balance_before",0) or 0.0)
 
                     acc_type = self._account_type(acc_id)
-
-                    is_opening = (e.get("meta",{}) or {}).get("kind") == "opening_balance"
-                    eq_id = self._opening_equity_id()
                     is_ob_equity = (acc_id == eq_id) or (name == "Opening Balances Equity")
 
-                    # DISPLAY sign (with OB Equity flip on opening JEs)
-                    signed_amt = self._signed_amount(d, c, acc_type,
-                                                    is_opening=is_opening, is_ob_equity=is_ob_equity)
+                    # Prefer cached signed amount (offline), else compute
+                    signed_amt = ln.get("signed_amt")
+                    if signed_amt is None:
+                        signed_amt = self._signed_amount(d, c, acc_type,
+                                                        is_opening=is_opening, is_ob_equity=is_ob_equity)
 
-                    # Movement uses the base rule; we’ll freeze OB Equity below
+                    # New balance: base movement except freeze for Opening Balances Equity in opening JEs
                     net = self._signed_amount(d, c, acc_type)
+                    new_signed = prev if (is_opening and is_ob_equity) else (prev + net)
 
-                    is_equity_ob_line = is_opening and is_ob_equity
-                    new_signed = prev if is_equity_ob_line else (prev + net)
+                    line_rows.append(["","","","","", name, f"{float(signed_amt):,.2f}", f"{new_signed:,.2f}"])
 
-                    line_rows.append(["","","","","", name, f"{signed_amt:,.2f}", f"{new_signed:,.2f}"])
-
-                # Main row: bold cells, no amount
+                # entry header row
                 main_row = [
                     Paragraph(e.get("_date_str","") or "-", bold_style),
                     Paragraph(e.get("_reference","-") or "-", bold_style),
                     Paragraph(e.get("_description","") or "-", bold_wrap_style),
                     Paragraph(e.get("_purpose","-") or "-", bold_style),
                     Paragraph(e.get("_branch","-") or "-", bold_style),
-                    "—",   # Account
-                    "",    # Amount (blank on main row)
-                    "—"    # New Balance
+                    "—",
+                    "",
+                    "—"
                 ]
                 data.append(main_row)
                 data.extend(line_rows)
 
+            # === width calc & styling (unchanged aesthetics) ===
             def maxlen(col):
                 m = 0
                 for r in data[1:]:
@@ -647,14 +935,17 @@ class JournalEntryViewer(QWidget):
                     m = max(m, len(str(v)))
                 return m
 
+            from reportlab.lib import colors as rlcolors
             w=[maxlen(0)*0.8, maxlen(1)*0.85, 28, maxlen(3)*0.5, maxlen(4)*0.6, 26, maxlen(6)*0.7, maxlen(7)*0.7]
             mins=[40,85,120,55,55,140,80,90]; avail=pdf.width; total=sum(max(a,b) for a,b in zip(w,mins))
             col_widths=[avail*(max(a,b)/total) for a,b in zip(w,mins)]
 
+            from reportlab.platypus import Table
+            from reportlab.platypus import TableStyle
             tbl = Table(data, colWidths=col_widths, repeatRows=1)
             tbl.setStyle(TableStyle([
-                ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#FAFBFC")),
-                ("TEXTCOLOR", (0,0), (-1,0), colors.HexColor("#334E68")),
+                ("BACKGROUND", (0,0), (-1,0), rlcolors.HexColor("#FAFBFC")),
+                ("TEXTCOLOR", (0,0), (-1,0), rlcolors.HexColor("#334E68")),
                 ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
                 ("FONTSIZE", (0,0), (-1,0), 9),
                 ("ALIGN", (0,0), (-1,0), "CENTER"),
@@ -663,11 +954,12 @@ class JournalEntryViewer(QWidget):
                 ("FONTSIZE", (0,1), (-1,-1), 7.5),
                 ("VALIGN", (0,1), (-1,-1), "TOP"),
                 ("ALIGN", (6,1), (7,-1), "RIGHT"),
-                ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.whitesmoke, colors.HexColor("#F8FAFC")]),
-                ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor("#E2E8F0")),
+                ("ROWBACKGROUNDS", (0,1), (-1,-1), [rlcolors.whitesmoke, rlcolors.HexColor("#F8FAFC")]),
+                ("GRID", (0,0), (-1,-1), 0.25, rlcolors.HexColor("#E2E8F0")),
                 ("LEFTPADDING", (0,0), (-1,-1), 3), ("RIGHTPADDING", (0,0), (-1,-1), 3),
                 ("TOPPADDING", (0,0), (-1,-1), 2), ("BOTTOMPADDING", (0,0), (-1,-1), 2),
             ]))
             pdf.build(elements+[tbl])
         except Exception as e:
             QMessageBox.critical(self, "Export Failed", str(e))
+

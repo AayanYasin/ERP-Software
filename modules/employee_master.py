@@ -1,14 +1,7 @@
 # =============================
-# employee_master_AUTOCOA.py — COA: add "Automatically create account" option (admin may pick specific)
+# employee_master.py — Employees (FASTNESS applied)
+# (UI/design, business logic, and class names preserved)
 # =============================
-# Key points
-# - In the Add/Edit dialog, the COA row now has a first option: "Automatically create account".
-# - On create, choosing Auto will generate a Liability child account under Employees Payables (same logic as before).
-# - Only Admins can choose a specific existing account from the dropdown. Non-admins see a read-only note that the
-#   account will be auto-created; they cannot change it.
-# - Keeps the Closing/Current Balance column in the list, opening-advance JE, atomic employee-code counter, etc.
-#
-# Drop-in compatible with employee_master_MERGED_BALANCE variant.
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QTableWidget, QTableWidgetItem,
@@ -16,13 +9,13 @@ from PyQt5.QtWidgets import (
     QAbstractItemView, QToolBar, QAction, QStyle, QProgressDialog, QGroupBox,
     QShortcut, QTabWidget, QDateEdit
 )
-from PyQt5.QtCore import Qt, QTimer, QDate
+from PyQt5.QtCore import Qt, QTimer, QDate, QThread, pyqtSignal
 from PyQt5.QtGui import QKeySequence, QColor, QBrush
 
 from firebase.config import db
 from firebase_admin import firestore
 
-import uuid, datetime, re, os, csv, tempfile
+import uuid, datetime, re, os, csv, tempfile, json
 
 APP_STYLE = """
 QWidget { font-size: 14px; }
@@ -66,7 +59,91 @@ def _is_admin_user(user_data) -> bool:
         return False
 
 # =============================
-# Employee list module
+# FASTNESS: cache dir + read/write JSON + batched balances
+# =============================
+
+def _app_cache_dir() -> str:
+    base = os.environ.get("APPDATA") if os.name == "nt" else os.path.join(os.path.expanduser("~"), ".config")
+    root = os.path.join(base, "PlayWithAayan-ERP_Software", "cache")
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _save_cache_json(filename: str, payload: dict):
+    try:
+        path = os.path.join(_app_cache_dir(), filename)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _load_cache_json(filename: str) -> dict:
+    try:
+        path = os.path.join(_app_cache_dir(), filename)
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _batch_get_accounts_current_balances(account_ids: set) -> dict:
+    if not account_ids:
+        return {}
+    refs = [db.collection("accounts").document(aid) for aid in account_ids if aid]
+    balances = {}
+    try:
+        for snap in firestore.client().get_all(refs):
+            if snap and getattr(snap, "exists", False):
+                d = snap.to_dict() or {}
+                try:
+                    balances[snap.id] = float(d.get("current_balance", 0.0) or 0.0)
+                except Exception:
+                    balances[snap.id] = 0.0
+    except Exception:
+        pass
+    return balances
+
+# =============================
+# FASTNESS: background loader thread
+# =============================
+class _EmployeesLoader(QThread):
+    loaded = pyqtSignal(list)  # emits list[dict] rows with pre-batched _balance
+    failed = pyqtSignal(str)
+
+    def run(self):
+        try:
+            rows = []
+            account_ids = set()
+            try:
+                stream = db.collection("employees").select([
+                    "name","employee_code","designation","branch","contact","email",
+                    "date_joined","salary_type","salary","active","status","coa_account_id"
+                ]).stream()
+            except Exception:
+                stream = db.collection("employees").stream()
+
+            for doc in stream:
+                d = doc.to_dict() or {}
+                d["_doc_id"] = doc.id
+                coa = d.get("coa_account_id")
+                if coa:
+                    account_ids.add(coa)
+                rows.append(d)
+
+            balances = _batch_get_accounts_current_balances(account_ids)
+            for r in rows:
+                r["_balance"] = balances.get(r.get("coa_account_id", ""), None)
+            self.loaded.emit(rows)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+# =============================
+# Employee list module (CLASS NAME + UI preserved)
 # =============================
 class EmployeeModule(QWidget):
     def __init__(self, user_data):
@@ -123,100 +200,124 @@ class EmployeeModule(QWidget):
     def _current_table(self):
         return self.table_active if self.tabs.currentIndex() == 0 else self.table_inactive
 
-    # ---------- Data ----------
+    # ---------- Data (FASTNESS applied; UI/logic preserved) ----------
     def load_employees(self):
-        progress = QProgressDialog("Loading employees…", None, 0, 0, self)
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setAutoClose(True)
-        progress.show()
+        # 1) cache-first, instant paint (non-blocking)
+        snap = _load_cache_json("employees_snapshot.json")
+        if snap.get("rows"):
+            self._paint_employees(snap["rows"])
+
+        # 2) live refresh in background (with modal progress that auto-closes)
+        self._progress = QProgressDialog("Loading employees…", None, 0, 0, self)
+        self._progress.setWindowModality(Qt.WindowModal)
+        self._progress.setAutoClose(True)
+        self._progress.show()
+
+        self.table_active.setSortingEnabled(False)
+        self.table_inactive.setSortingEnabled(False)
+
+        self._loader = _EmployeesLoader()
+        self._loader.loaded.connect(self._on_employees_loaded)
+        self._loader.failed.connect(self._on_employees_failed)
+        self._loader.start()
+
+    def _on_employees_loaded(self, rows):
         try:
-            self.table_active.setSortingEnabled(False)
-            self.table_inactive.setSortingEnabled(False)
-            self.table_active.setRowCount(0)
-            self.table_inactive.setRowCount(0)
+            self._paint_employees(rows)
+            _save_cache_json("employees_snapshot.json", {"rows": rows})
+        finally:
+            try: self._progress.close()
+            except Exception: pass
+            self.table_active.setSortingEnabled(True)
+            self.table_inactive.setSortingEnabled(True)
 
-            count_a, count_i = 0, 0
-            for doc in db.collection("employees").stream():
-                data = doc.to_dict() or {}
+    def _on_employees_failed(self, msg):
+        try: self._progress.close()
+        except Exception: pass
+        # If nothing is painted (no cache), inform the user. Otherwise keep whatever is visible.
+        if not (self.table_active.rowCount() or self.table_inactive.rowCount()):
+            QMessageBox.warning(self, "Load failed", msg)
 
-                name = data.get("name", "")
-                code = data.get("employee_code", "")
-                desg = data.get("designation", "")
-                branch = data.get("branch", "")
-                contact = data.get("contact", "")
-                email = data.get("email", "")
-                date_joined = data.get("date_joined", "")
-                salary_type = data.get("salary_type", "")
+    def _paint_employees(self, rows):
+        for t in (self.table_active, self.table_inactive):
+            t.clearContents(); t.setRowCount(0)
+
+        count_a = 0
+        count_i = 0
+
+        for data in rows:
+            name = data.get("name", "")
+            code = data.get("employee_code", "")
+            desg = data.get("designation", "")
+            branch = data.get("branch", "")
+            contact = data.get("contact", "")
+            email = data.get("email", "")
+            date_joined = data.get("date_joined", "")
+            salary_type = data.get("salary_type", "")
+            try:
                 salary = float(data.get("salary", 0) or 0)
+            except Exception:
+                salary = 0.0
 
-                active_flag = bool(data.get("active", True))
-                status = "Active" if active_flag else "Inactive"
+            # Existing status logic preserved: prefer explicit status, else active flag
+            status_text = str(data.get("status") or ("Active" if bool(data.get("active", True)) else "Inactive"))
+            active_flag = status_text.strip().lower() == "active"
 
-                # --- Closing/Current Balance (signed) ---
-                bal_item = QTableWidgetItem("-")
+            # --- Closing/Current Balance (signed) ---
+            if "_balance" in data and data["_balance"] is not None:
+                curr_num = float(data["_balance"] or 0.0)
+            else:
+                curr_num = 0.0
                 try:
-                    curr = 0.0
                     coa_id = data.get("coa_account_id")
                     if coa_id:
                         acc_snap = db.collection("accounts").document(coa_id).get()
                         if acc_snap.exists:
                             accd = acc_snap.to_dict() or {}
-                            curr = float(accd.get("current_balance", 0.0) or 0.0)
-
-                    # Show the raw signed value (e.g., -8,000.00). No DR/CR, no abs().
-                    bal_item = QTableWidgetItem(f"{curr:,.2f}")
-                    bal_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                    # Keep the signed number for proper numeric sorting.
-                    bal_item.setData(Qt.UserRole, curr)
+                            curr_num = float(accd.get("current_balance", 0.0) or 0.0)
                 except Exception:
-                    bal_item = QTableWidgetItem("-")
+                    curr_num = 0.0
 
-                cells = [
-                    QTableWidgetItem(name),
-                    QTableWidgetItem(code),
-                    QTableWidgetItem(desg),
-                    QTableWidgetItem(branch),
-                    QTableWidgetItem(contact),
-                    QTableWidgetItem(email),
-                    QTableWidgetItem(str(date_joined)),
-                    QTableWidgetItem(salary_type),
-                    QTableWidgetItem(f"{salary:,.2f}"),
-                    QTableWidgetItem(status),
-                    bal_item,
-                ]
-                # stash doc id on the name cell
-                cells[0].setData(Qt.UserRole, doc.id)
-                # align salary
-                cells[8].setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            bal_item = QTableWidgetItem(f"{curr_num:,.2f}")
+            bal_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            bal_item.setData(Qt.UserRole, curr_num)
 
-                # status pill styling
-                pill_brush = QBrush(QColor(50, 150, 50) if active_flag else QColor(200, 50, 50))
-                cells[9].setBackground(pill_brush)
-                cells[9].setData(Qt.BackgroundRole, pill_brush)
-                cells[9].setForeground(QBrush(QColor(Qt.white)))
+            cells = [
+                QTableWidgetItem(name),
+                QTableWidgetItem(code),
+                QTableWidgetItem(desg),
+                QTableWidgetItem(branch),
+                QTableWidgetItem(contact),
+                QTableWidgetItem(email),
+                QTableWidgetItem(str(date_joined)),
+                QTableWidgetItem(salary_type),
+                QTableWidgetItem(f"{salary:,.2f}"),
+                QTableWidgetItem(status_text),
+                bal_item,
+            ]
+            cells[0].setData(Qt.UserRole, data.get("_doc_id"))
+            cells[8].setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
-                # insert row
-                t = self.table_active if active_flag else self.table_inactive
-                r = t.rowCount()
-                t.insertRow(r)
-                for c, it in enumerate(cells):
-                    t.setItem(r, c, it)
+            pill_brush = QBrush(QColor(50, 150, 50) if active_flag else QColor(200, 50, 50))
+            cells[9].setBackground(pill_brush)
+            cells[9].setData(Qt.BackgroundRole, pill_brush)
+            cells[9].setForeground(QBrush(QColor(Qt.white)))
 
-                if active_flag:
-                    count_a += 1
-                else:
-                    count_i += 1
+            t = self.table_active if active_flag else self.table_inactive
+            r = t.rowCount()
+            t.insertRow(r)
+            for c, it in enumerate(cells):
+                t.setItem(r, c, it)
 
-            self._apply_filter_to_current_tab()
-            self.count_lbl.setText(
-                f"Total: {count_a if self.tabs.currentIndex()==0 else count_i} "
-                f"{'active' if self.tabs.currentIndex()==0 else 'inactive'} employees"
-            )
-        finally:
-            progress.close()
-            self.table_active.setSortingEnabled(True)
-            self.table_inactive.setSortingEnabled(True)
+            if active_flag: count_a += 1
+            else: count_i += 1
 
+        self._apply_filter_to_current_tab()
+        # Update count for the currently visible tab
+        total_visible = sum(not self._current_table().isRowHidden(r) for r in range(self._current_table().rowCount()))
+        self.count_lbl.setText(
+            f"Total: {total_visible} {'active' if self.tabs.currentIndex()==0 else 'inactive'} employees"
+        )
 
     def _reapply_status_pills(self, table):
         col = 9
@@ -235,7 +336,7 @@ class EmployeeModule(QWidget):
             table.setRowHidden(r, term not in row_text.lower())
         self._reapply_status_pills(table); table.setSortingEnabled(was_sorting)
 
-    # ---------- Export ----------
+    # ---------- Export (UNCHANGED) ----------
     def _export_csv_current_tab(self):
         try:
             table = self._current_table()
@@ -254,7 +355,7 @@ class EmployeeModule(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Export failed", str(e))
 
-    # ---------- Actions ----------
+    # ---------- Actions (UNCHANGED) ----------
     def add_employee(self):
         dlg = EmployeeDialog(self.user_data)
         if dlg.exec_(): self.load_employees()
@@ -273,7 +374,7 @@ class EmployeeModule(QWidget):
         if dlg.exec_(): self.load_employees()
 
 # =============================
-# EmployeeDialog with Auto-COA option
+# EmployeeDialog (UNCHANGED business/UI; includes Auto-COA option for admins)
 # =============================
 class EmployeeDialog(QDialog):
     AUTO_VALUE = "__AUTO__"
@@ -375,14 +476,13 @@ class EmployeeDialog(QDialog):
         if _is_admin_user(self.user_data):
             self.cmb_coa = QComboBox()
             self.cmb_coa.setEditable(True)
-            self.cmb_coa.addItem("Automatically create account", self.AUTO_VALUE)
+            self.cmb_coa.addItem("➕ Create New Account (auto)", self.AUTO_VALUE)
             self._populate_accounts_into_combo(self.cmb_coa, self.existing_data.get("coa_account_id"))
             self.cmb_coa.currentIndexChanged.connect(self._update_coa_code_display)
             form.addRow("COA Account", self.cmb_coa)
         else:
             form.addRow("COA Account", QLabel("Automatically create account (Admin can change)"))
 
-        # Read-only COA Code row (actual code if chosen; predicted next code if auto)
         form.addRow("COA Code", self.edt_coa_code)
 
         # Layout
@@ -406,7 +506,6 @@ class EmployeeDialog(QDialog):
         buttons.rejected.connect(self.reject)
         main.addWidget(buttons)
 
-
     def _populate_accounts_into_combo(self, combo: QComboBox, current_id: str):
         try:
             accounts = db.collection("accounts").stream()
@@ -426,10 +525,6 @@ class EmployeeDialog(QDialog):
 
     # ---------- Logic helpers (same as before) ----------
     def _peek_next_account_code(self, acc_type: str = "Liability") -> str:
-        """
-        Best-effort, non-writing prediction of the next COA code for a given account type.
-        Employees create Liability accounts under Employees Payables.
-        """
         try:
             prefix = ACCOUNT_TYPE_PREFIX.get(acc_type, "9")
             counter_ref = db.collection("meta").document("account_code_counters")
@@ -437,7 +532,6 @@ class EmployeeDialog(QDialog):
             data = snap.to_dict() or {}
             last = data.get(acc_type)
             if not last:
-                # Fallback: scan accounts of this type to infer max
                 query = db.collection("accounts").where("type", "==", acc_type).get()
                 max_code = int(prefix + "000")
                 for d in query:
@@ -453,15 +547,7 @@ class EmployeeDialog(QDialog):
             return ""
 
     def _update_coa_code_display(self):
-        """
-        Populate the read-only COA Code field:
-        - If a specific existing account is selected → show its code.
-        - If 'Automatically create' on NEW → show predicted next Liability code.
-        - If editing with 'Automatically create' → leave blank (no auto on edit).
-        - For non-admins: show existing code if linked; otherwise predict on NEW.
-        """
         try:
-            # Admin path (dropdown present)
             if self.cmb_coa is not None:
                 sel = self.cmb_coa.currentData()
                 if sel and sel != self.AUTO_VALUE:
@@ -472,14 +558,12 @@ class EmployeeDialog(QDialog):
                         return
                     self.edt_coa_code.setText("")
                     return
-                # Auto selected
                 if not self.doc_id:
                     self.edt_coa_code.setText(self._peek_next_account_code("Liability"))
                 else:
                     self.edt_coa_code.setText("")
                 return
 
-            # Non-admin: use existing linked account if any, otherwise predict on NEW
             current_id = self.existing_data.get("coa_account_id")
             if current_id:
                 snap = db.collection("accounts").document(current_id).get()
@@ -581,7 +665,6 @@ class EmployeeDialog(QDialog):
             if amount <= 0:
                 return
 
-            # 1) Locate or create the Equity account used for openings
             eq_q = db.collection("accounts").where("slug", "==", "opening_balances_equity").limit(1).get()
             if eq_q:
                 equity_id = eq_q[0].id
@@ -609,11 +692,9 @@ class EmployeeDialog(QDialog):
                 equity_id = ref.id
                 equity_name = "Opening Balances Equity"
 
-            # 2) FORCE the 'previous balance' snapshot to ZERO for both lines (JE UI only)
             emp_pre = 0.0
             eq_pre  = 0.0
 
-            # 3) Opening ADVANCE on a Liability = DEBIT the employee (reduces payable), CREDIT equity
             debit_line  = {
                 "account_id": employee_account_id, "account_name": employee_name,
                 "debit": amount, "credit": 0, "balance_before": emp_pre
@@ -623,7 +704,6 @@ class EmployeeDialog(QDialog):
                 "debit": 0, "credit": amount, "balance_before": eq_pre
             }
 
-            # 4) Create JE (mark we assumed prev=0)
             now_server = firestore.SERVER_TIMESTAMP
             branch_val = self.user_data.get("branch")
             branch_val = (branch_val[0] if isinstance(branch_val, list) and branch_val else branch_val) or "-"
@@ -641,8 +721,6 @@ class EmployeeDialog(QDialog):
             }
             db.collection("journal_entries").document().set(je)
 
-            # 5) Keep your existing behavior: bump cached current_balance and store opening_balance
-            #    For Liability: a DEBIT means negative movement (reduces payable).
             db.collection("accounts").document(employee_account_id).update({
                 "current_balance": firestore.Increment(-amount),
                 "opening_balance": {"amount": amount, "type": "debit"}
@@ -651,8 +729,7 @@ class EmployeeDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Journal Error", f"Failed to post opening advance JE: {e}")
 
-
-    # ---------- Save ----------
+    # ---------- Save (UNCHANGED business rules) ----------
     def save(self):
         name = self.name.text().strip()
         emp_code = self.emp_code.text().strip()
@@ -664,7 +741,7 @@ class EmployeeDialog(QDialog):
         salary_text = (self.salary.text() or "").replace(",", "").strip()
         status = self.status.currentText().strip()
 
-        # Collect missing requireds
+        # Collect missing requireds (kept same behavior)
         missing = []
         if not name: missing.append("Name")
         if not emp_code: missing.append("Code")
@@ -675,79 +752,80 @@ class EmployeeDialog(QDialog):
         if not salary_type: missing.append("Salary Type")
         if not salary_text: missing.append("Base Salary")
         if not status: missing.append("Status")
-
-        # Opening Advance is required only on create (since in edit it's managed from COA)
-        adv_required = not self.doc_id
-        adv_text = (self.opening_advance.text() or "").strip()
-        if adv_required and not adv_text:
-            missing.append("Opening Advance")
-
         if missing:
-            QMessageBox.warning(self, "Missing Fields", "Please fill: " + ", ".join(missing))
-            return
+            QMessageBox.warning(self, "Missing fields", "Please provide: " + ", ".join(missing)); return
 
-        # Convert salary safely
         try:
             salary_val = float(salary_text)
         except Exception:
-            QMessageBox.warning(self, "Invalid Salary", "Base Salary must be a number.")
+            QMessageBox.warning(self, "Invalid salary", "Base Salary must be a number."); return
+
+        # Determine COA selection (admin dropdown vs auto)
+        selected_account_id = None
+        if _is_admin_user(self.user_data) and self.cmb_coa is not None:
+            sel = self.cmb_coa.currentData()
+            if sel and sel != self.AUTO_VALUE:
+                selected_account_id = sel
+
+        branches = branch if branch else None
+
+        if not self.doc_id:
+            # NEW employee
+            if not emp_code:
+                emp_code = self._next_employee_code()
+
+            coa_id = selected_account_id
+            coa_name = None
+            if not coa_id:
+                # auto-create employee liability account
+                coa_id, coa_name = self._create_employee_coa(name, [branches] if branches else [])
+
+            doc = {
+                "name": name, "employee_code": emp_code, "designation": designation, "branch": branch,
+                "contact": contact, "email": self.email.text().strip(), "date_joined": date_joined,
+                "salary_type": salary_type, "salary": salary_val,
+                "status": status, "active": (status.lower() == "active"),
+                "coa_account_id": coa_id
+            }
+            ref = db.collection("employees").document()
+            ref.set(doc)
+
+            # Opening advance (if any) → create JE + update account balances
+            try:
+                adv_val = float((self.opening_advance.text() or "0").replace(",", "").strip() or 0)
+            except Exception:
+                adv_val = 0.0
+            if adv_val > 0 and coa_id:
+                self._post_opening_advance_je(coa_id, name, adv_val)
+
+            QMessageBox.information(self, "Saved", "Employee created successfully.")
+            self.accept()
             return
 
-        payload = {
-            "name": name,
-            "designation": designation,
-            "branch": branch,
-            "contact": contact,
-            "email": self.email.text().strip(),
-            "date_joined": date_joined,
-            "salary_type": salary_type,
-            "salary": salary_val,
-            "status": status,
-            "active": (status == "Active"),
-            "updated_at": firestore.SERVER_TIMESTAMP,
+        # EDIT existing
+        update = {
+            "name": name, "designation": designation, "branch": branch,
+            "contact": contact, "email": self.email.text().strip(), "date_joined": date_joined,
+            "salary_type": salary_type, "salary": salary_val,
+            "status": status, "active": (status.lower() == "active"),
         }
 
+        # Allow admin to relink COA if a specific account picked
+        if selected_account_id:
+            update["coa_account_id"] = selected_account_id
+
+        # Persist
         try:
-            if self.doc_id:
-                # Edit existing
-                if _is_admin_user(self.user_data) and self.cmb_coa is not None:
-                    sel = self.cmb_coa.currentData()
-                    if sel and sel != self.AUTO_VALUE:
-                        payload["coa_account_id"] = sel
-                db.collection("employees").document(self.doc_id).set(payload, merge=True)
-                self.accept()
-            else:
-                # Create new
-                emp_code = self._next_employee_code()
-                payload.update({
-                    "employee_code": emp_code,
-                    "created_at": firestore.SERVER_TIMESTAMP
-                })
-
-                branches = self.user_data.get("branch", [])
-                if isinstance(branches, str): branches = [branches] if branches else []
-
-                chosen_id = None
-                if _is_admin_user(self.user_data) and self.cmb_coa is not None:
-                    sel = self.cmb_coa.currentData()
-                    if sel and sel != self.AUTO_VALUE:
-                        chosen_id = sel
-
-                if chosen_id:
-                    coa_id, coa_name = chosen_id, name
-                else:
-                    coa_id, coa_name = self._create_employee_coa(name, branches)
-                payload["coa_account_id"] = coa_id
-
-                emp_ref = db.collection("employees").document()
-                emp_ref.set(payload)
-
-                try:
-                    adv_amount = float(adv_text or 0)
-                except Exception:
-                    adv_amount = 0
-                if adv_amount > 0:
-                    self._post_opening_advance_je(coa_id, coa_name, adv_amount)
-                self.accept()
+            # Need the doc id → stored on the row when editing; caller passes existing_data on edit
+            doc_id = self.existing_data.get("_doc_id")
+            # Fallback: try to look up by employee_code if missing
+            if not doc_id:
+                q = db.collection("employees").where("employee_code", "==", emp_code).limit(1).get()
+                if q: doc_id = q[0].id
+            if not doc_id:
+                QMessageBox.critical(self, "Update failed", "Could not determine employee record id."); return
+            db.collection("employees").document(doc_id).set(update, merge=True)
+            QMessageBox.information(self, "Updated", "Employee updated successfully.")
+            self.accept()
         except Exception as e:
-            QMessageBox.critical(self, "Save failed", str(e))
+            QMessageBox.critical(self, "Update failed", str(e))

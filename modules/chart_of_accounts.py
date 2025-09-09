@@ -7,6 +7,7 @@
 # - Robust opening-edit guard: allows true opening-only state, blocks real activity
 # - Parent accounts list comes from already-loaded tree data (no network on dialog open)
 # - Tree build with repaint suppression + single-pass column resize
+# - OFFLINE MODE: cache-first view, no infinite loader, read-only UI (buttons/menu/double-click)
 # ------------------------------------------------
 
 from PyQt5.QtWidgets import (
@@ -26,6 +27,7 @@ import re
 import uuid
 import csv
 import os
+import json  # <-- offline cache
 
 
 # ------------------------------------------------
@@ -80,7 +82,6 @@ def _drcr_for_increase(acc_t: str) -> str:
 
 
 def _is_opening_like_je(doc_dict: dict) -> bool:
-    """Treat legacy 'Opening balance' entries as opening-like even if meta.kind is missing."""
     d = doc_dict or {}
     meta_kind = ((d.get("meta") or {}).get("kind") or "").lower()
     if meta_kind == "opening_balance":
@@ -95,10 +96,6 @@ def _is_opening_like_je(doc_dict: dict) -> bool:
 
 
 def _has_non_opening_activity(db_ref, account_id: str, sample_size: int = 25) -> bool:
-    """
-    True iff there's at least ONE JE touching this account that is NOT opening-like.
-    Uses small, bounded reads to avoid heavy scans.
-    """
     q = db_ref.collection("journal_entries") \
               .where("lines_account_ids", "array_contains", account_id) \
               .select(["description", "purpose", "meta.kind"]) \
@@ -109,7 +106,6 @@ def _has_non_opening_activity(db_ref, account_id: str, sample_size: int = 25) ->
     for d in docs:
         if not _is_opening_like_je(d.to_dict() or {}):
             return True
-    # If we hit the sample limit, peek one more page conservatively
     if len(docs) == sample_size:
         more = q.offset(sample_size).limit(sample_size).get()
         for d in more:
@@ -119,7 +115,6 @@ def _has_non_opening_activity(db_ref, account_id: str, sample_size: int = 25) ->
 
 
 def _generate_code_once_tx(db_ref, acc_type: str) -> str:
-    """Transactional, thread-safe account code generation for a given type."""
     prefix = ACCOUNT_TYPE_PREFIX.get(acc_type, "9")
     counter_ref = db_ref.collection("meta").document("account_code_counters")
     transaction = firestore.client().transaction()
@@ -150,7 +145,6 @@ def _generate_code_once_tx(db_ref, acc_type: str) -> str:
 
 def _post_opening_balance_je(db_ref, user_data: dict, account_id: str, account_name: str,
                              amount: float, drcr: str, acc_type: str, description: str = None):
-    """Pure DB helper: create (if needed) 'Opening Balances Equity' and post a two-line JE."""
     if not amount or amount <= 0:
         return
 
@@ -158,7 +152,6 @@ def _post_opening_balance_je(db_ref, user_data: dict, account_id: str, account_n
     if drcr not in ("debit", "credit"):
         drcr = "debit"
 
-    # Locate or create equity account by slug
     eq_q = db_ref.collection("accounts").where("slug", "==", "opening_balances_equity").limit(1).get()
     if eq_q:
         equity_account_id = eq_q[0].id
@@ -186,7 +179,6 @@ def _post_opening_balance_je(db_ref, user_data: dict, account_id: str, account_n
         equity_account_id = doc_ref.id
         equity_account_name = "Opening Balances Equity"
 
-    # Get 'before' balances (best-effort)
     try:
         a_doc = (db_ref.collection("accounts").document(account_id).get().to_dict() or {})
         a_pre = float(a_doc.get("current_balance", 0.0) or 0.0)
@@ -247,7 +239,6 @@ class AccountsLoader(QThread):
                 data = doc.to_dict() or {}
                 acc_id = doc.id
 
-                # Prefer cached current_balance; fall back to opening-only
                 if "current_balance" in data:
                     base_balance = float(data.get("current_balance", 0.0) or 0.0)
                 else:
@@ -281,7 +272,6 @@ class _SaveAccountWorker(QThread):
 
     def run(self):
         try:
-            # Unpack
             doc_id = self.p["doc_id"]
             is_new = self.p["is_new"]
             doc = self.p["doc"]
@@ -296,7 +286,6 @@ class _SaveAccountWorker(QThread):
 
             doc_ref = db.collection("accounts").document(doc_id)
 
-            # Guard: block opening edits if there is non-opening activity
             if guard_needed:
                 if _has_non_opening_activity(db, doc_id, sample_size=25):
                     self.fail.emit(
@@ -305,16 +294,13 @@ class _SaveAccountWorker(QThread):
                     )
                     return
 
-            # Persist account doc (set or update)
             if is_new:
                 doc_ref.set(doc)
             else:
                 doc_ref.update(doc)
 
-            # Opening/Delta handling
             if is_new:
                 if opening["has"]:
-                    # Post opening JE
                     _post_opening_balance_je(
                         db_ref=db,
                         user_data=user_data,
@@ -325,15 +311,13 @@ class _SaveAccountWorker(QThread):
                         acc_type=acc_type,
                         description=f"Opening balance for {name}"
                     )
-                    # Seed current_balance
                     doc_ref.update({"current_balance": _signed_opening(acc_type, opening["amount"], opening["type"])})
                 else:
                     doc_ref.update({"current_balance": 0.0})
             else:
-                # Edit: if opening changed, post delta and bump cache atomically
                 delta = new_signed - prev_signed
                 if abs(delta) > tol:
-                    inc_dir = _drcr_for_increase(acc_type)  # debit for A/E, credit for L/Eq/Inc
+                    inc_dir = _drcr_for_increase(acc_type)
                     delta_drcr = inc_dir if delta > 0 else ("credit" if inc_dir == "debit" else "debit")
                     _post_opening_balance_je(
                         db_ref=db,
@@ -345,7 +329,6 @@ class _SaveAccountWorker(QThread):
                         acc_type=acc_type,
                         description=f"Opening balance adjustment Δ={delta:+,.2f}"
                     )
-                    # Atomic bump to avoid race
                     doc_ref.update({"current_balance": firestore.Increment(delta)})
 
             self.ok.emit({"id": doc_id})
@@ -361,7 +344,7 @@ class AccountDialog(QDialog):
         super().__init__(parent)
         self.user_data = user_data
         self.existing = existing
-        self._parents_seed = parents_seed or []  # list[(acc_id, data)] of non-posting accounts
+        self._parents_seed = parents_seed or []
         self.setWindowTitle("Edit Account" if existing else "Add New Account")
         self.setMinimumWidth(460)
 
@@ -399,7 +382,7 @@ class AccountDialog(QDialog):
         self.parent_combo = QComboBox()
         self.parent_combo.addItem("-- None --", None)
         self.parent_map = {}
-        self._populate_parents_from_seed()  # instant; no I/O
+        self._populate_parents_from_seed()
         form.addRow("Parent Account:", self.parent_combo)
 
         self.branch_list = QListWidget()
@@ -420,7 +403,6 @@ class AccountDialog(QDialog):
         self.posting_checkbox.setChecked(True)
         form.addRow("Account Nature:", self.posting_checkbox)
 
-        # Opening Balance block
         self.opening_amount = QLineEdit()
         self.opening_amount.setPlaceholderText("0.00")
         self.opening_type = QComboBox()
@@ -452,7 +434,6 @@ class AccountDialog(QDialog):
         return s.strip("_")
 
     def _populate_parents_from_seed(self):
-        """Fill parent combo from preloaded non-posting accounts (no network)."""
         self.parent_combo.blockSignals(True)
         while self.parent_combo.count() > 1:
             self.parent_combo.removeItem(1)
@@ -462,8 +443,7 @@ class AccountDialog(QDialog):
         sorted_seed = sorted(self._parents_seed, key=lambda t: str((t[1] or {}).get("code", "")))
         for acc_id, data in sorted_seed:
             if me_id and acc_id == me_id:
-                continue  # cannot be own parent
-            # Only non-posting accounts can be parents (same rule as before)
+                continue
             if not (data or {}).get("is_posting", True):
                 self.parent_combo.addItem(f"[{data.get('code','')}] {data.get('name','')}", acc_id)
                 self.parent_map[acc_id] = data
@@ -506,7 +486,6 @@ class AccountDialog(QDialog):
             self.opening_type.setCurrentText((opening.get("type", "Debit")).capitalize())
 
     def save_account(self):
-        # -------- gather + validate form --------
         name = self.name_edit.text().strip()
         acc_type = self.type_combo.currentText()
         parent = self.parent_combo.currentData()
@@ -519,14 +498,12 @@ class AccountDialog(QDialog):
             QMessageBox.warning(self, "Validation Error", "Account name is required.")
             return
 
-        # Block converting to posting if there are children
         if self.existing and is_posting:
             children = db.collection("accounts").where("parent", "==", self.existing["id"]).limit(1).get()
             if children:
                 QMessageBox.warning(self, "Invalid Action", "Cannot convert to posting account — it has child accounts.")
                 return
 
-        # Validate/normalize parent and inherit type from a non-posting parent
         if parent:
             parent_doc = db.collection("accounts").document(parent).get()
             if parent_doc.exists:
@@ -536,7 +513,6 @@ class AccountDialog(QDialog):
                     return
                 acc_type = parent_data.get("type", acc_type)
 
-        # Previous opening (for comparison)
         prev_amt = 0.0
         prev_type = "debit"
         if self.existing:
@@ -547,7 +523,6 @@ class AccountDialog(QDialog):
                 prev_amt = 0.0
             prev_type = (prev_opening.get("type") or "debit").lower()
 
-        # New opening from form
         opening_balance = None
         new_amt = 0.0
         new_type = "debit"
@@ -563,7 +538,6 @@ class AccountDialog(QDialog):
                 QMessageBox.warning(self, "Validation Error", "Opening balance must be a positive number.")
                 return
 
-        # Account code
         if not self.existing:
             try:
                 code = self.generate_code_once(acc_type)
@@ -573,11 +547,9 @@ class AccountDialog(QDialog):
         else:
             code = self.code_edit.text()
 
-        # Slug
         existing_slug = (self.existing or {}).get("slug") if self.existing else None
         slug_val = existing_slug or self._slugify(name)
 
-        # Document payload
         doc = {
             "name": name,
             "slug": slug_val,
@@ -592,11 +564,9 @@ class AccountDialog(QDialog):
             "opening_balance": opening_balance
         }
 
-        # Compute signed values for delta calc (thread passes these; no UI I/O)
         prev_signed = _signed_opening(acc_type, prev_amt, prev_type) if self.existing and prev_amt > 0 else 0.0
         new_signed = _signed_opening(acc_type, new_amt, new_type) if opening_balance and new_amt > 0 else 0.0
 
-        # Determine whether the opening actually changed
         tol = 1e-6
         prev_has_opening = (prev_amt > 0)
         new_has_opening = (opening_balance is not None) and (new_amt > 0)
@@ -605,7 +575,6 @@ class AccountDialog(QDialog):
             or (prev_has_opening and new_has_opening and abs(prev_amt - new_amt) < tol and prev_type == new_type)
         )
 
-        # Pre-assign / reuse doc id, avoid passing object refs across threads
         if self.existing:
             doc_id = self.existing["id"]
             is_new = False
@@ -613,7 +582,6 @@ class AccountDialog(QDialog):
             doc_id = db.collection("accounts").document().id
             is_new = True
 
-        # Spinner + disable dialog while saving in background
         spinner = QProgressDialog("Saving account…", None, 0, 0, self)
         spinner.setWindowModality(Qt.WindowModal)
         spinner.setCancelButton(None)
@@ -643,7 +611,7 @@ class AccountDialog(QDialog):
 
 
 # ------------------------------------------------
-# Chart of Accounts (non-blocking + parent cache)
+# Chart of Accounts (non-blocking + parent cache + OFFLINE SNAPSHOT)
 # ------------------------------------------------
 class ChartOfAccounts(QWidget):
     def __init__(self, user_data):
@@ -654,13 +622,90 @@ class ChartOfAccounts(QWidget):
 
         self._filter_timer = QTimer(self)
         self._filter_timer.setSingleShot(True)
-        self._filter_timer.setInterval(300)  # debounce filters
+        self._filter_timer.setInterval(300)
+
+        # --- offline flag
+        self._offline_read_only = False
 
         self._build_ui()
         self._wire_shortcuts()
         self._loader_thread = None
-        self._parents_seed = []  # cache of non-posting accounts for dialogs
+        self._parents_seed = []
+
+        # Cache-first draw, then online refresh (unless offline)
+        self._render_from_cache_if_any()
         self.refresh()
+
+    # ---------- OFFLINE CACHE HELPERS ----------
+    def _app_dir(self) -> str:
+        base = os.environ.get("APPDATA") if os.name == "nt" else os.path.join(os.path.expanduser("~"), ".config")
+        root = os.path.join(base, "PlayWithAayan-ERP_Software", "cache")
+        os.makedirs(root, exist_ok=True)
+        return root
+
+    def _cache_file(self) -> str:
+        return os.path.join(self._app_dir(), "coa_snapshot.json")
+
+    def _save_cache(self, rows, parent_map, active_count, inactive_count):
+        try:
+            serial_rows = [
+                {"id": rid, "data": data, "base_balance": base}
+                for (rid, data, base) in rows
+            ]
+            payload = {
+                "rows": serial_rows,
+                "parent_map": parent_map,
+                "active_count": active_count,
+                "inactive_count": inactive_count
+            }
+            tmp = self._cache_file() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, self._cache_file())
+        except Exception:
+            pass
+
+    def _load_cache(self):
+        try:
+            if os.path.exists(self._cache_file()):
+                with open(self._cache_file(), "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return None
+
+    def _render_from_cache_if_any(self):
+        cached = self._load_cache()
+        if not cached:
+            return
+        rows = [(r["id"], r["data"], r.get("base_balance", 0.0)) for r in cached.get("rows", [])]
+        parent_map = cached.get("parent_map", {})
+        active_count = cached.get("active_count", 0)
+        inactive_count = cached.get("inactive_count", 0)
+
+        self._on_loaded_accounts(rows, parent_map, active_count, inactive_count)
+        if self._offline_read_only:
+            self._set_offline_badge(True)
+
+    # ---------- OFFLINE MODE HOOK ----------
+    def set_offline_mode(self, read_only: bool):
+        """External hook. Closes loaders, shows cache, and locks write interactions."""
+        self._offline_read_only = bool(read_only)
+        if read_only:
+            try:
+                if getattr(self, "loader_dialog", None):
+                    self.loader_dialog.close()
+            except Exception:
+                pass
+            self._render_from_cache_if_any()
+            self._set_offline_badge(True)
+            self._apply_offline_lock(True)
+        else:
+            self._set_offline_badge(False)
+            self._apply_offline_lock(False)
+            self.refresh()
+
+    # ------------------------------------------
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -678,6 +723,23 @@ class ChartOfAccounts(QWidget):
         self.badge_inactive = QLabel(_badge("Inactive: 0", "muted"))
         header.addWidget(self.badge_active)
         header.addWidget(self.badge_inactive)
+
+        # --- Improved Offline badge (pill, subtle border/shadow)
+        self.badge_offline = QLabel("⚠️ Offline — showing cached")
+        self.badge_offline.setVisible(False)
+        self.badge_offline.setStyleSheet("""
+            QLabel {
+                background-color: #FFF3CD;
+                color: #7A5D00;
+                border: 1px solid #FFECB5;
+                border-radius: 12px;
+                padding: 4px 10px;
+                font-weight: 600;
+            }
+        """)
+        header.addWidget(self.badge_offline)
+        # ---------------------------------------
+
         root.addLayout(header)
 
         # Toolbar / Filters
@@ -749,7 +811,7 @@ class ChartOfAccounts(QWidget):
         self.tree.setUniformRowHeights(True)
         self.tree.setIndentation(18)
         self.tree.setAnimated(True)
-        self.tree.itemDoubleClicked.connect(self._on_double_click)
+        self.tree.itemDoubleClicked.connect(self._on_double_click)  # <-- guarded by offline flag
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._context_menu)
 
@@ -778,13 +840,17 @@ class ChartOfAccounts(QWidget):
         def handler(event):
             key = event.key()
             if key == Qt.Key_Insert:
-                self.add_account(); return
+                if not self._offline_read_only:
+                    self.add_account()
+                return
             if key == Qt.Key_F2:
-                self.edit_selected(); return
+                if not self._offline_read_only:
+                    self.edit_selected()
+                return
             if key == Qt.Key_Delete:
-                self.delete_selected(); return
-            if key == Qt.Key_F5:
-                self.refresh(); return
+                if not self._offline_read_only:
+                    self.delete_selected()
+                return
             if key == Qt.Key_F and (event.modifiers() & Qt.ControlModifier):
                 self.search_edit.setFocus(); self.search_edit.selectAll(); return
             return original(event)
@@ -809,7 +875,25 @@ class ChartOfAccounts(QWidget):
         self.filter_status.setEnabled(enabled)
         self.filter_post.setEnabled(enabled)
 
+    # NEW: keep write actions disabled in offline mode without touching other buttons
+    def _apply_offline_lock(self, lock: bool):
+        self.btn_add.setEnabled(not lock)
+        self.btn_edit.setEnabled(not lock)
+        self.btn_delete.setEnabled(not lock)
+        # (Refresh/Expand/Collapse/Export & filters remain enabled)
+
     def refresh(self):
+        # Offline: do NOT start network, do NOT show loader; keep cache + badge
+        if self._offline_read_only:
+            self._set_toolbar_enabled(True)
+            self._apply_offline_lock(True)
+            self._set_offline_badge(True)
+            self._render_from_cache_if_any()
+            return
+
+        # Cache-first draw
+        self._render_from_cache_if_any()
+
         self.loader_dialog = self.show_loader("Loading Accounts", "Fetching chart of accounts…")
         self._set_toolbar_enabled(False)
 
@@ -828,7 +912,18 @@ class ChartOfAccounts(QWidget):
         except Exception:
             pass
         self._set_toolbar_enabled(True)
-        QMessageBox.critical(self, "Load Error", msg)
+
+        cached = self._load_cache()
+        if cached:
+            self._set_offline_badge(True)
+            self._apply_offline_lock(True)
+            rows = [(r["id"], r["data"], r.get("base_balance", 0.0)) for r in cached.get("rows", [])]
+            parent_map = cached.get("parent_map", {})
+            active_count = cached.get("active_count", 0)
+            inactive_count = cached.get("inactive_count", 0)
+            self._on_loaded_accounts(rows, parent_map, active_count, inactive_count)
+        else:
+            QMessageBox.critical(self, "Load Error", msg)
 
     def _on_loaded_accounts(self, rows, parent_map, active_count, inactive_count):
         self.tree.setUpdatesEnabled(False)
@@ -854,7 +949,6 @@ class ChartOfAccounts(QWidget):
 
                 self._account_map[acc_id] = (item, parent_map.get(acc_id), base_balance)
 
-            # Build adjacency + totals (memoized)
             children_of = {}
             for acc_id, (_, parent_id, _) in self._account_map.items():
                 children_of.setdefault(parent_id, []).append(acc_id)
@@ -893,7 +987,6 @@ class ChartOfAccounts(QWidget):
             self.badge_active.setText(_badge(f"Active: {active_count}", "ok"))
             self.badge_inactive.setText(_badge(f"Inactive: {inactive_count}", "muted"))
 
-            # Build non-posting parent cache for dialogs
             self._parents_seed = [
                 (acc_id, (itm.data(1, Qt.UserRole) or {}))
                 for acc_id, (itm, _parent, _base) in self._account_map.items()
@@ -903,8 +996,24 @@ class ChartOfAccounts(QWidget):
             self._apply_filters()
         finally:
             self.tree.setUpdatesEnabled(True)
-            QTimer.singleShot(200, self.loader_dialog.close)
+            try:
+                QTimer.singleShot(200, self.loader_dialog.close)
+            except Exception:
+                pass
             self._set_toolbar_enabled(True)
+
+            if not self._offline_read_only:
+                self._set_offline_badge(False)
+                self._apply_offline_lock(False)
+                self._save_cache(rows, parent_map, active_count, inactive_count)
+            else:
+                self._apply_offline_lock(True)
+
+    def _set_offline_badge(self, visible: bool):
+        try:
+            self.badge_offline.setVisible(bool(visible))
+        except Exception:
+            pass
 
     def _apply_filters(self):
         query = (self.search_edit.text() or "").strip().lower()
@@ -944,7 +1053,10 @@ class ChartOfAccounts(QWidget):
         finally:
             self.tree.setUpdatesEnabled(True)
 
+    # Double-click guarded in offline mode (does nothing)
     def _on_double_click(self, item):
+        if self._offline_read_only:
+            return
         if item:
             self.edit_account(item)
 
@@ -957,12 +1069,19 @@ class ChartOfAccounts(QWidget):
         menu.addSeparator()
         a_expand = menu.addAction("▾ Expand All")
         a_collapse = menu.addAction("▸ Collapse All")
+
+        # Disable write actions when offline
+        if self._offline_read_only:
+            a_add.setEnabled(False)
+            a_edit.setEnabled(False)
+            a_del.setEnabled(False)
+
         action = menu.exec_(self.tree.viewport().mapToGlobal(pos))
-        if action == a_add:
+        if action == a_add and not self._offline_read_only:
             self.add_account()
-        elif action == a_edit and item:
+        elif action == a_edit and item and not self._offline_read_only:
             self.edit_account(item)
-        elif action == a_del and item:
+        elif action == a_del and item and not self._offline_read_only:
             self.delete_selected()
         elif action == a_expand:
             self._expand_collapse(True)
@@ -1011,19 +1130,16 @@ class ChartOfAccounts(QWidget):
         if not acc:
             return
 
-        # 1) Block if it has children
         children = db.collection("accounts").where("parent", "==", acc["id"]).limit(1).get()
         if children:
             QMessageBox.warning(self, "Cannot Delete", "This account has child accounts.")
             return
 
-        # 2) Block if referenced in any journal entry
         je_refs = db.collection("journal_entries").where("lines_account_ids", "array_contains", acc["id"]).limit(1).get()
         if je_refs:
             QMessageBox.warning(self, "Cannot Delete", "This account is used in journal entries. Deletion is not allowed.")
             return
 
-        # 3) Block if linked to a party
         party_link = db.collection("parties").where("coa_account_id", "==", acc["id"]).limit(1).get()
         if party_link:
             QMessageBox.warning(self, "Cannot Delete", "This account is linked to a party (Customer/Supplier). Unlink the party first.")
@@ -1075,12 +1191,3 @@ class ChartOfAccounts(QWidget):
             QMessageBox.information(self, "Exported", f"CSV exported to:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Failed to export: {e}")
-
-
-# If you want to test standalone:
-# if __name__ == "__main__":
-#     import sys
-#     app = QApplication(sys.argv)
-#     w = ChartOfAccounts({"email":"tester@example.com", "branch":["Main"]})
-#     w.show()
-#     sys.exit(app.exec_())
