@@ -27,6 +27,7 @@ class ProductsPage(QWidget):
         self.branches = user_data.get("branch", [])
         if isinstance(self.branches, str):
             self.branches = [self.branches]
+        self.is_admin = user_data.get("role") == "admin"  # Check if user is admin
 
         # ===== Window =====
         self.setWindowTitle("Products Management")
@@ -150,7 +151,7 @@ class ProductsPage(QWidget):
         self.splitter = splitter
         root.addWidget(splitter, 1)
 
-        # ===== Left pane (Categories + Subcategories) =====
+        # Left pane (Categories + Subcategories)
         left_card, left_lay = self._card()
         splitter.addWidget(left_card)
 
@@ -172,7 +173,13 @@ class ProductsPage(QWidget):
         cat_row.addWidget(self.cat_input, 1)
         cat_row.addWidget(self._btn("Add", self.add_category, kind="subtle"))
         cat_row.addWidget(self._btn("Rename", self.edit_category, kind="subtle"))
-        cat_row.addWidget(self._btn("Delete", self.delete_category, kind="danger"))
+
+        # Disable delete button for non-admins
+        delete_btn = self._btn("Delete", self.delete_category, kind="danger")
+        if not self.is_admin:
+            delete_btn.setDisabled(True)
+        cat_row.addWidget(delete_btn)
+        
         left_lay.addLayout(cat_row)
 
         left_lay.addSpacing(6)
@@ -194,7 +201,13 @@ class ProductsPage(QWidget):
         sub_row.addWidget(self.subcat_input, 1)
         sub_row.addWidget(self._btn("Add", self.add_subcategory, kind="subtle"))
         sub_row.addWidget(self._btn("Rename", self.edit_subcategory, kind="subtle"))
-        sub_row.addWidget(self._btn("Delete", self.delete_subcategory, kind="danger"))
+
+        # Disable delete button for non-admins
+        delete_subcategory_btn = self._btn("Delete", self.delete_subcategory, kind="danger")
+        if not self.is_admin:
+            delete_subcategory_btn.setDisabled(True)
+        sub_row.addWidget(delete_subcategory_btn)
+        
         left_lay.addLayout(sub_row)
 
         # ===== Right pane (Items + Form) =====
@@ -238,7 +251,13 @@ class ProductsPage(QWidget):
         actions.addStretch(1)
         actions.addWidget(self._btn("Add", self.add_item, kind="primary"))
         actions.addWidget(self._btn("Edit", self.edit_item, kind="subtle"))
-        actions.addWidget(self._btn("Delete", self.delete_item, kind="danger"))
+
+        # Disable delete button for non-admins
+        delete_item_btn = self._btn("Delete", self.delete_item, kind="danger")
+        if not self.is_admin:
+            delete_item_btn.setDisabled(True)
+        actions.addWidget(delete_item_btn)
+
         actions.addWidget(self._btn("Clear", self.clear_fields, kind="subtle"))
         right_lay.addLayout(actions)
 

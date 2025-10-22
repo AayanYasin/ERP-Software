@@ -683,8 +683,8 @@ class JournalEntryViewer(QWidget):
         # Base sign rule (unchanged)
         amt = (debit - credit) if acc_type in ("Asset", "Expense") else (credit - debit)
         # Special DISPLAY override: in Opening Balance JEs, flip "Opening Balances Equity"
-        if is_opening and is_ob_equity:
-            amt = -amt
+        # if is_opening and is_ob_equity:
+        #     amt = amt
         return amt
 
     # ===== Detail dialog (visual polish only) =====

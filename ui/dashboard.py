@@ -26,6 +26,9 @@ from modules.employee_master import EmployeeModule
 from modules.clients_master import PartyModule
 from modules.invoice import InvoiceModule
 from modules.view_invoice import ViewInvoicesModule
+from modules.delivery_chalan import DeliveryChalanModule
+from modules.view_users import ViewUsersModule
+
 
 
 # ---------------- Floating notice chip (offline) ----------------
@@ -345,8 +348,9 @@ class DashboardApp(QMainWindow):
     def __init__(self, username, user_data, company_name: str = "ERP"):
         super().__init__()
         self.username = username
-        self.user_data = user_data
+        self.user_data = user_data or {}
         self.company_name = company_name
+        self._is_admin = self._is_admin_user(self.user_data)
 
         self.setWindowTitle(f"{self.company_name} ERP — Dashboard")
         self.showMaximized()
@@ -362,7 +366,7 @@ class DashboardApp(QMainWindow):
 
         self._build_ui()
         self._start_network_monitor()
-        self._kick_data_load()
+        self._kick_data_load() if self._is_admin else None
 
     # ---------------- UI scaffold ----------------
     def _build_ui(self):
@@ -374,8 +378,8 @@ class DashboardApp(QMainWindow):
                 border: 1px solid rgba(17, 24, 39, 0.08);
                 border-radius: 16px;
             }
-            QFrame#KPI { background:#ffffff; border:1px solid #e5e7eb; border-radius:14px; }
-            QFrame#Card { background:#ffffff; border:1px solid #e5e7eb; border-radius:14px; }
+            QFrame#KPI { background:#ffffff; border:1px solid #e5e7eb; border-radius:18px; }
+            QFrame#Card { background:#ffffff; border:1px solid #e5e7eb; border-radius:18px; }
             QTableWidget {
                 gridline-color: #e5e7eb; alternate-background-color: #fafafa;
                 background: transparent; selection-background-color: #e8f2ff;
@@ -391,35 +395,67 @@ class DashboardApp(QMainWindow):
 
         # Sidebar
         sidebar_items = [
-            ("Dashboard", lambda: None),
+            # Group 1: Dashboard
+            ("Dashboard", lambda: None),  # Simple function case
+
+            # Group 2: Parties
             ("Parties", [("Manage/View", lambda: self.launch_module("party_window", PartyModule, self.user_data))]),
-            ("Emploees", [("Manage/View", lambda: self.launch_module("Emploee_window", EmployeeModule, self.user_data))]),
+
+            # Group 3: Employees
+            ("Employees", [("Manage/View", lambda: self.launch_module("Emploee_window", EmployeeModule, self.user_data))]),
+
+            # Group 4: Accounting
             ("Accounting", [
                 ("Chart of Accounts", lambda: self.launch_module("chart_of_accounts", ChartOfAccounts, self.user_data)),
-                ("Open Jounal", lambda: self.launch_module("wiew_journal_entry", JournalEntryViewer, self.user_data)),
+                ("Open Journal", lambda: self.launch_module("wiew_journal_entry", JournalEntryViewer, self.user_data)),
             ]),
+
+            # Group 5: Sales
             ("Sales", [
                 ("Invoice", lambda: self.launch_module("invoice_window", InvoiceModule, self.user_data)),
                 ("View Invoice", lambda: self.launch_module("view_invoice_window", ViewInvoicesModule, self.user_data)),
             ]),
+
+            # Group 6: Purchase
             ("Purchase", [("Purchase Order", lambda: QMessageBox.about(self, "Dev Log", "Cannot Acces, Under Development!"))]),
+
+            # Group 7: Inventory
             ("Inventory", [
                 ("Chart of Inventory", lambda: self.launch_module("products_window", ProductsPage, self.user_data)),
-                ("Stock Adjustment", lambda: self.launch_module("inventory_window", StockAdjustment, self.user_data, self)),
+                ("Stock Adjustment", lambda: setattr(self, "inventory_window", StockAdjustment.show_if_admin(self.user_data, self))),
                 ("View Inventory", lambda: self.launch_module("view_inventory_window", ViewInventory, self.user_data)),
+                ("Delivery Chalan", lambda: self.launch_module("delivery_chalan", DeliveryChalanModule, self.user_data)),
             ]),
+
+            # Group 8: Manufacturing
             ("Manufacturing", [
                 ("Create Order", lambda: self.launch_module("manufacturing_window", ManufacturingModule)),
                 ("View Orders", lambda: self.launch_module("view_orders_window", ViewManufacturingWindow, self.user_data, self)),
             ]),
+
+            # Group 9: Core Options
             ("Core Options", [
                 ("Settings", lambda: self.launch_module("settings_window", SettingsWindow, self.user_data)),
                 ("Create Login (Admin Only)", lambda: setattr(self, "create_user_window", CreateUserModule.show_if_admin(self.user_data))),
+                ("View Users (Admin Only)", lambda: setattr(self, "view_users_window", ViewUsersModule.show_if_admin(self.user_data))),
                 ("Connect Whatsapp", lambda: QMessageBox.about(self, "Dev Log", "Cannot Acces, Under Development!")),
             ]),
         ]
-        sidebar = create_expandable_sidebar(self, sidebar_items, self.logout, font_scale=1.1)
 
+        # For non-admin users, filter out the modules that are not in the allowed_modules list
+        if not self._is_admin:
+            allowed_modules = self.user_data.get('allowed_modules', [])
+            sidebar_items = [
+                (label, actions)  # If actions are a list, iterate over them
+                if isinstance(actions, list)
+                else (label, actions)  # Handle the function case (e.g., "Dashboard")
+                for label, actions in sidebar_items
+                for label, action in (actions if isinstance(actions, list) else [(label, actions)])  # Ensure it's iterable
+                if label in allowed_modules  # Check if the module is in allowed_modules
+            ]
+
+        sidebar = create_expandable_sidebar(self, sidebar_items, self.logout, font_scale=1.1)
+        
         # --- Right content ---
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         content = QWidget(); content.setObjectName("ContentArea"); scroll.setWidget(content)
@@ -443,11 +479,12 @@ class DashboardApp(QMainWindow):
         h.addWidget(self.net_badge)
 
         # Quick actions
-        btn_refresh = QToolButton(); btn_refresh.setText("↻ Refresh")
-        btn_refresh.setCursor(Qt.PointingHandCursor)
-        btn_refresh.setStyleSheet("QToolButton{padding:6px 10px; background:#ffffff; border:1px solid #dfe3ea; border-radius:8px;}")
-        btn_refresh.clicked.connect(self._kick_data_load)
-        h.addWidget(btn_refresh)
+        if self._is_admin:
+            btn_refresh = QToolButton(); btn_refresh.setText("↻ Refresh")
+            btn_refresh.setCursor(Qt.PointingHandCursor)
+            btn_refresh.setStyleSheet("QToolButton{padding:6px 10px; background:#ffffff; border:1px solid #dfe3ea; border-radius:8px;}")
+            btn_refresh.clicked.connect(self._kick_data_load)
+            h.addWidget(btn_refresh)
 
         btn_settings = QToolButton(); btn_settings.setText("⚙ Settings")
         btn_settings.setCursor(Qt.PointingHandCursor)
@@ -455,57 +492,61 @@ class DashboardApp(QMainWindow):
         btn_settings.clicked.connect(lambda: self.launch_module("settings_window", SettingsWindow, self.user_data))
         h.addWidget(btn_settings)
 
+        
         right.addWidget(header)
 
-        # ======= KPI cards row =======
-        kpi_row = QHBoxLayout(); kpi_row.setSpacing(12)
-        right.addLayout(kpi_row)
-        self.kpi_cards = {}
-        for title_txt in ["Assets", "Liabilities", "Equity", "Income", "Expense", "Net Worth", "Profit"]:
-            card = self._kpi_card(title_txt, "0.00")
-            self.kpi_cards[title_txt] = card
-            kpi_row.addWidget(card["frame"])
+        if self._is_admin:
+            # ======= KPI cards row =======
+            kpi_row = QHBoxLayout(); kpi_row.setSpacing(12)
+            right.addLayout(kpi_row)
+            self.kpi_cards = {}
+            for title_txt in ["Assets", "Liabilities", "Equity", "Income", "Expense", "Net Worth", "Profit"]:
+                card = self._kpi_card(title_txt, "0.00")
+                self.kpi_cards[title_txt] = card
+                kpi_row.addWidget(card["frame"])
 
-        # ======= Two-column content =======
-        grid_row = QHBoxLayout(); grid_row.setSpacing(12)
-        right.addLayout(grid_row)
+            # ======= Two-column content =======
+            grid_row = QHBoxLayout(); grid_row.setSpacing(12)
+            right.addLayout(grid_row)
 
-        # Left column: Top 5 Customers
-        self.top_box, self.top_table = self._build_table_card(
-        "👥 Top 5 Customers by Balance",
-        headers=["Code", "Customer", "Type", "Balance"]
-        )
-        grid_row.addWidget(self.top_box, 1)
+            # Left column: Top 5 Customers
+            self.top_box, self.top_table = self._build_table_card(
+            "👥 Top 5 Customers by Balance",
+            headers=["Code", "Customer", "Type", "Balance"]
+            )
+            grid_row.addWidget(self.top_box, 1)
 
-        # Right column: Stock Report (now with Code)
-        self.stock_box, self.stock_table = self._build_table_card(
-            "📦 Stock Report (Quick View)",
-            headers=["Code", "Item", "Qty", "Reorder Qty"]
-        )
-        grid_row.addWidget(self.stock_box, 1)
+            # Right column: Stock Report (now with Code)
+            self.stock_box, self.stock_table = self._build_table_card(
+                "📦 Stock Report (Quick View)",
+                headers=["Code", "Item", "Qty", "Reorder Qty"]
+            )
+            grid_row.addWidget(self.stock_box, 1)
 
-        # ======= Message Board (larger, clearer) =======
-        notes = QFrame(); notes.setObjectName("Card")
-        notes_lay = QVBoxLayout(notes)
-        notes_lay.setContentsMargins(18, 18, 18, 18)
-        notes_lay.setSpacing(10)
-        ttl = QLabel("🔔 Message Board")
-        ttl.setStyleSheet("font-size:16px; font-weight:800; color:#111827;")
-        msg = QTextEdit(); msg.setReadOnly(True)
-        msg.setText("• No pending approvals\n• 2 orders awaiting dispatch\n• System running smoothly\n• Welcome, Admin.")
-        msg.setFont(QFont("Segoe UI", 12))
-        msg.setMinimumHeight(180)
-        msg.setStyleSheet("""
-            QTextEdit {
-                background:#ffffff;
-                border:1px solid #edf0f4;
-                border-radius:12px;
-                padding:12px;
-            }
-        """)
-        notes_lay.addWidget(ttl); notes_lay.addWidget(msg)
-        right.addWidget(notes)
-
+            # ======= Message Board (larger, clearer) =======
+            notes = QFrame(); notes.setObjectName("Card")
+            notes_lay = QVBoxLayout(notes)
+            notes_lay.setContentsMargins(18, 18, 18, 18)
+            notes_lay.setSpacing(10)
+            ttl = QLabel("🔔 Message Board")
+            ttl.setStyleSheet("font-size:16px; font-weight:800; color:#111827;")
+            msg = QTextEdit(); msg.setReadOnly(True)
+            msg.setText("• No pending approvals\n• 2 orders awaiting dispatch\n• System running smoothly\n• Welcome, Admin.")
+            msg.setFont(QFont("Segoe UI", 12))
+            msg.setMinimumHeight(180)
+            msg.setStyleSheet("""
+                QTextEdit {
+                    background:#ffffff;
+                    border:1px solid #edf0f4;
+                    border-radius:12px;
+                    padding:12px;
+                }
+            """)
+            notes_lay.addWidget(ttl); notes_lay.addWidget(msg)
+            right.addWidget(notes)
+        else:
+            # Non-admin launchpad (icons grid)
+            right.addWidget(self._build_nonadmin_launchpad())
         right.addStretch(1)
 
         # Layout: sidebar + content
@@ -682,6 +723,132 @@ class DashboardApp(QMainWindow):
                 if c == len(rdata) - 1:
                     it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 table.setItem(r, c, it)
+
+    def _is_admin_user(self, user: dict) -> bool:
+        if not user:
+            return False
+        # Check directly if the user has an admin role.
+        print(user.get("role", ""))
+        role = str(user.get("role", "")).lower()
+        if role == "admin":
+            return True
+        roles = user.get("roles") or []
+        if isinstance(roles, (list, tuple, set)) and "admin" in roles:
+            return True
+        return False
+
+    def _is_inventory_manager(self, user: dict) -> bool:
+        if not user:
+            return False
+        role = str(user.get("role", "")).strip().lower()
+        if role == "inventory manager":
+            return True
+        roles = user.get("roles") or []
+        if isinstance(roles, (list, tuple, set)):
+            return any(str(r).strip().lower() == "inventory manager" for r in roles)
+        return False
+
+    def _build_nonadmin_launchpad(self):
+        wrap = QFrame()
+        wrap.setObjectName("Card")
+        lay = QVBoxLayout(wrap)
+        lay.setContentsMargins(24, 32, 24, 32)
+        lay.setSpacing(18)
+        
+        title = QLabel(f"Choose a Module to work on!")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size:22px;font-weight:900;color:#111827;")
+        lay.addWidget(title)
+
+        # Create a placeholder text for when no modules are allowed
+        if not self._is_admin:
+            allowed_modules = self.user_data.get('allowed_modules', [])
+            if not allowed_modules:  # If allowed_modules is empty
+                placeholder = QLabel("No modules are available. Please contact your admin.")
+                placeholder.setAlignment(Qt.AlignCenter)
+                placeholder.setStyleSheet("font-size:16px; font-weight:600; color:#ff0000;")  # Red for emphasis
+                lay.addWidget(placeholder)
+                return wrap  # Return early, as no further tiles are needed
+
+        # Continue with the usual tile generation if allowed_modules is not empty
+        grid = QGridLayout()
+        grid.setSpacing(16)
+        lay.addLayout(grid)
+        
+        # Define the module tiles to be included
+        all_modules = [
+            ("📦", "Manage / View Parties", lambda: self.launch_module("party_window", PartyModule, self.user_data)),
+            ("✅", "Manage / View Employees", lambda: self.launch_module("Emploee_window", EmployeeModule, self.user_data)),
+            ("📊", "Chart of Accounts", lambda: self.launch_module("chart_of_accounts", ChartOfAccounts, self.user_data)),
+            ("📝", "Journal", lambda: self.launch_module("wiew_journal_entry", JournalEntryViewer, self.user_data)),
+            ("🧾", "Invoice", lambda: self.launch_module("invoice_window", InvoiceModule, self.user_data)),
+            ("📑", "View Invoices", lambda: self.launch_module("view_invoice_window", ViewInvoicesModule, self.user_data)),
+            ("📦", "Purchase Order", lambda: QMessageBox.about(self, "Dev Log", "Cannot Access, Under Development!")),
+            ("📦", "Chart of Inventory", lambda: self.launch_module("products_window", ProductsPage, self.user_data)),
+            ("📦", "View Inventory", lambda: self.launch_module("view_inventory_window", ViewInventory, self.user_data)),
+            ("🚚", "Delivery Chalan", lambda: self.launch_module("delivery_chalan", DeliveryChalanModule, self.user_data)),
+            ("🏭", "Create Manufacturing Order", lambda: self.launch_module("manufacturing_window", ManufacturingModule)),
+            ("🏭", "View Manufacturing Order", lambda: self.launch_module("view_orders_window", ViewManufacturingWindow, self.user_data, self)),
+        ]
+
+        # If user is not admin, filter based on allowed modules
+        if not self._is_admin:
+            allowed_modules = self.user_data.get('allowed_modules', [])
+            all_modules = [(emoji, label, fn) for emoji, label, fn in all_modules if label in allowed_modules]
+
+        # Add the filtered tiles to the layout (all tiles will be of the same size)
+        for i, (emoji, label, fn) in enumerate(all_modules):
+            r, c = divmod(i, 4)  # Arrange in grid
+            tile = self._square_tile(emoji, label, fn)
+            grid.addWidget(tile, r, c)
+
+        # Add a message box below the tiles section (to display messages or instructions)
+        message_box = QFrame()
+        message_layout = QVBoxLayout(message_box)
+        message_layout.setContentsMargins(18, 18, 18, 18)
+        message_layout.setSpacing(10)
+        message_title = QLabel("🔔 Important Notice")
+        message_title.setStyleSheet("font-size:16px; font-weight:800; color:#111827;")
+        message_content = QTextEdit()
+        message_content.setReadOnly(True)
+        message_content.setText("• Please contact your admin if you have any issues accessing the modules.\n• Keep this section updated.")
+        message_content.setFont(QFont("Segoe UI", 12))
+        message_content.setStyleSheet("""
+            QTextEdit {
+                background:#ffffff;
+                border:1px solid #edf0f4;
+                border-radius:12px;
+                padding:12px;
+            }
+        """)
+        message_layout.addWidget(message_title)
+        message_layout.addWidget(message_content)
+        lay.addWidget(message_box)
+
+        return wrap
+
+    def _square_tile(self, emoji, label, on_click):
+        btn = QToolButton()
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setText(f"{emoji}\n{label}")
+        btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        btn.setMinimumSize(200, 160)  # Ensuring all tiles are of same size
+        btn.setStyleSheet("""
+            QToolButton {
+                background:#fff;
+                border:1px solid #e5e7eb;
+                border-radius:18px;
+                padding:20px;
+                font-size:16px;
+                font-weight:800;
+                color:#111827;
+            }
+            QToolButton:hover {
+                border-color:#cbd5e1;
+            }
+        """)
+        btn.clicked.connect(on_click)
+        return btn
 
     # ---------------- Network handling ----------------
     def _paint_net_badge(self, state: str, rtt_ms: int = 0):

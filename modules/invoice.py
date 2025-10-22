@@ -823,7 +823,7 @@ class InvoiceModule(QWidget):
             inv_ref.set(invoice_doc)
 
             # 4) Post Revenue JE (virtual credit line, real AR debit → updates AR only)
-            self._post_revenue_virtual_je(
+            self._post_revenue_against_opening_equity(
                 invoice_ref_id=inv_ref.id,
                 client_id=client_id,
                 amount=total,
@@ -919,6 +919,116 @@ class InvoiceModule(QWidget):
             "current_balance": firestore.Increment(net_change)
         })
         
+    def _post_revenue_against_opening_equity(self, invoice_ref_id, client_id, amount, description=""):
+        # Revenue JE (NO virtual lines):
+        # - DR Accounts Receivable (party)      -> real account
+        # - CR Opening Balances Equity (global) -> real account (single money source)
+        if amount <= 0:
+            return
+
+        # Resolve party + AR
+        party = db.collection("parties").document(client_id).get().to_dict() or {}
+        ar_account_id = party.get("coa_account_id")
+        if not ar_account_id:
+            raise RuntimeError("Client AR account missing while posting revenue JE.")
+
+        # --- Find or create Opening Balances Equity ---
+        eq_q = db.collection("accounts").where("slug", "==", "opening_balances_equity").limit(1).get()
+        if eq_q:
+            equity_account_id = eq_q[0].id
+            equity_account_name = (eq_q[0].to_dict() or {}).get("name", "System Offset Account")
+            equity_doc = eq_q[0].to_dict() or {}
+        else:
+            # Create one (same shape as chart_of_accounts)
+            from firebase_admin import firestore as _fs
+            counter_ref = db.collection("meta").document("account_code_counter")
+            transaction = _fs.client().transaction()
+
+            @_fs.transactional
+            def _generate_code_once_tx(trans):
+                snap = counter_ref.get(transaction=trans)
+                last = int(snap.get("last_code") or 1000)
+                new  = last + 1
+                trans.update(counter_ref, {"last_code": new})
+                return new
+
+            equity_code = _generate_code_once_tx(transaction)
+            branches = self.user_data.get("branch", [])
+            if isinstance(branches, str):
+                branches = [branches]
+
+            equity_account = {
+                "name": "System Offset Account",
+                "slug": "opening_balances_equity",
+                "type": "Asset",
+                "code": equity_code,
+                "parent": None,
+                "branch": branches,
+                "description": "System-generated equity account for opening balances",
+                "active": True,
+                "is_posting": True,
+                "opening_balance": None,
+                "current_balance": 0.0,
+                "subtype": "Equity",
+            }
+            doc_ref = db.collection("accounts").document()
+            doc_ref.set(equity_account)
+            equity_account_id = doc_ref.id
+            equity_account_name = "Opening Balances Equity"
+            equity_doc = equity_account
+
+        # Snapshots for balances
+        def _snap(acc_id):
+            try:
+                s = db.collection("accounts").document(acc_id).get()
+                d = s.to_dict() or {}
+                pre = float(d.get("current_balance", 0.0) or 0.0)
+                return d, pre
+            except Exception:
+                return {}, 0.0
+
+        ar_doc, ar_pre = _snap(ar_account_id)
+        eq_doc, eq_pre = _snap(equity_account_id)
+
+        # Lines
+        real_lines = [
+            {"account_id": ar_account_id,      "account_name": ar_doc.get("name","Accounts Receivable"), "debit": float(amount), "credit": 0.0, "balance_before": ar_pre},
+            {"account_id": equity_account_id,  "account_name": equity_doc.get("name", "System Offset Account"), "debit": 0.0, "credit": float(amount), "balance_before": eq_pre},
+        ]
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        branch_val = self.user_data.get("branch")
+        if isinstance(branch_val, list): branch_val = branch_val[0] if branch_val else "-"
+        je = {
+            "date": now,
+            "created_at": firestore.SERVER_TIMESTAMP,
+            "created_by": self.user_data.get("email", "system"),
+            "reference_no": f"JE-{uuid.uuid4().hex[:6].upper()}-{int(now.timestamp())}",
+            "description": description or "Invoice revenue (Opening Balances Equity credit)",
+            "purpose": "Sale",
+            "branch": branch_val or "-",
+            "invoice_ref": invoice_ref_id,
+            "lines": real_lines,
+            "lines_account_ids": [real_lines[0]["account_id"], real_lines[1]["account_id"]],
+            "meta": {"kind": "opening_balance"}
+        }
+
+        # Balance deltas (Assets/Expenses: debit - credit; Others: credit - debit)
+        def _net(acc_dict, debit, credit):
+            typ = (acc_dict.get("type") or "Asset")
+            return (debit - credit) if typ in ["Asset", "Expense"] else (credit - debit)
+
+        updates = {
+            ar_account_id: _net(ar_doc, float(amount), 0.0),
+            equity_account_id: _net(eq_doc, 0.0, float(amount)),
+        }
+
+        db.collection("journal_entries").add(je)
+        for acc_id, delta in updates.items():
+            db.collection("accounts").document(acc_id).update({
+                "current_balance": firestore.Increment(delta)
+            })
+
     def _post_payment_journal(self, invoice_ref_id, client_id, received_account_id, amount, description=""):
         """
         Settlement JE (updates balances):
@@ -1517,8 +1627,12 @@ class BoQItemWidget(QWidget):
 
         self.product_cb = QComboBox()
         self.product_cb.setEditable(True)
+        # Populate with labels so the list is visible
+        self.product_cb.clear()
+        self.product_cb.addItems(sorted(self.product_dict.keys()))
         self.product_cb.setFixedWidth(300)
         self.product_cb.setInsertPolicy(QComboBox.NoInsert)
+        self.product_cb.currentIndexChanged.connect(self._on_product_change)
 
         # Initially empty — you can preload if needed later
         self.product_cb.addItem("")  
@@ -1573,6 +1687,19 @@ class BoQItemWidget(QWidget):
         for w in widgets:
             layout.addWidget(w)
             
+    def _on_product_change(self, *_):
+        label = (self.product_cb.currentText() or "").strip()
+        prod = self.product_dict.get(label) or {}
+        try:
+            rate = float(prod.get("selling_price", 0) or 0)
+        except Exception:
+            rate = 0.0
+        # Only auto-set if user hasn't typed a custom rate yet or it's zero
+        if (self.rate_edit.text() or "").strip() in ("", "0", "0.0", "0.00"):
+            self.rate_edit.setText(f"{rate:.2f}")
+        # Always recompute total
+        self.recalculate_total()
+
     def get_data(self):
         return {
             "product": self.product_cb.currentText(),

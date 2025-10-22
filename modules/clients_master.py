@@ -839,16 +839,16 @@ class PartyDialog(QDialog):
             equity_q = db.collection("accounts").where("slug", "==", "opening_balances_equity").limit(1).get()
             if equity_q:
                 equity_account_id = equity_q[0].id
-                equity_account_name = (equity_q[0].to_dict() or {}).get("name", "Opening Balances Equity")
+                equity_account_name = (equity_q[0].to_dict() or {}).get("name", "System Offset Account")
             else:
-                code = self._generate_code_once("Equity")
+                code = self._generate_code_once("Asset")
                 branch_list = self.user_data.get("branch", [])
                 if isinstance(branch_list, str):
                     branch_list = [branch_list]
                 equity_doc = {
-                    "name": "Opening Balances Equity",
+                    "name": "System Offset Account",
                     "slug": "opening_balances_equity",
-                    "type": "Equity",
+                    "type": "Asset",
                     "code": code,
                     "parent": None,
                     "branch": branch_list,
@@ -861,7 +861,7 @@ class PartyDialog(QDialog):
                 ref = db.collection("accounts").document()
                 ref.set(equity_doc)
                 equity_account_id = ref.id
-                equity_account_name = "Opening Balances Equity"
+                equity_account_name = "System Offset Account"
 
             a_pre = 0.0
             e_pre = 0.0

@@ -75,8 +75,12 @@ class SettingsWindow(QWidget):
 
         loader = self.show_loader(self, "Please wait...", "Loading Data")
         self.setup_ui()
-        self.load_branches()
-        self.load_colors()
+        
+        # Call load_branches only if the user is an admin
+        if self.user_data.get("role") == "admin":
+            self.load_branches()
+            self.load_colors()  # This can remain for both admins and non-admins
+            
         loader.close()
 
     def setup_ui(self):
@@ -100,6 +104,7 @@ class SettingsWindow(QWidget):
 
         layout.addWidget(self.divider())
 
+        # Only show the Branch and Color Sections for Admins
         if self.user_data.get("role") == "admin":
             # ─── Branch Section ───
             layout.addWidget(self.section_title("Manage Branches"))
@@ -141,11 +146,13 @@ class SettingsWindow(QWidget):
 
             layout.addWidget(self.divider())
 
-        more = QLabel("More settings coming soon...")
-        more.setFont(QFont("Segoe UI", 10))
-        more.setStyleSheet("color: #a4b0be;")
-        more.setAlignment(Qt.AlignCenter)
-        layout.addWidget(more)
+        else:
+            # If the user is not an admin, show only the "Remove Access" option
+            more = QLabel("More settings coming soon...")
+            more.setFont(QFont("Segoe UI", 10))
+            more.setStyleSheet("color: #a4b0be;")
+            more.setAlignment(Qt.AlignCenter)
+            layout.addWidget(more)
 
     # ─── Helpers ───
     def section_title(self, text):

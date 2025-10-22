@@ -18,6 +18,15 @@ class StockAdjustment(QWidget):
         self.setup_ui()
         
         self.dashboard = dashboard
+    
+    @staticmethod
+    def show_if_admin(user_data, dashboard=None):
+        if user_data.get("role") != "admin":
+            QMessageBox.critical(None, "Access Denied", "You are not authorized to adjust stocks")
+            return
+        window = StockAdjustment(user_data, dashboard)
+        window.show()
+        return window
 
     def setup_ui(self):
         self.setWindowTitle("📦 Stock Adjustment")

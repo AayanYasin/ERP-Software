@@ -155,16 +155,16 @@ def _post_opening_balance_je(db_ref, user_data: dict, account_id: str, account_n
     eq_q = db_ref.collection("accounts").where("slug", "==", "opening_balances_equity").limit(1).get()
     if eq_q:
         equity_account_id = eq_q[0].id
-        equity_account_name = (eq_q[0].to_dict() or {}).get("name", "Opening Balances Equity")
+        equity_account_name = (eq_q[0].to_dict() or {}).get("name", "System Offset Account")
     else:
-        equity_code = _generate_code_once_tx(db_ref, "Equity")
+        equity_code = _generate_code_once_tx(db_ref, "Asset")
         branches = user_data.get("branch", [])
         if isinstance(branches, str):
             branches = [branches]
         equity_account = {
-            "name": "Opening Balances Equity",
+            "name": "System Offset Account",
             "slug": "opening_balances_equity",
-            "type": "Equity",
+            "type": "Asset",
             "code": equity_code,
             "parent": None,
             "branch": branches,
@@ -177,7 +177,7 @@ def _post_opening_balance_je(db_ref, user_data: dict, account_id: str, account_n
         doc_ref = db_ref.collection("accounts").document()
         doc_ref.set(equity_account)
         equity_account_id = doc_ref.id
-        equity_account_name = "Opening Balances Equity"
+        equity_account_name = "System Offset Account"
 
     try:
         a_doc = (db_ref.collection("accounts").document(account_id).get().to_dict() or {})

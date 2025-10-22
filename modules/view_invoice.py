@@ -12,6 +12,8 @@ from PyQt5.QtGui import QColor
 from firebase.config import db
 from firebase_admin import firestore
 import uuid, csv, os, tempfile, datetime
+import datetime as _dt
+
 
 # Try to import your editor to support View/Edit actions
 try:
@@ -25,17 +27,9 @@ QWidget { font-size: 14px; }
 QPushButton { background: #2d6cdf; color: white; border: none; padding: 6px 12px; border-radius: 8px; }
 QPushButton:hover { background: #2458b2; }
 QPushButton:disabled { background: #a9b7d1; }
-
 QGroupBox { border: 1px solid #e3e7ef; border-radius: 10px; margin-top: 16px; }
-QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #4a5568; }
-
-QLineEdit, QComboBox, QTextEdit, QDateEdit {
-    border: 1px solid #d5dbe7; border-radius: 8px; padding: 6px 8px;
-}
-QLineEdit:focus, QComboBox:focus, QTextEdit:focus, QDateEdit:focus { border-color: #2d6cdf; }
-
-QTableWidget { gridline-color: #e6e9f2; }
-QHeaderView::section { background: #f7f9fc; padding: 6px; border: none; border-bottom: 1px solid #e6e9f2; }
+QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; }
+QTableWidget::item:selected { background: #dbeafe; color: #1e3a8a; }
 """
 
 def _fmt_money(v) -> str:
@@ -45,39 +39,148 @@ def _fmt_money(v) -> str:
         n = 0.0
     return f"Rs {n:,.2f}"
 
+
 def _safe_date(d):
-    """Return a NAIVE datetime (no tzinfo) for consistent comparisons."""
+    """Return a naive datetime (no tzinfo) for consistent comparisons."""
     try:
         if d is None:
             return None
-        if hasattr(d, "to_datetime"):
+        if hasattr(d, "to_datetime"):        # Firestore Timestamp
             return d.to_datetime().replace(tzinfo=None)
-        if isinstance(d, datetime.datetime):
+        if isinstance(d, _dt.datetime):
             return d.replace(tzinfo=None)
-        if isinstance(d, datetime.date):
-            return datetime.datetime(d.year, d.month, d.day)
+        if isinstance(d, _dt.date):
+            return _dt.datetime(d.year, d.month, d.day)
         s = str(d)
         if s.endswith("Z"):
             s = s.replace("Z", "+00:00")
-        return datetime.datetime.fromisoformat(s).replace(tzinfo=None)
+        return _dt.datetime.fromisoformat(s).replace(tzinfo=None)
     except Exception:
         return None
-
+    
 def _today():
-    return datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    return _dt.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
-def _due_status_color(due_dt: datetime.datetime):
+def _due_status_color(due_dt):
+    """Return (label, bg_color, fg_color) based on due date proximity."""
+    from PyQt5.QtGui import QColor
     if not due_dt:
         return ("No Due", QColor("#e5e7eb"), QColor("#111827"))
-    if getattr(due_dt, "tzinfo", None) is not None:
-        due_dt = due_dt.replace(tzinfo=None)
-    today = _today()
-    delta = (due_dt - today).days
+    # Remove tz to make arithmetic consistent
+    try:
+        if getattr(due_dt, "tzinfo", None) is not None:
+            due_dt = due_dt.replace(tzinfo=None)
+    except Exception:
+        pass
+    delta = (due_dt - _today()).days
     if delta < 0:
         return ("Overdue", QColor("#fee2e2"), QColor("#991b1b"))
     if delta <= 2:
         return ("Due Soon", QColor("#fef3c7"), QColor("#78350f"))
     return ("On Time", QColor("#dcfce7"), QColor("#065f46"))
+
+
+class DeliveryChalanDialog(QDialog):
+    """Create a delivery chalan from an invoice's aggregated BoQ items."""
+    def __init__(self, invoice_doc_id, invoice_data, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Create Delivery Chalan")
+        self.setMinimumSize(720, 560)
+        self.invoice_doc_id = invoice_doc_id
+        self.invoice_data = invoice_data
+
+        v = QVBoxLayout(self)
+
+        # --- Header form ---
+        form = QFormLayout()
+        self.date_edit = QDateEdit(QDate.currentDate())
+        self.date_edit.setCalendarPopup(True)
+        self.vehicle = QLineEdit()
+        self.person = QLineEdit()
+        self.notes = QTextEdit()
+        form.addRow("Date", self.date_edit)
+        form.addRow("Vehicle", self.vehicle)
+        form.addRow("Delivered By", self.person)
+        form.addRow("Notes", self.notes)
+        v.addLayout(form)
+
+        # --- Items table (aggregated BoQ) ---
+        self.tbl = QTableWidget(0, 4)
+        self.tbl.setHorizontalHeaderLabels(["Item", "Condition", "Qty (deliver)", "Already Delivered"])
+        self.tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.tbl.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        v.addWidget(self.tbl)
+
+        self._load_boq_items()
+
+        # --- Buttons ---
+        btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._save)
+        btns.rejected.connect(self.reject)
+        v.addWidget(btns)
+
+    def _load_boq_items(self):
+        """Aggregate BoQ items across all main products on the invoice."""
+        self.tbl.setRowCount(0)
+        rows = []
+        for mp in self.invoice_data.get("items", []):
+            for b in mp.get("boq", []):
+                rows.append({
+                    "product": b.get("product", "") or "",
+                    "condition": b.get("condition", "") or "",
+                    "qty": float(b.get("qty", 0) or 0),
+                })
+
+        # Aggregate (product, condition) → total qty
+        agg = {}
+        for r in rows:
+            key = (r["product"], r["condition"])
+            agg[key] = agg.get(key, 0.0) + r["qty"]
+
+        # TODO: replace with actual “already delivered” lookup if/when you want
+        delivered_map = {}
+
+        self.tbl.setRowCount(len(agg))
+        for i, ((prod, cond), total_qty) in enumerate(agg.items()):
+            self.tbl.setItem(i, 0, QTableWidgetItem(prod))
+            self.tbl.setItem(i, 1, QTableWidgetItem(cond))
+            qty_edit = QLineEdit(str(total_qty))
+            self.tbl.setCellWidget(i, 2, qty_edit)
+            self.tbl.setItem(i, 3, QTableWidgetItem(str(delivered_map.get((prod, cond), 0))))
+
+    def _save(self):
+        # Collect items
+        items = []
+        for r in range(self.tbl.rowCount()):
+            prod = self.tbl.item(r, 0).text() if self.tbl.item(r, 0) else ""
+            cond = self.tbl.item(r, 1).text() if self.tbl.item(r, 1) else ""
+            qtyw = self.tbl.cellWidget(r, 2)
+            try:
+                qty = float((qtyw.text() if qtyw else "0") or 0)
+            except Exception:
+                qty = 0.0
+            if qty > 0:
+                items.append({"product": prod, "condition": cond, "qty": qty})
+
+        payload = {
+            "invoice_id": self.invoice_doc_id,
+            "invoice_no": self.invoice_data.get("invoice_no"),
+            "client_id": self.invoice_data.get("client_id"),
+            "client_name": self.invoice_data.get("client_name"),
+            "date": self.date_edit.date().toString("yyyy-MM-dd"),
+            "vehicle": (self.vehicle.text() or "").strip(),
+            "person": (self.person.text() or "").strip(),
+            "notes": (self.notes.toPlainText() or "").strip(),
+            "items": items,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        }
+
+        db.collection("delivery_chalans").add(payload)
+        QMessageBox.information(self, "Saved", "Delivery Chalan saved.")
+        self.accept()
+
 
 
 # ---------- Read-only VIEW dialog ----------
@@ -886,23 +989,12 @@ class ViewInvoicesModule(QWidget):
         dlg.exec_()
 
     def _create_delivery_chalan(self, doc_id, data):
-        try:
-            ch = {
-                "created_at": datetime.datetime.now(),
-                "created_by": self.user_data.get("email", "system"),
-                "invoice_id": doc_id,
-                "invoice_no": data.get("invoice_no"),
-                "client_id": data.get("client_id") or data.get("party_id"),
-                "client_name": data.get("client_name"),
-                "items": data.get("items", []),
-                "status": "Draft",
-                "notes": f"Auto-generated from invoice {data.get('invoice_no')}"
-            }
-            ref = db.collection("delivery_chalans").document()
-            ref.set(ch)
-            QMessageBox.information(self, "Created", f"Delivery Chalan created: {ref.id}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to create Delivery Chalan:\n{e}")
+        """Open Delivery Chalan dialog for the selected invoice."""
+        dlg = DeliveryChalanDialog(doc_id, data, self)
+        if dlg.exec_():
+            # optional: refresh the chalan history right away
+            self._view_chalan_history(doc_id)
+
 
     def _view_chalan_history(self, doc_id):
         dlg = ChalanHistoryDialog(doc_id, self)
