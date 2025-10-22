@@ -338,22 +338,25 @@ class EmployeeModule(QWidget):
 
     # ---------- Export (UNCHANGED) ----------
     def _export_csv_current_tab(self):
-        try:
-            table = self._current_table()
-            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-            if not os.path.isdir(desktop): desktop = tempfile.gettempdir()
-            path = os.path.join(desktop, "employees_export.csv")
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                headers = [table.horizontalHeaderItem(c).text() for c in range(table.columnCount())]
-                w.writerow(headers)
-                for r in range(table.rowCount()):
-                    if table.isRowHidden(r): continue
-                    row = [(table.item(r, c).text() if table.item(r, c) else "") for c in range(table.columnCount())]
-                    w.writerow(row)
-            QMessageBox.information(self, "Exported", f"CSV saved to: {path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Export failed", str(e))
+        if _is_admin_user(self.user_data):
+            try:
+                table = self._current_table()
+                desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+                if not os.path.isdir(desktop): desktop = tempfile.gettempdir()
+                path = os.path.join(desktop, "employees_export.csv")
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    headers = [table.horizontalHeaderItem(c).text() for c in range(table.columnCount())]
+                    w.writerow(headers)
+                    for r in range(table.rowCount()):
+                        if table.isRowHidden(r): continue
+                        row = [(table.item(r, c).text() if table.item(r, c) else "") for c in range(table.columnCount())]
+                        w.writerow(row)
+                QMessageBox.information(self, "Exported", f"CSV saved to: {path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Export failed", str(e))
+        else:
+            QMessageBox.warning(self, "Not Allowed", "You do not have permission to perform this action.")
 
     # ---------- Actions (UNCHANGED) ----------
     def add_employee(self):

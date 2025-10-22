@@ -310,12 +310,12 @@ class AssignModulesDialog(QDialog):
             "can_see_other_branches_inventory": QCheckBox("Can View all branch Inventories?", self),
             "can_delete_products": QCheckBox("Can Delete Products?", self),
             "can_edit_products": QCheckBox("Can Edit Products?", self),
-            "can_delete_parties": QCheckBox("Can Delete Parties?", self),
-            "can_edit_parties": QCheckBox("Can Edit Parties?", self),
-            "can_delete_employees": QCheckBox("Can Delete Employees?", self),
-            "can_edit_employees": QCheckBox("Can Edit Employees?", self),
-            "can_delete_accounts": QCheckBox("Can Delete Accounts?", self),
-            "can_edit_accounts": QCheckBox("Can Edit Accounts?", self),
+            # "can_delete_parties": QCheckBox("Can Delete Parties?", self),
+            # "can_edit_parties": QCheckBox("Can Edit Parties?", self),
+            # "can_delete_employees": QCheckBox("Can Delete Employees?", self),
+            # "can_edit_employees": QCheckBox("Can Edit Employees?", self),
+            # "can_delete_accounts": QCheckBox("Can Delete Accounts?", self),
+            # "can_edit_accounts": QCheckBox("Can Edit Accounts?", self),
             "can_imp_exp_anything": QCheckBox("Can Import/Export Anything?", self)
         }
 
