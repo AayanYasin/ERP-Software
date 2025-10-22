@@ -65,7 +65,19 @@ class ViewInventory(QWidget):
     def __init__(self, user_data):
         super().__init__()
         self.user_data = user_data
-        self.branches = user_data.get("branch", [])
+        self.is_admin = user_data.get("role") == "admin"  # Check if user is admin
+        
+        # Fetch admin's branches from Firestore
+        admin_branches = self.get_admin_branches()
+        
+        # Check if current user has permission to see other branches
+        if "can_see_other_branches_inventory" in user_data.get("extra_perm", []):
+            # User has permission to see all branches from the admin
+            self.branches = admin_branches
+        else:
+            # Default: Show only the user's own branches
+            self.branches = user_data.get("branch", [])
+        
         self.main_categories = {}      # {name: doc_id}
         self.sub_categories = {}       # {sub_id: main_id}
         self.expanded_rows = set()     # expanded item_codes
@@ -138,7 +150,14 @@ class ViewInventory(QWidget):
         self.height_filter.textChanged.connect(self.refresh_table); header_layout.addWidget(QLabel("Height:")); header_layout.addWidget(self.height_filter)
 
         clear_btn = QPushButton("Clear Filters"); clear_btn.clicked.connect(self.clear_filters); header_layout.addWidget(clear_btn)
-        export_btn = QPushButton("Export"); export_btn.clicked.connect(self.export_inventory); header_layout.addWidget(export_btn)
+        
+        export_btn = QPushButton("Export")
+        if not self.is_admin and "can_imp_exp_anything" not in self.user_data.get("extra_perm", []):
+            export_btn.clicked.connect(self.show_not_allowed_warning)
+        else:
+            export_btn.clicked.connect(self.export_inventory)
+        
+        header_layout.addWidget(export_btn)
 
         # --- OFFLINE BADGE (hidden by default; shown only when offline/cache is used) ---
         self.offline_badge = QLabel("Showing offline inventory")
@@ -183,6 +202,9 @@ class ViewInventory(QWidget):
         self.reload_async()
 
     # ---------------- Offline cache helpers (no UX change) ----------------
+    def show_not_allowed_warning(self):
+        QMessageBox.warning(self, "Not Allowed", "You do not have permission to perform this action.")
+        
     def _app_dir(self) -> str:
         base = os.environ.get("APPDATA") if os.name == "nt" else os.path.join(os.path.expanduser("~"), ".config")
         root = os.path.join(base, "PlayWithAayan-ERP_Software", "cache")
@@ -232,6 +254,17 @@ class ViewInventory(QWidget):
             self.reload_async()
 
     # ---------------- UI loader ----------------
+    def get_admin_branches(self):
+        # Fetch branches from admin role document in Firestore
+        try:
+            admin_doc = db.collection("users").where("role", "==", "admin").limit(1).stream()
+            for admin in admin_doc:
+                admin_data = admin.to_dict()
+                return admin_data.get("branch", [])
+        except Exception as e:
+            print(f"Error fetching admin branches: {e}")
+            return []  # Return empty if something goes wrong
+        
     def show_loader(self, parent, title="Please wait...", message="Processing..."):
         loader = QProgressDialog(message, None, 0, 0, parent)
         loader.setWindowModality(Qt.WindowModal)

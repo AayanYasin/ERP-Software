@@ -137,7 +137,14 @@ class ProductsPage(QWidget):
         header_row.addWidget(title, 0, Qt.AlignLeft)
         header_row.addStretch(1)
 
-        import_btn = self._btn("Import Inventory", self.import_inventory, kind="primary")
+        # Check if the user is an admin or if they have the permission to delete
+        if not self.is_admin and "can_imp_exp_anything" not in self.user_data.get("extra_perm", []):
+            # delete_btn.setDisabled(True)
+            # Connect the button to the warning function when clicked
+            import_btn = self._btn("Import Inventory", self.show_not_allowed_warning, kind="primary")
+        else:
+            import_btn = self._btn("Import Inventory", self.import_inventory, kind="primary")
+        
         import_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)  # avoid stretching full width
         header_row.addWidget(import_btn, 0, Qt.AlignRight)
 
@@ -172,12 +179,25 @@ class ProductsPage(QWidget):
         self.cat_input.setPlaceholderText("Add or rename main category…")
         cat_row.addWidget(self.cat_input, 1)
         cat_row.addWidget(self._btn("Add", self.add_category, kind="subtle"))
-        cat_row.addWidget(self._btn("Rename", self.edit_category, kind="subtle"))
+        
+        # Check if the user is an admin or if they have the permission to delete
+        if not self.is_admin and "can_edit_products" not in self.user_data.get("extra_perm", []):
+            # delete_btn.setDisabled(True)
+            # Connect the button to the warning function when clicked
+            rename_btn = self._btn("Rename", self.show_not_allowed_warning, kind="subtle")  
+        else:
+            rename_btn = self._btn("Rename", self.edit_category, kind="subtle")
 
-        # Disable delete button for non-admins
-        delete_btn = self._btn("Delete", self.delete_category, kind="danger")
-        if not self.is_admin:
-            delete_btn.setDisabled(True)
+
+        # Check if the user is an admin or if they have the permission to delete
+        if not self.is_admin and "can_delete_products" not in self.user_data.get("extra_perm", []):
+            # delete_btn.setDisabled(True)
+            # Connect the button to the warning function when clicked
+            delete_btn = self._btn("Delete", self.show_not_allowed_warning, kind="danger")  
+        else:
+            delete_btn = self._btn("Delete", self.delete_category, kind="danger")
+
+        cat_row.addWidget(rename_btn)
         cat_row.addWidget(delete_btn)
         
         left_lay.addLayout(cat_row)
@@ -200,12 +220,24 @@ class ProductsPage(QWidget):
         self.subcat_input.setPlaceholderText("Add or rename sub category…")
         sub_row.addWidget(self.subcat_input, 1)
         sub_row.addWidget(self._btn("Add", self.add_subcategory, kind="subtle"))
-        sub_row.addWidget(self._btn("Rename", self.edit_subcategory, kind="subtle"))
+        
+        # Check if the user is an admin or if they have the permission to delete
+        if not self.is_admin and "can_edit_products" not in self.user_data.get("extra_perm", []):
+            # delete_btn.setDisabled(True)
+            # Connect the button to the warning function when clicked
+            edit_subcategory_btn = self._btn("Rename", self.show_not_allowed_warning, kind="subtle")
+        else:
+            edit_subcategory_btn = self._btn("Rename", self.edit_subcategory, kind="subtle")
+            
+        # Check if the user is an admin or if they have the permission to delete
+        if not self.is_admin and "can_delete_products" not in self.user_data.get("extra_perm", []):
+            # delete_btn.setDisabled(True)
+            # Connect the button to the warning function when clicked
+            delete_subcategory_btn = self._btn("Delete", self.show_not_allowed_warning, kind="danger")
+        else:
+            delete_subcategory_btn = self._btn("Delete", self.delete_subcategory, kind="danger")
 
-        # Disable delete button for non-admins
-        delete_subcategory_btn = self._btn("Delete", self.delete_subcategory, kind="danger")
-        if not self.is_admin:
-            delete_subcategory_btn.setDisabled(True)
+        sub_row.addWidget(edit_subcategory_btn)
         sub_row.addWidget(delete_subcategory_btn)
         
         left_lay.addLayout(sub_row)
@@ -250,12 +282,26 @@ class ProductsPage(QWidget):
         actions = QHBoxLayout()
         actions.addStretch(1)
         actions.addWidget(self._btn("Add", self.add_item, kind="primary"))
-        actions.addWidget(self._btn("Edit", self.edit_item, kind="subtle"))
+        
+        # Disable delete button for non-admins
+        # Check if the user is an admin or if they have the permission to delete
+        if not self.is_admin and "can_edit_products" not in self.user_data.get("extra_perm", []):
+            # delete_btn.setDisabled(True)
+            # Connect the button to the warning function when clicked
+            edit_item_btn = self._btn("Edit", self.show_not_allowed_warning, kind="subtle")  
+        else:
+            edit_item_btn = self._btn("Edit", self.edit_item, kind="subtle")
 
         # Disable delete button for non-admins
-        delete_item_btn = self._btn("Delete", self.delete_item, kind="danger")
-        if not self.is_admin:
-            delete_item_btn.setDisabled(True)
+        # Check if the user is an admin or if they have the permission to delete
+        if not self.is_admin and "can_delete_products" not in self.user_data.get("extra_perm", []):
+            # delete_btn.setDisabled(True)
+            # Connect the button to the warning function when clicked
+            delete_item_btn = self._btn("Delete", self.show_not_allowed_warning, kind="danger")  
+        else:
+            delete_item_btn = self._btn("Delete", self.delete_item, kind="danger")
+
+        actions.addWidget(edit_item_btn)
         actions.addWidget(delete_item_btn)
 
         actions.addWidget(self._btn("Clear", self.clear_fields, kind="subtle"))
@@ -265,6 +311,9 @@ class ProductsPage(QWidget):
         self._apply_responsive_layout()
 
     # ================= Helpers (no logic change) =================
+    def show_not_allowed_warning(self):
+        QMessageBox.warning(self, "Not Allowed", "You do not have permission to perform this action.")
+
     def make_button_row(self, txt1, cmd1, txt2, cmd2, txt3, cmd3, txt4, cmd4):
         # kept for compatibility
         row = QHBoxLayout()

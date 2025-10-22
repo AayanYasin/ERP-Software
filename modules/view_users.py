@@ -294,13 +294,34 @@ class AssignModulesDialog(QDialog):
             "Delivery Chalan", "Create Manufacturing Order", "View Manufacturing Order"
         ]
 
-        # Create checkboxes first but don't add them to layout until data is fetched
+        # Create checkboxes for modules first but don't add them to layout until data is fetched
         form_layout = QFormLayout()
         for module in self.modules:
             checkbox = QCheckBox(module, self)
             form_layout.addRow(checkbox)
             self.module_checkboxes[module] = checkbox
         self.layout.addLayout(form_layout)
+
+        # Add permission checkboxes
+        self.permission_label = QLabel("Permissions:", self)
+        self.layout.addWidget(self.permission_label)
+
+        self.extra_perm_checkboxes = {
+            "can_see_other_branches_inventory": QCheckBox("Can View all branch Inventories?", self),
+            "can_delete_products": QCheckBox("Can Delete Products?", self),
+            "can_edit_products": QCheckBox("Can Edit Products?", self),
+            "can_delete_parties": QCheckBox("Can Delete Parties?", self),
+            "can_edit_parties": QCheckBox("Can Edit Parties?", self),
+            "can_delete_employees": QCheckBox("Can Delete Employees?", self),
+            "can_edit_employees": QCheckBox("Can Edit Employees?", self),
+            "can_delete_accounts": QCheckBox("Can Delete Accounts?", self),
+            "can_edit_accounts": QCheckBox("Can Edit Accounts?", self),
+            "can_imp_exp_anything": QCheckBox("Can Import/Export Anything?", self)
+        }
+
+        # Add permission checkboxes to the layout
+        for checkbox in self.extra_perm_checkboxes.values():
+            self.layout.addWidget(checkbox)
 
         # Add the save and cancel buttons
         self.button_box = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, self)
@@ -309,30 +330,41 @@ class AssignModulesDialog(QDialog):
 
         self.layout.addWidget(self.button_box)
 
-        # Fetch allowed modules and then update checkboxes
-        self.fetch_allowed_modules()
+        # Fetch allowed modules and extra permissions
+        self.fetch_user_permissions()
 
-    def fetch_allowed_modules(self):
-        # Fetch the allowed_modules field for the user from Firebase
+    def fetch_user_permissions(self):
+        # Fetch the allowed_modules and extra_perm data for the user from Firestore
         user_ref = db.collection("users").document(self.user_id)
         user_doc = user_ref.get()
         if user_doc.exists:
             allowed_modules = user_doc.to_dict().get("allowed_modules", [])
+            extra_perm = user_doc.to_dict().get("extra_perm", [])
+            
             # Pre-select the checkboxes for allowed modules
             for module in allowed_modules:
                 if module in self.module_checkboxes:
                     self.module_checkboxes[module].setChecked(True)
 
+            # Pre-select the checkboxes for extra_perm permissions
+            for perm in extra_perm:
+                if perm in self.extra_perm_checkboxes:
+                    self.extra_perm_checkboxes[perm].setChecked(True)
+
     def save_modules(self):
-        # Get the selected modules
+        # Get the selected modules and extra permissions
         selected_modules = [
             module for module, checkbox in self.module_checkboxes.items() if checkbox.isChecked()
         ]
-        
-        # Save to Firebase under the user's document in the "allowed_modules" field
+        selected_extra_perm = [
+            perm for perm, checkbox in self.extra_perm_checkboxes.items() if checkbox.isChecked()
+        ]
+
+        # Save to Firebase
         user_ref = db.collection("users").document(self.user_id)
         user_ref.update({
-            "allowed_modules": selected_modules
+            "allowed_modules": selected_modules,
+            "extra_perm": selected_extra_perm  # Save extra permissions
         })
 
         self.accept()
