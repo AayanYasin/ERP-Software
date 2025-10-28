@@ -1,10 +1,125 @@
+# view_users.py  — enhanced UI/UX, clearer permissions screen, centered dialogs
+
 from PyQt5.QtCore import Qt, QAbstractTableModel, QModelIndex, QThread, pyqtSignal
-from PyQt5.QtWidgets import QWidget, QDialog, QTableView, QVBoxLayout, QProgressBar, QHeaderView, QMessageBox, QCheckBox, QFormLayout, QDialogButtonBox, QLabel, QPushButton, QLineEdit, QComboBox, QScrollArea  # <-- Make sure QScrollArea is here
+from PyQt5.QtGui import QFont
+from PyQt5.QtWidgets import (
+    QWidget, QDialog, QTableView, QVBoxLayout, QProgressBar, QHeaderView, QMessageBox,
+    QCheckBox, QFormLayout, QDialogButtonBox, QLabel, QPushButton, QLineEdit, QComboBox,
+    QScrollArea, QHBoxLayout, QFrame, QGroupBox, QApplication, QDesktopWidget
+)
 from firebase.config import db
 from firebase_admin import auth as admin_auth
 
 
-# Firebase data fetching in a separate thread
+# ---------------------------
+# Helpers / Common UI styling
+# ---------------------------
+
+PRIMARY_BTN = """
+QPushButton {
+    background-color: #10B981; color: white; border: none; padding: 10px 16px;
+    border-radius: 8px; font-weight: 600;
+}
+QPushButton:hover { background-color: #0EA371; }
+QPushButton:pressed { background-color: #0C8D62; }
+"""
+
+SECONDARY_BTN = """
+QPushButton {
+    background-color: #6B7280; color: white; border: none; padding: 10px 16px;
+    border-radius: 8px; font-weight: 600;
+}
+QPushButton:hover { background-color: #5B616D; }
+QPushButton:pressed { background-color: #4B505B; }
+"""
+
+INFO_BTN = """
+QPushButton {
+    background-color: #3B82F6; color: white; border: none; padding: 10px 16px;
+    border-radius: 10px; font-weight: 600; font-size: 14px;
+}
+QPushButton:hover { background-color: #2F6EE6; }
+QPushButton:pressed { background-color: #235AC7; }
+"""
+
+WARNING_BTN = """
+QPushButton {
+    background-color: #F59E0B; color: #111827; border: none; padding: 10px 16px;
+    border-radius: 10px; font-weight: 700; font-size: 14px;
+}
+QPushButton:hover { background-color: #DB8B08; }
+QPushButton:pressed { background-color: #B87406; color: white; }
+"""
+
+ACCENT_BTN = """
+QPushButton {
+    background-color: #8B5CF6; color: white; border: none; padding: 10px 16px;
+    border-radius: 10px; font-weight: 700; font-size: 14px;
+}
+QPushButton:hover { background-color: #7A48F3; }
+QPushButton:pressed { background-color: #6A3FE0; }
+"""
+
+SECTION_LABEL = """
+QLabel {
+    font-size: 16px; font-weight: 700; color: #111827;
+}
+"""
+
+SUBTLE_LABEL = """
+QLabel {
+    font-size: 13px; color: #374151;
+}
+"""
+
+CHECKBOX_BIG = """
+QCheckBox {
+    font-size: 14px;
+}
+"""
+
+TABLE_STYLE = """
+QTableView {
+    border: 1px solid #E5E7EB;
+    background: #FFFFFF;
+    gridline-color: #E5E7EB;
+    selection-background-color: #DBEAFE;
+    selection-color: #111827;
+}
+QHeaderView::section {
+    background-color: #F3F4F6;
+    color: #111827;
+    padding: 8px;
+    border: 1px solid #E5E7EB;
+    font-weight: 600;
+}
+"""
+
+CARD_STYLE = """
+QDialog {
+    background: #FFFFFF;
+}
+"""
+
+def hline():
+    line = QFrame()
+    line.setFrameShape(QFrame.HLine)
+    line.setFrameShadow(QFrame.Sunken)
+    line.setStyleSheet("color: #E5E7EB;")
+    return line
+
+def center_on_screen(widget: QDialog):
+    # Center without shrinking the window size chosen via resize()/setGeometry()
+    frame_geom = widget.frameGeometry()
+    center_point = QDesktopWidget().availableGeometry(widget).center()
+    frame_geom.moveCenter(center_point)
+    widget.move(frame_geom.topLeft())
+
+
+# ---------------------------
+# Firebase data fetching
+# ---------------------------
+
 class ViewUsersThread(QThread):
     users_fetched = pyqtSignal(list)
     error_occurred = pyqtSignal(str)
@@ -18,7 +133,7 @@ class ViewUsersThread(QThread):
         try:
             users_ref = db.collection("users")
             # Exclude users with the role "admin"
-            query = users_ref.where("role", "!=" , "admin").limit(self.page_size)
+            query = users_ref.where("role", "!=", "admin").limit(self.page_size)
             if self.start_after:
                 query = query.start_after(self.start_after)
 
@@ -44,36 +159,59 @@ class ViewUsersThread(QThread):
             self.error_occurred.emit(str(e))
 
 
-# ViewUsersModule to show users and handle module assignment
+# ---------------------------
+# Users Window
+# ---------------------------
+
 class ViewUsersModule(QDialog):
     def __init__(self, user_data, parent=None):
         super().__init__(parent)
         self.user_data = user_data
         self.setWindowTitle("User Management (Admin Only)")
-        self.setGeometry(100, 100, 800, 600)
-        self.layout = QVBoxLayout(self)
+        self.resize(1200, 750)
+        self.setStyleSheet(CARD_STYLE)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(12)
+
+        header = QLabel("Manage Users")
+        header.setStyleSheet(SECTION_LABEL)
+        root.addWidget(header)
+
+        sub = QLabel("Double-click a row to open actions.")
+        sub.setStyleSheet(SUBTLE_LABEL)
+        root.addWidget(sub)
 
         # Progress bar for loading
         self.progress = QProgressBar(self)
         self.progress.setRange(0, 0)  # Infinite progress
-        self.layout.addWidget(self.progress)
+        root.addWidget(self.progress)
 
         # Table for displaying users
         self.table = QTableView(self)
-        self.layout.addWidget(self.table)
+        self.table.setStyleSheet(TABLE_STYLE)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QTableView.SelectRows)
+        self.table.setEditTriggers(QTableView.NoEditTriggers)
+        root.addWidget(self.table)
+
         self.model = UserTableModel([], self)
         self.table.setModel(self.model)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        header_view = self.table.horizontalHeader()
+        header_view.setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSortingEnabled(True)
 
-        # Double-click event to open AssignModulesDialog or options
+        # Double-click event to open options
         self.table.doubleClicked.connect(self.show_user_options)
 
-        # Initialize and start the background thread to fetch users
+        # Thread to fetch users
         self.thread = ViewUsersThread()
         self.thread.users_fetched.connect(self.update_table)
         self.thread.error_occurred.connect(self.show_error)
         self.thread.start()
+
+        center_on_screen(self)
 
     @staticmethod
     def show_if_admin(user_data):
@@ -86,47 +224,49 @@ class ViewUsersModule(QDialog):
 
     def show_user_options(self, index):
         user_id = self.model.users[index.row()]["user_id"]
-        # Pass only the necessary data (like user_id and user_data) to the dialog
         dialog = UserOptionsDialog(user_id, self.user_data, self)
         dialog.exec_()
-        
+
     def update_table(self, users):
-        # Add users to the model and stop the progress bar
         self.model.add_users(users)
-        self.progress.setRange(0, 1)  # Stop progress (done)
-        self.progress.setValue(1)  # Mark as completed
+        self.progress.setRange(0, 1)
+        self.progress.setValue(1)
 
     def show_error(self, error_message):
         QMessageBox.critical(self, "Error", f"Failed to fetch users: {error_message}")
-        self.progress.setRange(0, 1)  # Stop progress
-        self.progress.setValue(1)  # Mark as completed
+        self.progress.setRange(0, 1)
+        self.progress.setValue(1)
 
 
-# UserTableModel to manage the table data
 class UserTableModel(QAbstractTableModel):
     def __init__(self, data, parent=None):
         super().__init__(parent)
         self.users = data
+        self.headers = ["User ID", "Name", "Email", "Role"]
 
     def rowCount(self, parent=QModelIndex()):
         return len(self.users)
 
     def columnCount(self, parent=QModelIndex()):
-        return 4  # user_id, name, email, role
+        return 4
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            return self.headers[section]
+        return super().headerData(section, orientation, role)
 
     def data(self, index, role=Qt.DisplayRole):
         if role == Qt.DisplayRole:
             user = self.users[index.row()]
-            column = index.column()
-            if column == 0:
+            col = index.column()
+            if col == 0:
                 return user["user_id"]
-            elif column == 1:
+            elif col == 1:
                 return user["name"]
-            elif column == 2:
+            elif col == 2:
                 return user["email"]
-            elif column == 3:
+            elif col == 3:
                 return user["role"]
-
         return None
 
     def add_users(self, users):
@@ -139,32 +279,53 @@ class UserTableModel(QAbstractTableModel):
         self.layoutChanged.emit()
 
 
-# Dialog for user options (Edit User, Edit Permissions, Reset Password)
+# ---------------------------
+# Options Dialog
+# ---------------------------
+
 class UserOptionsDialog(QDialog):
     def __init__(self, user_id, admin_user_data, parent=None):
         super().__init__(parent)
         self.user_id = user_id
-        self.admin_user_data = admin_user_data  # admin's complete data (role, email, branch, etc.)
+        self.admin_user_data = admin_user_data
         self.setWindowTitle("Choose an Action")
-        self.setGeometry(150, 150, 400, 200)
-        self.layout = QVBoxLayout(self)
+        self.resize(480, 240)
+        self.setStyleSheet(CARD_STYLE)
 
-        # Options for the admin
-        self.edit_user_btn = QPushButton("Edit User", self)
-        self.edit_permissions_btn = QPushButton("Edit Permissions", self)
-        self.send_reset_btn = QPushButton("Send Reset Password Link", self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(14)
 
-        self.layout.addWidget(self.edit_user_btn)
-        self.layout.addWidget(self.edit_permissions_btn)
-        self.layout.addWidget(self.send_reset_btn)
+        title = QLabel("What would you like to do?")
+        title.setStyleSheet(SECTION_LABEL)
+        root.addWidget(title)
+        root.addWidget(hline())
 
+        # Big, colorful buttons in a row
+        row1 = QHBoxLayout()
+        self.edit_user_btn = QPushButton("Edit User")
+        self.edit_user_btn.setStyleSheet(INFO_BTN)
+        row1.addWidget(self.edit_user_btn)
+
+        self.edit_permissions_btn = QPushButton("Edit Permissions")
+        self.edit_permissions_btn.setStyleSheet(WARNING_BTN)
+        row1.addWidget(self.edit_permissions_btn)
+
+        self.send_reset_btn = QPushButton("Send Reset Password Link")
+        self.send_reset_btn.setStyleSheet(ACCENT_BTN)
+        row1.addWidget(self.send_reset_btn)
+
+        root.addLayout(row1)
+
+        # Wire up actions
         self.edit_user_btn.clicked.connect(self.edit_user)
         self.edit_permissions_btn.clicked.connect(self.edit_permissions)
         self.send_reset_btn.clicked.connect(self.send_reset_password)
 
+        center_on_screen(self)
+
     def edit_user(self):
-        # Now, pass the necessary data (like user_id and admin_user_data) to EditUserDialog
-        dialog = EditUserDialog(self.user_id, self.admin_user_data, self)  # Pass entire admin data
+        dialog = EditUserDialog(self.user_id, self.admin_user_data, self)
         dialog.exec_()
 
     def edit_permissions(self):
@@ -173,74 +334,99 @@ class UserOptionsDialog(QDialog):
 
     def send_reset_password(self):
         try:
-            # Send a reset password link using Firebase
             user = admin_auth.get_user(self.user_id)
             link = admin_auth.generate_password_reset_link(user.email)
-            # Send the reset link to the user's email
+            # NOTE: You may want to email 'link' yourself; here we just notify success.
             QMessageBox.information(self, "Password Reset", f"A password reset link has been sent to {user.email}.")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to send reset link: {str(e)}")
-
         self.accept()
 
-# Dialog for editing user details
+
+# ---------------------------
+# Edit User Dialog
+# ---------------------------
+
 class EditUserDialog(QDialog):
     def __init__(self, user_id, admin_user_data, parent=None):
         super().__init__(parent)
         self.user_id = user_id
-        self.admin_user_data = admin_user_data  # Store the complete admin data here
+        self.admin_user_data = admin_user_data
         self.setWindowTitle("Edit User")
-        self.setGeometry(150, 150, 400, 300)
-        self.layout = QVBoxLayout(self)
+        self.resize(520, 520)
+        self.setStyleSheet(CARD_STYLE + CHECKBOX_BIG)
 
-        # Form for editing user details
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(12)
+
+        header = QLabel("Edit User Details")
+        header.setStyleSheet(SECTION_LABEL)
+        root.addWidget(header)
+        root.addWidget(hline())
+
+        form_box = QGroupBox()
+        form_box.setTitle("Basic Info")
+        form_layout = QFormLayout(form_box)
+        form_layout.setLabelAlignment(Qt.AlignLeft)
+        form_layout.setFormAlignment(Qt.AlignTop)
+        form_layout.setHorizontalSpacing(14)
+        form_layout.setVerticalSpacing(10)
+
         self.name_input = QLineEdit(self)
         self.role_dropdown = QComboBox(self)
-
-        self.layout.addWidget(QLabel("Name:"))
-        self.layout.addWidget(self.name_input)
-        self.layout.addWidget(QLabel("Role:"))
-        self.layout.addWidget(self.role_dropdown)
-
-        # Populate role dropdown
         self.role_dropdown.addItems(["Admin", "Branch Manager", "Accountant", "Inventory Manager", "Viewer"])
+        form_layout.addRow(QLabel("Name:"), self.name_input)
+        form_layout.addRow(QLabel("Role:"), self.role_dropdown)
 
-        # Branches
-        self.branch_label = QLabel("Assign Branches:")
-        self.layout.addWidget(self.branch_label)
+        root.addWidget(form_box)
+        root.addWidget(hline())
+
+        # Branches section
+        branches_box = QGroupBox()
+        branches_box.setTitle("Assign Branches")
+        branches_layout = QVBoxLayout(branches_box)
 
         self.branch_checkboxes = {}
-        self.scroll_area = QScrollArea()  # Add a scrollable area for branches
+        self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_widget = QWidget()  # This will hold all the checkboxes
+        self.scroll_widget = QWidget()
         self.scroll_layout = QVBoxLayout(self.scroll_widget)
+        self.scroll_layout.setSpacing(6)
+        self.scroll_layout.setContentsMargins(6, 6, 6, 6)
 
         self.scroll_area.setWidget(self.scroll_widget)
-        self.layout.addWidget(self.scroll_area)
+        branches_layout.addWidget(self.scroll_area)
+        root.addWidget(branches_box)
 
-        # Fetch the admin's branches and display them
+        # Buttons
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        save_btn = QPushButton("Save Changes", self)
+        save_btn.setStyleSheet(PRIMARY_BTN)
+        cancel_btn = QPushButton("Cancel", self)
+        cancel_btn.setStyleSheet(SECONDARY_BTN)
+        btns.addWidget(cancel_btn)
+        btns.addWidget(save_btn)
+        root.addLayout(btns)
+
+        cancel_btn.clicked.connect(self.reject)
+        save_btn.clicked.connect(self.save_changes)
+
+        # Populate UI
         self.fetch_admin_branches()
-
-        # Save button
-        self.save_btn = QPushButton("Save Changes", self)
-        self.save_btn.clicked.connect(self.save_changes)
-        self.layout.addWidget(self.save_btn)
-
-        # Load current user data (name, role, branches)
         self.load_user_data()
 
+        center_on_screen(self)
+
     def fetch_admin_branches(self):
-        # Get the admin user's branches from their document
         admin_branches = self.admin_user_data.get("branch", [])
-        
-        # Create checkboxes for the admin's branches
         for branch_name in admin_branches:
             checkbox = QCheckBox(branch_name, self)
             self.branch_checkboxes[branch_name] = checkbox
-            self.scroll_layout.addWidget(checkbox)  # Add to the scrollable area
+            self.scroll_layout.addWidget(checkbox)
 
     def load_user_data(self):
-        # Fetch user data from Firebase (load name, role, branches)
         user_ref = db.collection("users").document(self.user_id)
         user_doc = user_ref.get()
         if user_doc.exists:
@@ -248,123 +434,162 @@ class EditUserDialog(QDialog):
             self.name_input.setText(user_data.get("name", ""))
             self.role_dropdown.setCurrentText(user_data.get("role", "Viewer"))
 
-            # Pre-check the branches the user is assigned to (if any)
             assigned_branches = user_data.get("branch", [])
             for branch_name in assigned_branches:
                 if branch_name in self.branch_checkboxes:
                     self.branch_checkboxes[branch_name].setChecked(True)
 
     def save_changes(self):
-        name = self.name_input.text()
+        name = self.name_input.text().strip()
         role = self.role_dropdown.currentText()
+        selected_branches = [b for b, cb in self.branch_checkboxes.items() if cb.isChecked()]
 
-        # Get the selected branches
-        selected_branches = [
-            branch_name for branch_name, checkbox in self.branch_checkboxes.items() if checkbox.isChecked()
-        ]
-
-        # Save the updated user details to Firebase
         user_ref = db.collection("users").document(self.user_id)
         user_ref.update({
             "name": name,
             "role": role,
-            "branch": selected_branches  # Save selected branches
+            "branch": selected_branches
         })
 
         QMessageBox.information(self, "Success", "User details updated successfully!")
         self.accept()
 
-# Dialog for Assigning Modules to Users (same as before)
+
+# ---------------------------
+# Assign Modules / Permissions (Enhanced)
+# ---------------------------
+
 class AssignModulesDialog(QDialog):
     def __init__(self, user_id, parent=None):
         super().__init__(parent)
         self.user_id = user_id
-        self.setWindowTitle("Assign Modules to User")
-        self.setGeometry(100, 100, 400, 300)
+        self.setWindowTitle("Edit Permissions")
+        self.resize(720, 700)
+        self.setStyleSheet(CARD_STYLE + CHECKBOX_BIG)
 
-        self.layout = QVBoxLayout(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(12)
 
-        self.label = QLabel("Select Modules to Assign:", self)
-        self.layout.addWidget(self.label)
+        header = QLabel("Edit Permissions")
+        header.setStyleSheet(SECTION_LABEL)
+        root.addWidget(header)
+        root.addWidget(hline())
 
+        # ===== Allowed Modules Section =====
+        modules_box = QGroupBox("Allowed Modules")
+        modules_layout = QVBoxLayout(modules_box)
+        modules_layout.setSpacing(8)
+
+        info = QLabel("Select the modules this user can access.")
+        info.setStyleSheet(SUBTLE_LABEL)
+        modules_layout.addWidget(info)
+
+        # Scrollable area for many modules
         self.module_checkboxes = {}
         self.modules = [
-            "Manage / View Parties", "Manage / View Employees", "Chart Of Accounts", "Journal", 
-            "Invoice", "View Invoices", "Purchase Order", "Chart of Inventory", "View Inventory", 
+            "Manage / View Parties", "Manage / View Employees", "Chart of Accounts", "Journal",
+            "Invoice", "View Invoice", "Purchase Order", "Chart of Inventory", "View Inventory",
             "Delivery Chalan", "Create Manufacturing Order", "View Manufacturing Order"
         ]
 
-        # Create checkboxes for modules first but don't add them to layout until data is fetched
-        form_layout = QFormLayout()
-        for module in self.modules:
-            checkbox = QCheckBox(module, self)
-            form_layout.addRow(checkbox)
-            self.module_checkboxes[module] = checkbox
-        self.layout.addLayout(form_layout)
+        mod_scroll = QScrollArea()
+        mod_scroll.setWidgetResizable(True)
+        mod_container = QWidget()
+        mod_v = QVBoxLayout(mod_container)
+        mod_v.setSpacing(6)
+        mod_v.setContentsMargins(6, 6, 6, 6)
 
-        # Add permission checkboxes
-        self.permission_label = QLabel("Permissions:", self)
-        self.layout.addWidget(self.permission_label)
+        for module in self.modules:
+            cb = QCheckBox(module, self)
+            self.module_checkboxes[module] = cb
+            mod_v.addWidget(cb)
+
+        mod_v.addStretch(1)
+        mod_scroll.setWidget(mod_container)
+        modules_layout.addWidget(mod_scroll)
+
+        root.addWidget(modules_box)
+        root.addWidget(hline())
+
+        # ===== Extra Permissions Section =====
+        perm_box = QGroupBox("Extra Permissions")
+        perm_layout = QVBoxLayout(perm_box)
+        perm_layout.setSpacing(8)
+
+        perm_info = QLabel("Grant special permissions beyond the selected modules.")
+        perm_info.setStyleSheet(SUBTLE_LABEL)
+        perm_layout.addWidget(perm_info)
 
         self.extra_perm_checkboxes = {
-            "can_see_other_branches_inventory": QCheckBox("Can View all branch Inventories?", self),
-            "can_delete_products": QCheckBox("Can Delete Products?", self),
-            "can_edit_products": QCheckBox("Can Edit Products?", self),
-            # "can_delete_parties": QCheckBox("Can Delete Parties?", self),
-            # "can_edit_parties": QCheckBox("Can Edit Parties?", self),
-            # "can_delete_employees": QCheckBox("Can Delete Employees?", self),
-            # "can_edit_employees": QCheckBox("Can Edit Employees?", self),
-            # "can_delete_accounts": QCheckBox("Can Delete Accounts?", self),
-            # "can_edit_accounts": QCheckBox("Can Edit Accounts?", self),
-            "can_imp_exp_anything": QCheckBox("Can Import/Export Anything?", self)
+            "can_see_other_branches_inventory": QCheckBox("Can View all branch Inventories?"),
+            "can_delete_products": QCheckBox("Can Delete Products?"),
+            "can_edit_products": QCheckBox("Can Edit Products?"),
+            "can_see_other_branches_journals": QCheckBox("Can View all branch Journals?"),
+            "can_imp_exp_anything": QCheckBox("Can Import/Export Anything?")
         }
 
-        # Add permission checkboxes to the layout
-        for checkbox in self.extra_perm_checkboxes.values():
-            self.layout.addWidget(checkbox)
+        perm_scroll = QScrollArea()
+        perm_scroll.setWidgetResizable(True)
+        perm_container = QWidget()
+        perm_v = QVBoxLayout(perm_container)
+        perm_v.setSpacing(6)
+        perm_v.setContentsMargins(6, 6, 6, 6)
 
-        # Add the save and cancel buttons
-        self.button_box = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, self)
-        self.button_box.accepted.connect(self.save_modules)
-        self.button_box.rejected.connect(self.reject)
+        for cb in self.extra_perm_checkboxes.values():
+            perm_v.addWidget(cb)
 
-        self.layout.addWidget(self.button_box)
+        perm_v.addStretch(1)
+        perm_scroll.setWidget(perm_container)
+        perm_layout.addWidget(perm_scroll)
 
-        # Fetch allowed modules and extra permissions
+        root.addWidget(perm_box)
+
+        # ===== Action Buttons =====
+        root.addWidget(hline())
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet(SECONDARY_BTN)
+        save_btn = QPushButton("Save")
+        save_btn.setStyleSheet(PRIMARY_BTN)
+        btns.addWidget(cancel_btn)
+        btns.addWidget(save_btn)
+        root.addLayout(btns)
+
+        cancel_btn.clicked.connect(self.reject)
+        save_btn.clicked.connect(self.save_modules)
+
+        # Preload current settings
         self.fetch_user_permissions()
 
+        center_on_screen(self)
+
     def fetch_user_permissions(self):
-        # Fetch the allowed_modules and extra_perm data for the user from Firestore
         user_ref = db.collection("users").document(self.user_id)
         user_doc = user_ref.get()
         if user_doc.exists:
-            allowed_modules = user_doc.to_dict().get("allowed_modules", [])
-            extra_perm = user_doc.to_dict().get("extra_perm", [])
-            
-            # Pre-select the checkboxes for allowed modules
+            data = user_doc.to_dict()
+            allowed_modules = data.get("allowed_modules", [])
+            extra_perm = data.get("extra_perm", [])
+
             for module in allowed_modules:
                 if module in self.module_checkboxes:
                     self.module_checkboxes[module].setChecked(True)
 
-            # Pre-select the checkboxes for extra_perm permissions
             for perm in extra_perm:
                 if perm in self.extra_perm_checkboxes:
                     self.extra_perm_checkboxes[perm].setChecked(True)
 
     def save_modules(self):
-        # Get the selected modules and extra permissions
-        selected_modules = [
-            module for module, checkbox in self.module_checkboxes.items() if checkbox.isChecked()
-        ]
-        selected_extra_perm = [
-            perm for perm, checkbox in self.extra_perm_checkboxes.items() if checkbox.isChecked()
-        ]
+        selected_modules = [m for m, cb in self.module_checkboxes.items() if cb.isChecked()]
+        selected_extra_perm = [k for k, cb in self.extra_perm_checkboxes.items() if cb.isChecked()]
 
-        # Save to Firebase
         user_ref = db.collection("users").document(self.user_id)
         user_ref.update({
             "allowed_modules": selected_modules,
-            "extra_perm": selected_extra_perm  # Save extra permissions
+            "extra_perm": selected_extra_perm
         })
 
+        QMessageBox.information(self, "Saved", "Permissions updated successfully.")
         self.accept()

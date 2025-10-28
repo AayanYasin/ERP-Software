@@ -1,5 +1,5 @@
 # =============================
-# clients_master.py — Parties (Customers/Suppliers)
+# clients_master.py — Parties (Customers/Vendors)
 # (Business/UI unchanged; only COA fastness added)
 # =============================
 
@@ -213,12 +213,12 @@ class PartyModule(QWidget):
         w1 = QWidget(); l1 = QVBoxLayout(w1); l1.setContentsMargins(0,0,0,0); l1.addWidget(self.table_customers)
         self.tabs.addTab(w1, "Customers")
 
-        self.table_suppliers = self._make_table()
-        w2 = QWidget(); l2 = QVBoxLayout(w2); l2.setContentsMargins(0,0,0,0); l2.addWidget(self.table_suppliers)
-        self.tabs.addTab(w2, "Suppliers")
+        self.table_vendors = self._make_table()
+        w2 = QWidget(); l2 = QVBoxLayout(w2); l2.setContentsMargins(0,0,0,0); l2.addWidget(self.table_vendors)
+        self.tabs.addTab(w2, "Vendors")
 
         self.table_customers.itemDoubleClicked.connect(self._edit_selected_party)
-        self.table_suppliers.itemDoubleClicked.connect(self._edit_selected_party)
+        self.table_vendors.itemDoubleClicked.connect(self._edit_selected_party)
 
         self.tabs.currentChanged.connect(self._apply_filter_to_current_tab)
         root.addWidget(self.tabs, stretch=1)
@@ -242,7 +242,7 @@ class PartyModule(QWidget):
         return t
 
     def _current_table(self):
-        return self.table_customers if self.tabs.currentIndex() == 0 else self.table_suppliers
+        return self.table_customers if self.tabs.currentIndex() == 0 else self.table_vendors
 
     # ---------- Data load (FASTNESS APPLIED, UI/logic preserved) ----------
     def load_parties(self):
@@ -258,7 +258,7 @@ class PartyModule(QWidget):
         self._progress.show()
 
         self.table_customers.setSortingEnabled(False)
-        self.table_suppliers.setSortingEnabled(False)
+        self.table_vendors.setSortingEnabled(False)
 
         self._loader = _PartiesLoader()
         self._loader.loaded.connect(self._on_parties_loaded)
@@ -274,18 +274,18 @@ class PartyModule(QWidget):
             try: self._progress.close()
             except Exception: pass
             self.table_customers.setSortingEnabled(True)
-            self.table_suppliers.setSortingEnabled(True)
+            self.table_vendors.setSortingEnabled(True)
 
     def _on_parties_failed(self, msg):
         try: self._progress.close()
         except Exception: pass
         # Keep whatever is on screen (cached or empty); inform only if nothing painted
-        if not (self.table_customers.rowCount() or self.table_suppliers.rowCount()):
+        if not (self.table_customers.rowCount() or self.table_vendors.rowCount()):
             QMessageBox.warning(self, "Load failed", msg)
 
     # <<< fastness: extracted painter that preserves your exact row layout >>>
     def _paint_parties(self, rows):
-        for t in (self.table_customers, self.table_suppliers):
+        for t in (self.table_customers, self.table_vendors):
             t.clearContents()
             t.setRowCount(0)
 
@@ -334,15 +334,15 @@ class PartyModule(QWidget):
             balance_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
             goes_customers = ptype_lc in ("customer", "both")
-            goes_suppliers = ptype_lc in ("supplier", "both")
+            goes_vendors = ptype_lc in ("vendor", "both")
 
             if goes_customers:
                 self._append_row(self.table_customers,
                                  name_item, type_item, contact_item, phone_item,
                                  branches_item, status_item, balance_item)
 
-            if goes_suppliers:
-                self._append_row(self.table_suppliers,
+            if goes_vendors:
+                self._append_row(self.table_vendors,
                                  name_item.clone(), type_item.clone(), contact_item.clone(), phone_item.clone(),
                                  branches_item.clone(), status_item.clone(), balance_item.clone())
 
@@ -388,7 +388,7 @@ class PartyModule(QWidget):
     def _update_row_count_label(self):
         table = self._current_table()
         visible = sum(not table.isRowHidden(r) for r in range(table.rowCount()))
-        noun = "customers" if self.tabs.currentIndex() == 0 else "suppliers"
+        noun = "customers" if self.tabs.currentIndex() == 0 else "vendors"
         self.count_lbl.setText(f"Total: {visible} {noun}")
 
     def _apply_filter_to_current_tab(self):
@@ -410,7 +410,7 @@ class PartyModule(QWidget):
 
     # ---------- Export (UNCHANGED) ----------
     def _export_csv_current_tab(self):
-        if _is_admin_user(self.user_data):
+        if _is_admin_user(self.user_data) or "can_imp_exp_anything" in self.user_data.get("extra_perm", []):
             try:
                 table = self._current_table()
                 desktop = os.path.join(os.path.expanduser("~"), "Desktop")
@@ -527,9 +527,9 @@ class PartyDialog(QDialog):
         self.edt_code.setToolTip("Assigned automatically when you save a new party.")
 
         self.cmb_type = QComboBox()
-        self.cmb_type.addItems(["Customer", "Supplier"])
+        self.cmb_type.addItems(["Customer", "Vendor"])
         t = (self.existing_data.get("type") or "").strip().lower()
-        idx = {"customer":0,"supplier":1,"both":2}.get(t, 0)
+        idx = {"customer":0,"vendor":1,"both":2}.get(t, 0)
         self.cmb_type.setCurrentIndex(idx)
 
         self.edt_contact = QLineEdit(self.existing_data.get("contact_person", "") or "")
@@ -569,7 +569,7 @@ class PartyDialog(QDialog):
             party_type = self.cmb_type.currentText()
             if party_type == "Customer":
                 self.cmb_opening_type.setCurrentIndex(0)
-            elif party_type == "Supplier":
+            elif party_type == "Vendor":
                 self.cmb_opening_type.setCurrentIndex(1)
         self.cmb_type.currentIndexChanged.connect(_sync_opening_type)
         if not self.doc_id and not self.existing_data.get("opening_type"):
@@ -947,8 +947,8 @@ class PartyDialog(QDialog):
             ob_amount = 0.0
         drcr_norm = self._normalize_drcr(drcr)
 
-        parent_name = "Clients" if party_type == "Customer" else ("Suppliers" if party_type == "Supplier" else "Clients_Suppliers")
-        parent_slug = "clients_parent" if party_type == "Customer" else ("suppliers_parent" if party_type == "Supplier" else "clients_suppliers_parent")
+        parent_name = "Clients" if party_type == "Customer" else ("Vendors" if party_type == "Vendor" else "Clients_Vendors")
+        parent_slug = "clients_parent" if party_type == "Customer" else ("vendors_parent" if party_type == "Vendor" else "clients_vendors_parent")
         parent_id = ensure_parent_account(parent_name, type_, parent_slug, branches)
 
         computed_balance = ob_amount if drcr_norm == "debit" else -ob_amount

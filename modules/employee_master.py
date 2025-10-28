@@ -338,7 +338,7 @@ class EmployeeModule(QWidget):
 
     # ---------- Export (UNCHANGED) ----------
     def _export_csv_current_tab(self):
-        if _is_admin_user(self.user_data):
+        if _is_admin_user(self.user_data) or "can_imp_exp_anything" in self.user_data.get("extra_perm", []):
             try:
                 table = self._current_table()
                 desktop = os.path.join(os.path.expanduser("~"), "Desktop")
@@ -747,7 +747,7 @@ class EmployeeDialog(QDialog):
         # Collect missing requireds (kept same behavior)
         missing = []
         if not name: missing.append("Name")
-        if not emp_code: missing.append("Code")
+        if self.doc_id and not emp_code: missing.append("Code")
         if not designation: missing.append("Designation")
         if not branch: missing.append("Branch")
         if not contact: missing.append("Contact")
@@ -774,8 +774,8 @@ class EmployeeDialog(QDialog):
 
         if not self.doc_id:
             # NEW employee
-            if not emp_code:
-                emp_code = self._next_employee_code()
+            emp_code = self._next_employee_code()   # always generate (transactional)
+            self.emp_code.setText(emp_code)         # reflect in UI
 
             coa_id = selected_account_id
             coa_name = None
@@ -788,7 +788,7 @@ class EmployeeDialog(QDialog):
                 "contact": contact, "email": self.email.text().strip(), "date_joined": date_joined,
                 "salary_type": salary_type, "salary": salary_val,
                 "status": status, "active": (status.lower() == "active"),
-                "coa_account_id": coa_id
+                "coa_account_id": coa_id, "cnic": self.cnic.text().strip()
             }
             ref = db.collection("employees").document()
             ref.set(doc)
@@ -810,7 +810,7 @@ class EmployeeDialog(QDialog):
             "name": name, "designation": designation, "branch": branch,
             "contact": contact, "email": self.email.text().strip(), "date_joined": date_joined,
             "salary_type": salary_type, "salary": salary_val,
-            "status": status, "active": (status.lower() == "active"),
+            "status": status, "active": (status.lower() == "active"), "cnic": self.cnic.text().strip()
         }
 
         # Allow admin to relink COA if a specific account picked

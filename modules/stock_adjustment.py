@@ -3,7 +3,7 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem, QHeaderView, QMessageBox, QApplication, QProgressDialog, QListWidget, QLineEdit, QListWidgetItem
 )
 from PyQt5.QtGui import QFont
-from PyQt5.QtCore import Qt, QDateTime
+from PyQt5.QtCore import Qt, QDateTime, QTimer
 from firebase.config import db
 
 class StockAdjustment(QWidget):
@@ -30,32 +30,157 @@ class StockAdjustment(QWidget):
 
     def setup_ui(self):
         self.setWindowTitle("📦 Stock Adjustment")
-        self.setStyleSheet("background-color: #f4f6f9;")
-        self.resize(1100, 700)
+        self.resize(1280, 780)
+
+        # --- Global, tasteful styling (bigger controls, rounded corners) ---
+        self.setStyleSheet("""
+            QWidget { background: #f3f5f9; color: #1f2937; font-family: 'Segoe UI', 'Inter', sans-serif; }
+            QLabel { font-size: 15px; }
+            QLineEdit, QComboBox {
+                font-size: 16px; padding: 10px 14px; border-radius: 10px;
+                border: 1px solid #d7dfeb; background: #ffffff;
+            }
+            QComboBox QAbstractItemView {
+                font-size: 15px; padding: 6px; border: 1px solid #d7dfeb; background: #ffffff;
+                selection-background-color: #e6f0ff;
+            }
+            QPushButton {
+                font-size: 16px; padding: 10px 18px; border-radius: 10px; border: none;
+                background: #2563eb; color: #ffffff;
+            }
+            QPushButton:hover { background: #1e40af; }
+            QPushButton:disabled { background: #9ca3af; color: #f8fafc; }
+
+            /* Cards */
+            .card {
+                background: #ffffff; border: 1px solid #e6ecf5; border-radius: 16px;
+            }
+            /* Table header */
+            QHeaderView::section {
+                background: #f8fafc; padding: 10px; font-size: 15px; border: none; border-bottom: 1px solid #e6ecf5;
+            }
+            QTableWidget {
+                background: #ffffff; border: 1px solid #e6ecf5; border-radius: 12px;
+                gridline-color: #edf2f7; font-size: 15px;
+            }
+        """)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(15)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(16)
 
+        # === HEADER CARD ===
+        header_card = QWidget()
+        header_card.setObjectName("header_card")
+        header_card.setStyleSheet("QWidget#header_card { background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #f8fbff, stop:1 #ffffff); border: 1px solid #e6ecf5; border-radius: 16px; }")
+        header_wrap = QVBoxLayout(header_card)
+        header_wrap.setContentsMargins(18, 16, 18, 16)
+        header_wrap.setSpacing(12)
+
+        # Title row
         header_layout = QHBoxLayout()
-        title = QLabel("📦 Stock Adjustment")
-        title.setFont(QFont("Segoe UI", 16, QFont.Bold))
-        title.setStyleSheet("color: #2d3436;")
-        header_layout.addWidget(title)
+        header_layout.setSpacing(12)
 
+        title = QLabel("📦 Stock Adjustment")
+        title.setFont(QFont("Segoe UI", 22, QFont.Bold))
+        title.setStyleSheet("color: #111827;")
+        header_layout.addWidget(title)
         header_layout.addStretch()
 
+        # Item code input + import button (bigger / prettier)
         self.product_id_input = QLineEdit()
-        self.product_id_input.setPlaceholderText("Enter Product ID")
-        self.product_id_input.setFixedWidth(250)
-        header_layout.addWidget(self.product_id_input)
+        self.product_id_input.setPlaceholderText("Enter Product ID (e.g., ABC-001)")
+        self.product_id_input.setFixedWidth(360)
+        self.product_id_input.setMinimumHeight(44)
 
         import_btn = QPushButton("📥 Import Item")
-        import_btn.setStyleSheet("padding: 6px 12px; background-color: #0984e3; color: white; border-radius: 6px;")
+        import_btn.setMinimumHeight(44)
+        import_btn.setStyleSheet("QPushButton { background: #10b981; } QPushButton:hover { background: #059669; }")
         import_btn.clicked.connect(self.import_items)
+
+        header_layout.addWidget(self.product_id_input)
         header_layout.addWidget(import_btn)
 
-        layout.addLayout(header_layout)
+        header_wrap.addLayout(header_layout)
+
+        # === FILTERS CARD ===
+        filters_card = QWidget()
+        filters_card.setObjectName("filters_card")
+        filters_card.setProperty("class", "card")
+        filters_wrap = QHBoxLayout(filters_card)
+        filters_wrap.setContentsMargins(16, 14, 16, 14)
+        filters_wrap.setSpacing(12)
+
+        # Filter widgets — bigger + clear labels
+        # Branch (from current user)
+        lbl_branch = QLabel("Branch")
+        lbl_branch.setStyleSheet("font-weight: 600;")
+        self.branch_filter = QComboBox()
+        self.branch_filter.setMinimumWidth(220)
+        self.branch_filter.setMinimumHeight(44)
+        self.branch_filter.addItem("All Branches")
+        self.branch_filter.addItems(self.branches)
+
+        # Color (meta/colors -> pc_colors)
+        lbl_color = QLabel("Color")
+        lbl_color.setStyleSheet("font-weight: 600;")
+        self.color_filter = QComboBox()
+        self.color_filter.setMinimumWidth(220)
+        self.color_filter.setMinimumHeight(44)
+        self.color_filter.addItem("All Colors")
+        try:
+            colors_doc = db.collection("meta").document("colors").get()
+            if getattr(colors_doc, "exists", False):
+                pc_colors = (colors_doc.to_dict() or {}).get("pc_colors", [])
+                if isinstance(pc_colors, dict):
+                    pc_colors = list(pc_colors.values())
+                elif isinstance(pc_colors, str):
+                    pc_colors = [pc_colors]
+                cleaned = []
+                seen = set()
+                for c in pc_colors or []:
+                    s = str(c).strip()
+                    if s and s not in seen:
+                        seen.add(s); cleaned.append(s)
+                if cleaned:
+                    self.color_filter.addItems(cleaned)
+        except Exception as e:
+            print(f"⚠️ Failed to load pc_colors: {e}")
+
+        # Condition (fixed)
+        lbl_condition = QLabel("Condition")
+        lbl_condition.setStyleSheet("font-weight: 600;")
+        self.condition_filter = QComboBox()
+        self.condition_filter.setMinimumWidth(220)
+        self.condition_filter.setMinimumHeight(44)
+        self.condition_filter.addItem("All Conditions")
+        self.condition_filter.addItems(["New", "Used", "Bad"])
+
+        # Lay out filters (label above control for cleanliness)
+        branch_col = QVBoxLayout(); branch_col.setSpacing(6)
+        branch_col.addWidget(lbl_branch); branch_col.addWidget(self.branch_filter)
+
+        color_col = QVBoxLayout(); color_col.setSpacing(6)
+        color_col.addWidget(lbl_color); color_col.addWidget(self.color_filter)
+
+        cond_col = QVBoxLayout(); cond_col.setSpacing(6)
+        cond_col.addWidget(lbl_condition); cond_col.addWidget(self.condition_filter)
+
+        filters_wrap.addLayout(branch_col)
+        filters_wrap.addLayout(color_col)
+        filters_wrap.addLayout(cond_col)
+        filters_wrap.addStretch(1)
+
+        header_wrap.addWidget(filters_card)
+        layout.addWidget(header_card)
+
+        # === TABLE (larger, comfy) ===
+        table_card = QWidget()
+        table_card.setObjectName("table_card")
+        table_card.setProperty("class", "card")
+        table_wrap = QVBoxLayout(table_card)
+        table_wrap.setContentsMargins(14, 14, 14, 14)
+        table_wrap.setSpacing(12)
 
         self.table = QTableWidget()
         self.table.setColumnCount(5)
@@ -63,22 +188,54 @@ class StockAdjustment(QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSelectionMode(self.table.NoSelection)
-        layout.addWidget(self.table)
+        self.table.setMinimumHeight(420)
+        self.table.setStyleSheet("QTableWidget::item { padding: 10px; }")
 
-        btn_layout = QHBoxLayout()
+        table_wrap.addWidget(self.table)
+        layout.addWidget(table_card)
+
+        # === FOOTER BUTTONS (bigger) ===
+        footer = QWidget()
+        footer.setObjectName("footer")
+        footer.setStyleSheet("QWidget#footer { background: transparent; }")
+        btn_layout = QHBoxLayout(footer)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
         btn_layout.addStretch()
 
         save_btn = QPushButton("💾 Save Adjustments")
-        save_btn.setStyleSheet("padding: 8px 20px; background-color: #2ecc71; color: white; border-radius: 6px;")
+        save_btn.setMinimumHeight(46)
+        save_btn.setStyleSheet("QPushButton { background: #22c55e; } QPushButton:hover { background: #16a34a; }")
         save_btn.clicked.connect(self.save_balances)
 
         view_log_btn = QPushButton("📜 View Log")
-        view_log_btn.setStyleSheet("padding: 8px 20px; background-color: #636e72; color: white; border-radius: 6px;")
+        view_log_btn.setMinimumHeight(46)
+        view_log_btn.setStyleSheet("QPushButton { background: #64748b; } QPushButton:hover { background: #475569; }")
         view_log_btn.clicked.connect(self.view_log)
 
         btn_layout.addWidget(save_btn)
         btn_layout.addWidget(view_log_btn)
-        layout.addLayout(btn_layout)
+        layout.addWidget(footer)
+
+        # === Filter interactions ===
+        self.branch_filter.currentTextChanged.connect(self.apply_filters)
+        self.color_filter.currentTextChanged.connect(self.apply_filters)
+        self.condition_filter.currentTextChanged.connect(self.apply_filters)
+
+
+    def apply_filters(self):
+        branch = self.branch_filter.currentText()
+        color = self.color_filter.currentText()
+        condition = self.condition_filter.currentText()
+
+        for row in range(self.table.rowCount()):
+            show = True
+            if branch != "All Branches" and self.table.item(row, 1).text() != branch:
+                show = False
+            if color != "All Colors" and self.table.item(row, 2).text() != color:
+                show = False
+            if condition != "All Conditions" and self.table.item(row, 3).text() != condition:
+                show = False
+            self.table.setRowHidden(row, not show)
         
     def show_loader(self, parent, title="Please wait...", message="Processing..."):
         loader = QProgressDialog(message, None, 0, 0, parent)

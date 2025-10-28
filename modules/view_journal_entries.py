@@ -200,6 +200,30 @@ class JournalEntryViewer(QWidget):
         QTimer.singleShot(0, self._initial_load)
 
     # ===== Loader helpers =====
+    def _admin_branches_or(self, fallback_branches):
+        """
+        Get branch list from an admin user.
+        Falls back to the provided list if none found / on error.
+        """
+        try:
+            admins = db.collection("users").where("is_admin", "==", True).limit(1).get()
+            if not admins:
+                admins = db.collection("users").where("role", "==", "admin").limit(1).get()
+            if admins:
+                ad = admins[0].to_dict() or {}
+                branches = ad.get("branch", []) or []
+                if isinstance(branches, str):
+                    branches = [branches]
+                # de-dup and drop empties
+                branches = [b for b in {*(branches or [])} if isinstance(b, str) and b.strip()]
+                if branches:
+                    return branches
+        except Exception:
+            pass
+        if isinstance(fallback_branches, str):
+            fallback_branches = [fallback_branches]
+        return fallback_branches or []
+    
     def show_loader(self, text: str):
         try:
             self.loader_label.setText(text)
@@ -510,14 +534,57 @@ class JournalEntryViewer(QWidget):
         self.branch_filter.clear()
         role = self.user_data.get("role", "")
         branches = self.user_data.get("branch", [])
-        if isinstance(branches, str): branches = [branches]
+        if isinstance(branches, str):
+            branches = [branches]
+        branches = [b for b in (branches or []) if b]  # normalize & drop empties
+
+        # NEW: permission flag
+        extra = self.user_data.get("extra_perm", []) or []
+        can_see_others = "can_see_other_branches_journals" in extra
+
         if role == "admin":
+            # Admins: unchanged behavior
             self.branch_filter.addItem("— All Branches —", None)
-            for b in branches: self.branch_filter.addItem(b, b)
-        else:
-            if branches: self.branch_filter.addItem(branches[0], branches[0])
-            else: self.branch_filter.addItem("-", None)
+            for b in branches:
+                self.branch_filter.addItem(b, b)
+            self.branch_filter.setDisabled(False)
+            self.branch_filter.setToolTip("View all or limit to a specific branch")
+            return
+
+        # Non-admins:
+        if can_see_others:
+            # Show ALL admin branches to this non-admin
+            admin_branches = self._admin_branches_or(branches)
+            if not admin_branches:
+                # fallback to current behavior if no admin branches found
+                admin_branches = branches
+
+            self.branch_filter.addItem("— All Branches —", None)
+            for b in admin_branches:
+                self.branch_filter.addItem(b, b)
+            self.branch_filter.setDisabled(False)
+            self.branch_filter.setCurrentIndex(0)
+            self.branch_filter.setToolTip("Viewing admin branches per permission")
+            return
+
+        # (existing logic) Non-admins without permission
+        if not branches:
+            self.branch_filter.addItem("-", None)
             self.branch_filter.setDisabled(True)
+            self.branch_filter.setToolTip("No branch assigned")
+            return
+
+        if len(branches) == 1:
+            self.branch_filter.addItem(branches[0], branches[0])
+            self.branch_filter.setDisabled(True)
+            self.branch_filter.setToolTip("Single assigned branch")
+            return
+
+        for b in branches:
+            self.branch_filter.addItem(b, b)
+        self.branch_filter.setDisabled(False)
+        self.branch_filter.setCurrentIndex(0)
+        self.branch_filter.setToolTip("Select one of your assigned branches")
 
     def load_account_list(self):
         # Offline: use cache and skip network
@@ -586,6 +653,18 @@ class JournalEntryViewer(QWidget):
                 data["_debited_str"], data["_credited_str"] = self._format_lines_by_side(fixed_lines)
 
                 self.entries_cache.append(data)
+                
+            # --- NEW: narrow entries for non-admins with cross-branch permission
+            extra = self.user_data.get("extra_perm", []) or []
+            can_see_others = "can_see_other_branches_journals" in extra
+            if self.user_data.get("role") != "admin" and can_see_others:
+                allowed_branches = set(self._admin_branches_or(self.user_data.get("branch", [])))
+                if allowed_branches:
+                    self.entries_cache = [
+                        e for e in self.entries_cache
+                        if (e.get("_branch") in allowed_branches)
+                    ]
+
 
             # Save a fresh snapshot (including accounts from prior fetch)
             self._save_cache()
@@ -849,117 +928,120 @@ class JournalEntryViewer(QWidget):
             QMessageBox.critical(self, "Error", f"Delete failed: {e}")
 
     def export_to_pdf(self):
-        from reportlab.lib.pagesizes import A4, landscape
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-        from reportlab.lib import colors
-        now_str = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
-        path, _ = QFileDialog.getSaveFileName(self, "Export PDF", f"LedgerExport-{now_str}.pdf", "PDF Files (*.pdf)")
-        if not path: return
-        if not path.lower().endswith(".pdf"): path += ".pdf"
-        try:
-            pdf = SimpleDocTemplate(path, pagesize=landscape(A4), leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
-            elements = []
-            styles = getSampleStyleSheet()
-            title_style = styles["Title"]; title_style.fontSize = 13; title_style.leading = 16
+        if self.user_data.get("role", []) == "admin" or "can_imp_exp_anything" in self.user_data.get("extra_perm", []):
+            from reportlab.lib.pagesizes import A4, landscape
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+            from reportlab.lib import colors
+            now_str = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
+            path, _ = QFileDialog.getSaveFileName(self, "Export PDF", f"LedgerExport-{now_str}.pdf", "PDF Files (*.pdf)")
+            if not path: return
+            if not path.lower().endswith(".pdf"): path += ".pdf"
+            try:
+                pdf = SimpleDocTemplate(path, pagesize=landscape(A4), leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
+                elements = []
+                styles = getSampleStyleSheet()
+                title_style = styles["Title"]; title_style.fontSize = 13; title_style.leading = 16
 
-            wrap_style = ParagraphStyle(
-                "wrap", parent=styles["Normal"], fontName="Helvetica",
-                fontSize=7.5, leading=9.2, wordWrap="CJK"
-            )
-            bold_style = ParagraphStyle("bold", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=7.5, leading=9.2)
-            bold_wrap_style = ParagraphStyle("bold_wrap", parent=wrap_style, fontName="Helvetica-Bold")
+                wrap_style = ParagraphStyle(
+                    "wrap", parent=styles["Normal"], fontName="Helvetica",
+                    fontSize=7.5, leading=9.2, wordWrap="CJK"
+                )
+                bold_style = ParagraphStyle("bold", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=7.5, leading=9.2)
+                bold_wrap_style = ParagraphStyle("bold_wrap", parent=wrap_style, fontName="Helvetica-Bold")
 
-            elements += [
-                Paragraph("Journal Entries", title_style),
-                Paragraph(f"<font size='8.5'>Range: {self.from_date.date().toString('yyyy-MM-dd')} → {self.to_date.date().toString('yyyy-MM-dd')}</font>", styles["Normal"]),
-                Spacer(1,6)
-            ]
-
-            headers = ["Date","Reference","Description","Purpose","Branch","Account","Amount","New Balance"]
-            data = [headers]
-
-            # === build body rows ===
-            for e in self.filtered_entries:
-                desc_p = Paragraph(e.get("_description", "") or "-", wrap_style)
-                line_rows = []
-
-                # Keep online/offline consistency for signs and Opening-Equity handling
-                is_opening = (e.get("meta", {}) or {}).get("kind") == "opening_balance"
-                eq_id = self._opening_equity_id()
-
-                for ln in (e.get("_lines",[]) or []):
-                    name = ln.get("account_name") or "-"
-                    acc_id = ln.get("account_id","")
-                    d = float(ln.get("debit",0) or 0.0)
-                    c = float(ln.get("credit",0) or 0.0)
-                    prev = float(ln.get("balance_before",0) or 0.0)
-
-                    acc_type = self._account_type(acc_id)
-                    is_ob_equity = (acc_id == eq_id) or (name == "Opening Balances Equity")
-
-                    # Prefer cached signed amount (offline), else compute
-                    signed_amt = ln.get("signed_amt")
-                    if signed_amt is None:
-                        signed_amt = self._signed_amount(d, c, acc_type,
-                                                        is_opening=is_opening, is_ob_equity=is_ob_equity)
-
-                    # New balance: base movement except freeze for Opening Balances Equity in opening JEs
-                    net = self._signed_amount(d, c, acc_type)
-                    new_signed = prev if (is_opening and is_ob_equity) else (prev + net)
-
-                    line_rows.append(["","","","","", name, f"{float(signed_amt):,.2f}", f"{new_signed:,.2f}"])
-
-                # entry header row
-                main_row = [
-                    Paragraph(e.get("_date_str","") or "-", bold_style),
-                    Paragraph(e.get("_reference","-") or "-", bold_style),
-                    Paragraph(e.get("_description","") or "-", bold_wrap_style),
-                    Paragraph(e.get("_purpose","-") or "-", bold_style),
-                    Paragraph(e.get("_branch","-") or "-", bold_style),
-                    "—",
-                    "",
-                    "—"
+                elements += [
+                    Paragraph("Journal Entries", title_style),
+                    Paragraph(f"<font size='8.5'>Range: {self.from_date.date().toString('yyyy-MM-dd')} → {self.to_date.date().toString('yyyy-MM-dd')}</font>", styles["Normal"]),
+                    Spacer(1,6)
                 ]
-                data.append(main_row)
-                data.extend(line_rows)
 
-            # === width calc & styling (unchanged aesthetics) ===
-            def maxlen(col):
-                m = 0
-                for r in data[1:]:
-                    v = r[col]
-                    if isinstance(v, Paragraph):
-                        from xml.sax.saxutils import unescape
-                        v = unescape(v.getPlainText())
-                    m = max(m, len(str(v)))
-                return m
+                headers = ["Date","Reference","Description","Purpose","Branch","Account","Amount","New Balance"]
+                data = [headers]
 
-            from reportlab.lib import colors as rlcolors
-            w=[maxlen(0)*0.8, maxlen(1)*0.85, 28, maxlen(3)*0.5, maxlen(4)*0.6, 26, maxlen(6)*0.7, maxlen(7)*0.7]
-            mins=[40,85,120,55,55,140,80,90]; avail=pdf.width; total=sum(max(a,b) for a,b in zip(w,mins))
-            col_widths=[avail*(max(a,b)/total) for a,b in zip(w,mins)]
+                # === build body rows ===
+                for e in self.filtered_entries:
+                    desc_p = Paragraph(e.get("_description", "") or "-", wrap_style)
+                    line_rows = []
 
-            from reportlab.platypus import Table
-            from reportlab.platypus import TableStyle
-            tbl = Table(data, colWidths=col_widths, repeatRows=1)
-            tbl.setStyle(TableStyle([
-                ("BACKGROUND", (0,0), (-1,0), rlcolors.HexColor("#FAFBFC")),
-                ("TEXTCOLOR", (0,0), (-1,0), rlcolors.HexColor("#334E68")),
-                ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-                ("FONTSIZE", (0,0), (-1,0), 9),
-                ("ALIGN", (0,0), (-1,0), "CENTER"),
-                ("BOTTOMPADDING", (0,0), (-1,0), 5),
-                ("FONTNAME", (0,1), (-1,-1), "Helvetica"),
-                ("FONTSIZE", (0,1), (-1,-1), 7.5),
-                ("VALIGN", (0,1), (-1,-1), "TOP"),
-                ("ALIGN", (6,1), (7,-1), "RIGHT"),
-                ("ROWBACKGROUNDS", (0,1), (-1,-1), [rlcolors.whitesmoke, rlcolors.HexColor("#F8FAFC")]),
-                ("GRID", (0,0), (-1,-1), 0.25, rlcolors.HexColor("#E2E8F0")),
-                ("LEFTPADDING", (0,0), (-1,-1), 3), ("RIGHTPADDING", (0,0), (-1,-1), 3),
-                ("TOPPADDING", (0,0), (-1,-1), 2), ("BOTTOMPADDING", (0,0), (-1,-1), 2),
-            ]))
-            pdf.build(elements+[tbl])
-        except Exception as e:
-            QMessageBox.critical(self, "Export Failed", str(e))
+                    # Keep online/offline consistency for signs and Opening-Equity handling
+                    is_opening = (e.get("meta", {}) or {}).get("kind") == "opening_balance"
+                    eq_id = self._opening_equity_id()
+
+                    for ln in (e.get("_lines",[]) or []):
+                        name = ln.get("account_name") or "-"
+                        acc_id = ln.get("account_id","")
+                        d = float(ln.get("debit",0) or 0.0)
+                        c = float(ln.get("credit",0) or 0.0)
+                        prev = float(ln.get("balance_before",0) or 0.0)
+
+                        acc_type = self._account_type(acc_id)
+                        is_ob_equity = (acc_id == eq_id) or (name == "Opening Balances Equity")
+
+                        # Prefer cached signed amount (offline), else compute
+                        signed_amt = ln.get("signed_amt")
+                        if signed_amt is None:
+                            signed_amt = self._signed_amount(d, c, acc_type,
+                                                            is_opening=is_opening, is_ob_equity=is_ob_equity)
+
+                        # New balance: base movement except freeze for Opening Balances Equity in opening JEs
+                        net = self._signed_amount(d, c, acc_type)
+                        new_signed = prev if (is_opening and is_ob_equity) else (prev + net)
+
+                        line_rows.append(["","","","","", name, f"{float(signed_amt):,.2f}", f"{new_signed:,.2f}"])
+
+                    # entry header row
+                    main_row = [
+                        Paragraph(e.get("_date_str","") or "-", bold_style),
+                        Paragraph(e.get("_reference","-") or "-", bold_style),
+                        Paragraph(e.get("_description","") or "-", bold_wrap_style),
+                        Paragraph(e.get("_purpose","-") or "-", bold_style),
+                        Paragraph(e.get("_branch","-") or "-", bold_style),
+                        "—",
+                        "",
+                        "—"
+                    ]
+                    data.append(main_row)
+                    data.extend(line_rows)
+
+                # === width calc & styling (unchanged aesthetics) ===
+                def maxlen(col):
+                    m = 0
+                    for r in data[1:]:
+                        v = r[col]
+                        if isinstance(v, Paragraph):
+                            from xml.sax.saxutils import unescape
+                            v = unescape(v.getPlainText())
+                        m = max(m, len(str(v)))
+                    return m
+
+                from reportlab.lib import colors as rlcolors
+                w=[maxlen(0)*0.8, maxlen(1)*0.85, 28, maxlen(3)*0.5, maxlen(4)*0.6, 26, maxlen(6)*0.7, maxlen(7)*0.7]
+                mins=[40,85,120,55,55,140,80,90]; avail=pdf.width; total=sum(max(a,b) for a,b in zip(w,mins))
+                col_widths=[avail*(max(a,b)/total) for a,b in zip(w,mins)]
+
+                from reportlab.platypus import Table
+                from reportlab.platypus import TableStyle
+                tbl = Table(data, colWidths=col_widths, repeatRows=1)
+                tbl.setStyle(TableStyle([
+                    ("BACKGROUND", (0,0), (-1,0), rlcolors.HexColor("#FAFBFC")),
+                    ("TEXTCOLOR", (0,0), (-1,0), rlcolors.HexColor("#334E68")),
+                    ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0,0), (-1,0), 9),
+                    ("ALIGN", (0,0), (-1,0), "CENTER"),
+                    ("BOTTOMPADDING", (0,0), (-1,0), 5),
+                    ("FONTNAME", (0,1), (-1,-1), "Helvetica"),
+                    ("FONTSIZE", (0,1), (-1,-1), 7.5),
+                    ("VALIGN", (0,1), (-1,-1), "TOP"),
+                    ("ALIGN", (6,1), (7,-1), "RIGHT"),
+                    ("ROWBACKGROUNDS", (0,1), (-1,-1), [rlcolors.whitesmoke, rlcolors.HexColor("#F8FAFC")]),
+                    ("GRID", (0,0), (-1,-1), 0.25, rlcolors.HexColor("#E2E8F0")),
+                    ("LEFTPADDING", (0,0), (-1,-1), 3), ("RIGHTPADDING", (0,0), (-1,-1), 3),
+                    ("TOPPADDING", (0,0), (-1,-1), 2), ("BOTTOMPADDING", (0,0), (-1,-1), 2),
+                ]))
+                pdf.build(elements+[tbl])
+            except Exception as e:
+                QMessageBox.critical(self, "Export Failed", str(e))
+        else:
+            QMessageBox.warning(self, "Not Allowed", "You do not have permission to perform this action.")
 

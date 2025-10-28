@@ -104,7 +104,19 @@ class ViewInventory(QWidget):
         """)
 
         self.current_page = 1
-        self.items_per_page = 10  # Number of grouped products per page
+        self.items_per_page = 50  # was 10 → now 50 per page
+
+        # ----- NEW: filtered list cache + debounce + header cache -----
+        self._filtered_items = []
+        self._filtered_dirty = True
+        from PyQt5.QtCore import QTimer  # ensure import exists at top of file
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(200)  # 200 ms debounce
+        self._refresh_timer.timeout.connect(self.refresh_table)
+
+        self._last_headers = None
+        # --------------------------------------------------------------
 
         layout = QVBoxLayout(self)
         title = QLabel("📊 Inventory Overview")
@@ -113,41 +125,41 @@ class ViewInventory(QWidget):
         title.setStyleSheet("color: #2d3436; margin: 10px 0;")
         layout.addWidget(title)
 
-        # Filters/controls (UNCHANGED UX)
+        # Filters/controls
         header_layout = QHBoxLayout(); header_layout.setSpacing(10)
 
         self.search_input = QLineEdit(); self.search_input.setPlaceholderText("Search by Item Code or Name")
-        self.search_input.setFixedWidth(250); self.search_input.textChanged.connect(self.refresh_table)
+        self.search_input.setFixedWidth(250); self.search_input.textChanged.connect(self.on_filters_changed)
         header_layout.addWidget(QLabel("Search:")); header_layout.addWidget(self.search_input)
         
         self.main_category_filter = QComboBox(); self.main_category_filter.setFixedWidth(180)
         self.main_category_filter.setEditable(False); self.main_category_filter.setInsertPolicy(QComboBox.NoInsert)
-        self.main_category_filter.currentTextChanged.connect(self.refresh_table)
+        self.main_category_filter.currentTextChanged.connect(self.on_filters_changed)
         header_layout.addWidget(QLabel("Main Cat:")); header_layout.addWidget(self.main_category_filter)
 
         self.guage_filter = QComboBox(); self.guage_filter.setFixedWidth(100)
         self.guage_filter.setEditable(True); self.guage_filter.setInsertPolicy(QComboBox.NoInsert)
-        self.guage_filter.setPlaceholderText("Gauge"); self.guage_filter.currentTextChanged.connect(self.refresh_table)
+        self.guage_filter.setPlaceholderText("Gauge"); self.guage_filter.currentTextChanged.connect(self.on_filters_changed)
         header_layout.addWidget(QLabel("Gauge:")); header_layout.addWidget(self.guage_filter)
         
         self.metal_type_filter = QComboBox(); self.metal_type_filter.setFixedWidth(120)
         self.metal_type_filter.setEditable(True); self.metal_type_filter.setInsertPolicy(QComboBox.NoInsert)
-        self.metal_type_filter.setPlaceholderText("Metal Type"); self.metal_type_filter.currentTextChanged.connect(self.refresh_table)
+        self.metal_type_filter.setPlaceholderText("Metal Type"); self.metal_type_filter.currentTextChanged.connect(self.on_filters_changed)
         self.metal_type_filter.setVisible(False)
         self.metal_type_label = QLabel("Metal Type:"); self.metal_type_label.setVisible(False)
         header_layout.addWidget(self.metal_type_label); header_layout.addWidget(self.metal_type_filter)
 
         self.color_filter = QComboBox(); self.color_filter.setFixedWidth(120)
         self.color_filter.setEditable(True); self.color_filter.setInsertPolicy(QComboBox.NoInsert)
-        self.color_filter.setPlaceholderText("Color"); self.color_filter.currentTextChanged.connect(self.refresh_table)
+        self.color_filter.setPlaceholderText("Color"); self.color_filter.currentTextChanged.connect(self.on_color_change)
         header_layout.addWidget(QLabel("Color:")); header_layout.addWidget(self.color_filter)
 
         self.length_filter = QLineEdit(); self.length_filter.setPlaceholderText("Length"); self.length_filter.setFixedWidth(70)
-        self.length_filter.textChanged.connect(self.refresh_table); header_layout.addWidget(QLabel("Length:")); header_layout.addWidget(self.length_filter)
+        self.length_filter.textChanged.connect(self.on_filters_changed); header_layout.addWidget(QLabel("Length:")); header_layout.addWidget(self.length_filter)
         self.width_filter = QLineEdit(); self.width_filter.setPlaceholderText("Width"); self.width_filter.setFixedWidth(70)
-        self.width_filter.textChanged.connect(self.refresh_table); header_layout.addWidget(QLabel("Width:")); header_layout.addWidget(self.width_filter)
+        self.width_filter.textChanged.connect(self.on_filters_changed); header_layout.addWidget(QLabel("Width:")); header_layout.addWidget(self.width_filter)
         self.height_filter = QLineEdit(); self.height_filter.setPlaceholderText("Height"); self.height_filter.setFixedWidth(70)
-        self.height_filter.textChanged.connect(self.refresh_table); header_layout.addWidget(QLabel("Height:")); header_layout.addWidget(self.height_filter)
+        self.height_filter.textChanged.connect(self.on_filters_changed); header_layout.addWidget(QLabel("Height:")); header_layout.addWidget(self.height_filter)
 
         clear_btn = QPushButton("Clear Filters"); clear_btn.clicked.connect(self.clear_filters); header_layout.addWidget(clear_btn)
         
@@ -159,7 +171,7 @@ class ViewInventory(QWidget):
         
         header_layout.addWidget(export_btn)
 
-        # --- OFFLINE BADGE (hidden by default; shown only when offline/cache is used) ---
+        # --- OFFLINE BADGE ---
         self.offline_badge = QLabel("Showing offline inventory")
         self.offline_badge.setVisible(False)
         self.offline_badge.setStyleSheet("""
@@ -170,12 +182,11 @@ class ViewInventory(QWidget):
             }
         """)
         header_layout.addWidget(self.offline_badge)
-        # -------------------------------------------------------------------------------
+        # ----------------------
 
         layout.addLayout(header_layout)
-        self.color_filter.currentTextChanged.connect(self.on_color_change)
 
-        # Table (UNCHANGED UX)
+        # Table
         self.table = QTableWidget()
         headers = ["#", "Item Code", "Name", "Dimensions LWH", "Gauge", "Color", "Condition", "Weight", "Selling Price"] + self.branches
         self.table.setColumnCount(len(headers)); self.table.setHorizontalHeaderLabels(headers)
@@ -185,7 +196,7 @@ class ViewInventory(QWidget):
         self.table.cellClicked.connect(self.toggle_expand_row)
         layout.addWidget(self.table)
 
-        # Pagination (UNCHANGED UX)
+        # Pagination
         pagination_layout = QHBoxLayout()
         self.page_label = QLabel("Page: 1"); self.page_label.setFont(QFont("Segoe UI", 10))
         self.page_spin = QSpinBox(); self.page_spin.setMinimum(1); self.page_spin.setFixedWidth(70)
@@ -200,6 +211,17 @@ class ViewInventory(QWidget):
         # 1) Render cached snapshot instantly (if available), 2) then refresh online in background
         self._render_from_cache_if_any()
         self.reload_async()
+        
+    def on_filters_changed(self, *_):
+        # Mark filtered list dirty and debounce UI refresh
+        self._filtered_dirty = True
+        # When filters change, go back to first page
+        if self.page_spin.value() != 1:
+            self.page_spin.blockSignals(True)
+            self.page_spin.setValue(1)
+            self.page_spin.blockSignals(False)
+        self._refresh_timer.start()
+
 
     # ---------------- Offline cache helpers (no UX change) ----------------
     def show_not_allowed_warning(self):
@@ -302,7 +324,10 @@ class ViewInventory(QWidget):
             cached.get("colors", []),
             cached.get("main_category_names", []),
         )
-        self.page_spin.setMaximum(max(1, (len(self.get_filtered_items()) - 1) // self.items_per_page + 1))
+        # NEW: recompute filtered list once, then paginate
+        self._filtered_dirty = True
+        self._ensure_filtered()
+        self.page_spin.setMaximum(max(1, (len(self._filtered_items) - 1) // self.items_per_page + 1))
         self.refresh_table()
         # if we're explicitly offline, show the badge now
         if self._offline_read_only:
@@ -335,7 +360,11 @@ class ViewInventory(QWidget):
             payload.get("colors", []),
             payload.get("main_category_names", []),
         )
-        self.page_spin.setMaximum(max(1, (len(self.get_filtered_items()) - 1) // self.items_per_page + 1))
+
+        # NEW: recompute filtered list once, then paginate
+        self._filtered_dirty = True
+        self._ensure_filtered()
+        self.page_spin.setMaximum(max(1, (len(self._filtered_items) - 1) // self.items_per_page + 1))
         self.refresh_table()
 
         # we are online; hide badge if it was visible
@@ -391,7 +420,14 @@ class ViewInventory(QWidget):
         self.refresh_table()
         
     def on_color_change(self, _text):
-        self.refresh_table()
+        # keep color-specific behavior (auto-expand happens in refresh_table),
+        # but use the same debounced refresh path
+        self.on_filters_changed()
+        
+    def _ensure_filtered(self):
+        if self._filtered_dirty:
+            self._filtered_items = self.get_filtered_items()
+            self._filtered_dirty = False
 
     def clear_filters(self):
         self.search_input.clear()
@@ -468,54 +504,85 @@ class ViewInventory(QWidget):
         return result
 
     def refresh_table(self):
+        # Prevent recursive signals during rebuild
         self.table.blockSignals(True)
+        self._ensure_filtered()
 
-        filtered = self.get_filtered_items()
+        # Sort filtered items by item_code numerically if possible
+        def sort_key(data):
+            code = str(data.get("item_code", "")).strip()
+            try:
+                return int(code)
+            except ValueError:
+                return code.lower()
+        filtered = sorted(self._filtered_items, key=sort_key)
+
         self.page_spin.setMaximum(max(1, (len(filtered) - 1) // self.items_per_page + 1))
         self.page_label.setText(f"Page: {self.page_spin.value()}")
 
+        # Toggle metal type column based on main category
         main_cat = self.main_category_filter.currentText().strip().lower()
         self.include_metal_type = (main_cat == "raw material")
         self.metal_type_filter.setVisible(self.include_metal_type)
         self.metal_type_label.setVisible(self.include_metal_type)
 
+        # Build headers only if changed
         headers = ["#", "Item Code", "Name", "Dimensions LWH", "Gauge"]
         if self.include_metal_type:
             headers.append("Metal Type")
         headers += ["Color", "Condition", "Weight", "Selling Price"] + self.branches
-        self.table.setColumnCount(len(headers))
-        self.table.setHorizontalHeaderLabels(headers)
+
+        if getattr(self, "_last_headers", None) != headers:
+            self.table.setColumnCount(len(headers))
+            self.table.setHorizontalHeaderLabels(headers)
+            self._last_headers = headers
+
         self.col_index = {header: idx for idx, header in enumerate(headers)}
 
-        self.table.setRowCount(0)
+        # Compute slice
         start = (self.page_spin.value() - 1) * self.items_per_page
         end = start + self.items_per_page
-        display_index = start
+        page_slice = filtered[start:end]
 
+        # Freeze repaints; clear contents fast
+        self.table.setUpdatesEnabled(False)
+        self.table.clearContents()
+        self.table.setRowCount(0)
+
+        display_index = start
         color_filter_text = self.color_filter.currentText().strip().lower()
 
-        for data in filtered[start:end]:
+        for data in page_slice:
             display_index += 1
             item_code = data.get("item_code", "")
             qty_dict = data.get("qty", {})
             is_expanded = item_code in self.expanded_rows
 
+            # If a color filter is active, auto-expand rows that contain that color
             if color_filter_text:
                 match_found = False
                 for branch in self.branches:
                     for color in qty_dict.get(branch, {}):
-                        if color_filter_text in color.strip().lower():
-                            match_found = True; break
-                    if match_found: break
-                if match_found: self.expanded_rows.add(item_code); is_expanded = True
-                else: self.expanded_rows.discard(item_code)
+                        if color_filter_text in (color or "").strip().lower():
+                            match_found = True
+                            break
+                    if match_found:
+                        break
+                if match_found:
+                    self.expanded_rows.add(item_code)
+                    is_expanded = True
+                else:
+                    self.expanded_rows.discard(item_code)
 
             # header row
-            header_row = self.table.rowCount(); self.table.insertRow(header_row)
+            header_row = self.table.rowCount()
+            self.table.insertRow(header_row)
             header_font = QFont("Segoe UI", 10, QFont.Bold)
 
             l = data.get("length", 0); w = data.get("width", 0); h = data.get("height", 0)
-            dims = f"{self.format_unit(l, data.get('length_unit', ''))} x {self.format_unit(w, data.get('width_unit', ''))} x {self.format_unit(h, data.get('height_unit', ''))}"
+            dims = f"{self.format_unit(l, data.get('length_unit', ''))} x " \
+                f"{self.format_unit(w, data.get('width_unit', ''))} x " \
+                f"{self.format_unit(h, data.get('height_unit', ''))}"
             sp = data.get("selling_price", 0)
             weight = f"{data.get('weight', 0)} {data.get('weight_unit', '')}"
 
@@ -525,49 +592,70 @@ class ViewInventory(QWidget):
             header_items += ["—", "—", weight, f"{sp:,.0f}"]
 
             for col, val in enumerate(header_items):
-                item = QTableWidgetItem(val); item.setFont(header_font); item.setBackground(Qt.lightGray)
+                item = QTableWidgetItem(val)
+                item.setFont(header_font)
+                item.setBackground(Qt.lightGray)
                 self.table.setItem(header_row, col, item)
 
+            # totals per branch (header row)
+            first_branch_col = self.col_index["Selling Price"] + 1
             for i, branch in enumerate(self.branches):
                 branch_total = 0
                 branch_data = qty_dict.get(branch, {})
                 for color, condition_data in branch_data.items():
-                    if color_filter_text and color_filter_text not in color.lower():
+                    if color_filter_text and color_filter_text not in (color or "").lower():
                         continue
                     if isinstance(condition_data, dict):
-                        for condition, qty in condition_data.items():
+                        for _condition, qty in condition_data.items():
                             if isinstance(qty, (int, float)):
                                 branch_total += qty
-                item = QTableWidgetItem(str(branch_total)); item.setFont(header_font); item.setBackground(Qt.lightGray)
-                branch_col_start = 9 if not self.include_metal_type else 10
-                self.table.setItem(header_row, branch_col_start + i, item)
+                item = QTableWidgetItem(str(branch_total))
+                item.setFont(header_font)
+                item.setBackground(Qt.lightGray)
+                self.table.setItem(header_row, first_branch_col + i, item)
+
             self.table.setRowHeight(header_row, 30)
 
-            # child rows
+            # child rows (expanded) — skip zero-total rows
             if is_expanded:
                 shown_rows = set()
                 for branch in self.branches:
                     branch_data = qty_dict.get(branch, {})
                     for color, conds in branch_data.items():
-                        if color_filter_text and color_filter_text not in color.lower():
+                        if color_filter_text and color_filter_text not in (color or "").lower():
                             continue
                         if isinstance(conds, dict):
                             for condition in conds:
                                 shown_rows.add((color, condition))
 
                 for color, condition in sorted(shown_rows):
-                    row = self.table.rowCount(); self.table.insertRow(row)
-                    self.table.setItem(row, 0, QTableWidgetItem("")); self.table.setItem(row, 1, QTableWidgetItem(""))
+                    total_across_branches = 0
+                    for b in self.branches:
+                        q = qty_dict.get(b, {}).get(color, {}).get(condition, 0)
+                        if isinstance(q, (int, float)):
+                            total_across_branches += q
+                    if total_across_branches == 0:
+                        continue  # skip zero-only sub item
+
+                    row = self.table.rowCount()
+                    self.table.insertRow(row)
+                    self.table.setItem(row, 0, QTableWidgetItem(""))
+                    self.table.setItem(row, 1, QTableWidgetItem(""))
                     self.table.setItem(row, 2, QTableWidgetItem("↳"))
-                    for col in range(3, 9):
+                    for col in range(3, min(9, self.table.columnCount())):
                         self.table.setItem(row, col, QTableWidgetItem(""))
+
                     self.table.setItem(row, self.col_index["Color"], QTableWidgetItem(color))
                     self.table.setItem(row, self.col_index["Condition"], QTableWidgetItem(condition))
+
                     for i, branch in enumerate(self.branches):
                         qty = qty_dict.get(branch, {}).get(color, {}).get(condition, 0)
-                        branch_col_start = self.col_index["Selling Price"] + 1
-                        self.table.setItem(row, branch_col_start + i, QTableWidgetItem(str(qty)))
+                        self.table.setItem(row, first_branch_col + i, QTableWidgetItem(str(qty)))
+
+        # Re-enable painting & signals
+        self.table.setUpdatesEnabled(True)
         self.table.blockSignals(False)
+
 
     def toggle_expand_row(self, row, col):
         item = self.table.item(row, 1)

@@ -1,7 +1,7 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QListWidget,
     QComboBox, QGridLayout, QMessageBox, QFileDialog, QProgressDialog, QApplication,
-    QDialog, QFormLayout, QDialogButtonBox, QFrame, QSplitter, QSizePolicy
+    QDialog, QFormLayout, QDialogButtonBox, QFrame, QSplitter, QSizePolicy, QCompleter
 )
 from PyQt5.QtCore import Qt, QSize
 from PyQt5.QtWidgets import QScrollArea
@@ -88,6 +88,7 @@ class ProductsPage(QWidget):
         self.selected_sub_id = None
 
         self.setup_ui()
+        self._setup_name_autocomplete()
         self.refresh_categories()
 
     # ================= UI =================
@@ -302,6 +303,15 @@ class ProductsPage(QWidget):
             delete_item_btn = self._btn("Delete", self.delete_item, kind="danger")
 
         actions.addWidget(edit_item_btn)
+        
+        # --- Edit Qty button (admin or permission-based) ---
+        if self.is_admin or "can_edit_popup_qty" in self.user_data.get("extra_perm", []):
+            edit_qty_btn = self._btn("Edit Qty", self.edit_item_qty, kind="subtle")
+        else:
+            edit_qty_btn = self._btn("Edit Qty", self.show_not_allowed_warning, kind="subtle")
+
+        actions.addWidget(edit_qty_btn)
+        
         actions.addWidget(delete_item_btn)
 
         actions.addWidget(self._btn("Clear", self.clear_fields, kind="subtle"))
@@ -311,6 +321,67 @@ class ProductsPage(QWidget):
         self._apply_responsive_layout()
 
     # ================= Helpers (no logic change) =================
+    def _fetch_name_autocomplete_keys(self):
+        """Read the autocomplete source array from meta/product_autocomplete_list.keys."""
+        try:
+            snap = db.collection("meta").document("product_autocomplete_list").get()
+            data = snap.to_dict() or {}
+            keys = data.get("keys", []) or []
+            # normalize to strings and strip
+            return sorted({str(k).strip() for k in keys if str(k).strip()})
+        except Exception as e:
+            print("Autocomplete load error:", e)
+            return []
+
+    def _setup_name_autocomplete(self):
+        """Attach a QCompleter to the Name field using keys from meta."""
+        try:
+            keys = self._fetch_name_autocomplete_keys()
+            name_edit = self.fields.get("name")
+            if not isinstance(name_edit, QLineEdit):
+                return
+            completer = QCompleter(keys, self)
+            completer.setCaseSensitivity(Qt.CaseInsensitive)
+            # show suggestions that contain the substring, not just prefix:
+            try:
+                completer.setFilterMode(Qt.MatchContains)
+            except Exception:
+                pass  # older Qt fallback; prefix matching will still work
+            completer.setCompletionMode(QCompleter.PopupCompletion)
+            name_edit.setCompleter(completer)
+            self._name_completer = completer  # keep a ref to update later
+        except Exception as e:
+            print("Autocomplete setup error:", e)
+
+    def _refresh_name_autocomplete_if_needed(self, new_name: str):
+        """
+        Ensure the new name is in meta/product_autocomplete_list.keys and refresh the completer.
+        Uses a simple read-modify-write to avoid extra deps.
+        """
+        try:
+            new_name = (new_name or "").strip()
+            if not new_name:
+                return
+
+            doc_ref = db.collection("meta").document("product_autocomplete_list")
+            snap = doc_ref.get()
+            data = snap.to_dict() or {}
+            keys = set(data.get("keys", []) or [])
+            # Insert case-sensitively but avoid dupes (normalize compare)
+            if new_name not in keys and new_name.lower() not in {k.lower() for k in keys}:
+                keys.add(new_name)
+                doc_ref.set({"keys": sorted(keys)}, merge=True)
+
+            # Update the attached completer's model
+            if hasattr(self, "_name_completer"):
+                try:
+                    self._name_completer.model().setStringList(sorted(keys))
+                except Exception:
+                    # recreate if model is not a QStringListModel
+                    self._setup_name_autocomplete()
+        except Exception as e:
+            print("Autocomplete update error:", e)
+
     def show_not_allowed_warning(self):
         QMessageBox.warning(self, "Not Allowed", "You do not have permission to perform this action.")
 
@@ -394,16 +465,19 @@ class ProductsPage(QWidget):
         for i, dim in enumerate(["length", "width", "height"]):
             grid.addWidget(QLabel(dim.capitalize() + " Unit:"), i + 2, 2)  # align with length/width/height rows
             unit_cb = QComboBox()
-            unit_cb.addItems(["Ft", "Inch", "mm"])
+            unit_cb.addItems(["Inch", "Ft", "mm"])
             self.unit_fields[dim + "_unit"] = unit_cb
             grid.addWidget(unit_cb, i + 2, 3)
 
         # Weight unit
-        grid.addWidget(QLabel("Weight Unit:"), row - 1, 2)
+        # grid.addWidget(QLabel("Weight Unit:"), row - 1, 2)
+        # Add Calculate Button next to Weight field
         weight_unit_cb = QComboBox()
-        weight_unit_cb.addItems(["g", "kg"])
+        weight_unit_cb.addItems(["kg", "g"])
         self.unit_fields["weight_unit"] = weight_unit_cb
-        grid.addWidget(weight_unit_cb, row - 1, 3)
+        grid.addWidget(weight_unit_cb, row - 1, 2)
+        self.calculate_btn = self._btn("=⚖️", self.open_calculate_dialog, kind="primary")
+        grid.addWidget(self.calculate_btn, row - 1, 3)
 
         # Instructional label
         hint = QLabel("Qty input will be prompted per branch and color when saving.")
@@ -411,6 +485,15 @@ class ProductsPage(QWidget):
         grid.addWidget(hint, row, 0, 1, 4)
 
         return grid
+
+    def convert_to_inch(self, value, unit):
+        """Convert the value to inches if the unit is in mm or ft."""
+        if unit == "Ft":
+            return value * 12  # Convert feet to inches
+        elif unit == "mm":
+            return value * 0.0393701  # Convert mm to inches
+        else:
+            return value  # No conversion for inch
 
     # ================= Responsive helpers =================
     def _apply_responsive_layout(self):
@@ -430,6 +513,89 @@ class ProductsPage(QWidget):
     def resizeEvent(self, event):
         self._apply_responsive_layout()
         super().resizeEvent(event)
+        
+    def open_calculate_dialog(self):
+        # Define Gauge Values in mm
+        gauge_values = {
+            11: 3.0, 12: 2.5, 13: 2.5, 14: 2.0, 16: 1.5, 18: 1.2, 
+            20: 1.0, 22: 0.8, 23: 0.7, 24: 0.6, 26: 0.55, 28: 0.5
+        }
+
+        # Create the dialog box
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select Shelf Type")
+        dialog.setMinimumWidth(300)
+        layout = QVBoxLayout(dialog)
+
+        # Heading Label
+        heading = QLabel("Select Shelf Type to Calculate:")
+        layout.addWidget(heading)
+
+        # Buttons for options
+        plain_shelf_btn = self._btn("Plain Shelf", lambda: self.calculate_weight(3, 3, 1, gauge_values), kind="subtle")
+        deluxe_shelf_btn = self._btn("Deluxe Shelf", lambda: self.calculate_weight(3, 6, 1, gauge_values), kind="subtle")
+        pole_btn = self._btn("Pole", lambda: self.calculate_weight(0, 0, 0, gauge_values), kind="subtle")
+        bracket_btn = self._btn("Bracket", lambda: self.calculate_weight(0, 0, 1, gauge_values), kind="subtle")
+
+        # Add buttons to layout
+        layout.addWidget(plain_shelf_btn)
+        layout.addWidget(deluxe_shelf_btn)
+        layout.addWidget(pole_btn)
+        layout.addWidget(bracket_btn)
+
+        # Execute dialog
+        dialog.exec_()
+        
+    def calculate_weight(self, length_add, width_add, height_add, gauge_values):
+        # Get current item dimensions and gauge value
+        try:
+            length = float(self.fields["length"].text().strip())
+        except ValueError:
+            length = 0.0  # Default to 0 if length is empty or invalid
+
+        try:
+            width = float(self.fields["width"].text().strip())
+        except ValueError:
+            width = 0.0  # Default to 0 if width is empty or invalid
+
+        # Check for empty height field and assign 0 if empty or invalid
+        try:
+            height = float(self.fields["height"].text().strip())
+        except ValueError:
+            height = 0.0  # Default to 0 if height is empty or invalid
+
+        # Get the unit for each dimension (Length, Width, Height)
+        length_unit = self.unit_fields["length_unit"].currentText()
+        width_unit = self.unit_fields["width_unit"].currentText()
+        height_unit = self.unit_fields["height_unit"].currentText()
+
+        # Convert the units to inches if not already in inches
+        length = self.convert_to_inch(length, length_unit)
+        width = self.convert_to_inch(width, width_unit)
+        height = self.convert_to_inch(height, height_unit)
+
+        # Get gauge value from the user input, defaulting to 0 if invalid
+        try:
+            gauge = int(self.fields["gauge"].text().strip())
+        except ValueError:
+            gauge = 0  # Default to 0 if gauge is empty or invalid
+        
+        # Retrieve the gauge value in mm
+        gauge_mm = gauge_values.get(gauge, 0.0)
+
+        # Calculate weight
+        weight = ((length + length_add) * (width + width_add) * (height + height_add) / 144) * 0.729 * gauge_mm
+
+        # Get the weight unit (g or kg)
+        weight_unit = self.unit_fields["weight_unit"].currentText()
+
+        # If weight unit is grams (g), multiply by 1000 to convert to grams
+        if weight_unit == "g":
+            weight *= 1000
+
+        # Set the calculated weight back to the weight field
+        self.fields["weight"].setText(f"{weight:.2f}")
+
 
     # ================= Behavior (unchanged) =================
     def on_main_category_selected(self):
@@ -495,8 +661,8 @@ class ProductsPage(QWidget):
             float(height or 0)
             float(self.fields["weight"].text().strip() or 0)
             int(self.fields["gauge"].text().strip())
-            int(self.fields["selling_price"].text().strip())
-            int(self.fields["reorder_qty"].text().strip())
+            int(self.fields["selling_price"].text().strip() or 0)
+            int(self.fields["reorder_qty"].text().strip() or 100)
             for qty in self.qty_fields.values():
                 int(qty.text().strip() or 0)
         except ValueError:
@@ -630,38 +796,45 @@ class ProductsPage(QWidget):
         if not self.validate_fields():
             loader.close()
             return
+        
+        # Open the quantity input popup and ensure it completes
+        qty = self.get_qty_per_branch_and_color()
+        
+        # Proceed only if the user provides the quantity (i.e., does not cancel)
+        if qty:
+            # Set default selling price if not provided
+            selling_price = int(self.fields["selling_price"].text().strip() or 0)
+            self.fields["selling_price"].setText(str(selling_price))
 
-        # Check again for duplicate item_code
-        new_code = self.fields["item_code"].text().strip() or self.generate_code()
-        duplicate = db.collection("products").where("item_code", "==", new_code).get()
-        if duplicate:
-            QMessageBox.critical(self, "Duplicate Code", f"Item code {new_code} already exists.")
-            loader.close()
-            return
+            # Set item code and check for duplicates
+            new_code = self.fields["item_code"].text().strip() or self.generate_code()
+            # Check for duplicate item code before adding item to Firebase
+            duplicate = db.collection("products").where("item_code", "==", new_code).get()
+            if duplicate:
+                QMessageBox.critical(self, "Duplicate Code", f"Item code {new_code} already exists.")
+                loader.close()
+                return
 
-        # Set the code
-        self.fields["item_code"].setText(new_code)
-        item_data = self.get_item_data()
-        item_data.pop("qty", None)  # Don't set qty yet
+            self.fields["item_code"].setText(new_code)
 
-        # Add item first
-        doc_ref = db.collection("products").add(item_data)[1]
+            # Create item data but do not add it to the database yet
+            item_data = self.get_item_data()
 
-        # Prompt for qty
-        confirm = QMessageBox.question(
-            self,
-            "Add Opening Quantity",
-            "Do you want to define opening quantity for this product?",
-            QMessageBox.Yes | QMessageBox.No
-        )
+            # Add item to the database first (without item code initially)
+            doc_ref = db.collection("products").add(item_data)[1]  # Add item to Firestore
+            
+            # Now that the item is added, update the item code in Firestore
+            doc_ref.update({"item_code": new_code})  # Ensure the item code is updated in Firebase
+            
+            # Now update the qty after the item is confirmed in the database
+            doc_ref.update({"qty": qty})  # Update with the quantity
 
-        if confirm == QMessageBox.Yes:
-            qty = self.get_qty_per_branch_and_color()
-            if qty:
-                doc_ref.update({"qty": qty})
+            # Update the autocomplete list & refresh the completer
+            self._refresh_name_autocomplete_if_needed(item_data.get("name", ""))
 
-        self.refresh_items()
-        self.clear_fields()
+            self.refresh_items()
+            self.clear_fields()
+
         loader.close()
 
     def edit_item(self):
@@ -771,6 +944,7 @@ class ProductsPage(QWidget):
         return increment_code(transaction)
 
     def get_qty_per_branch_and_color(self):
+        """Handle quantity input for each branch using separate pop-ups and navigation."""
         colors = self.fetch_colors()
         conditions = ["New", "Used", "Bad"]
         if not colors:
@@ -778,58 +952,296 @@ class ProductsPage(QWidget):
             return {}
 
         qty_data = {}
+        terminated = {"flag": False}  # mutable flag to break recursion
 
-        for branch in self.branches:
+        def show_branch_popup(branch_index):
+            # If user terminated earlier, stop completely
+            if terminated["flag"]:
+                return
+
+            branch = self.branches[branch_index]
+            input_map = {}
+
             dialog = QDialog(self)
-            dialog.setWindowTitle(f"Enter Qty for {branch}")
+            dialog.setWindowTitle(f"Enter Qty for Branch: {branch}")
             dialog.setMinimumWidth(520)
+            dialog.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
+            dialog.setModal(True)
 
             layout = QVBoxLayout(dialog)
 
+            # ===== Top Row (Heading + Terminate) =====
+            top_row = QHBoxLayout()
             heading = QLabel(f"Branch: {branch}")
             heading.setObjectName("DialogHeading")
-            layout.addWidget(heading)
+            top_row.addWidget(heading)
 
-            form = QFormLayout()
-            form.setHorizontalSpacing(12)
-            form.setVerticalSpacing(8)
-            input_map = {}  # color -> condition -> input
+            terminate_btn = QPushButton("Terminate")
+            terminate_btn.setObjectName("Danger")
+            terminate_btn.setFixedHeight(28)
+            terminate_btn.setStyleSheet("QPushButton { background-color: #fee2e2; color: #b91c1c; border-radius: 6px; padding: 4px 10px; }"
+                                        "QPushButton:hover { background-color: #fecaca; }")
+            top_row.addStretch(1)
+            top_row.addWidget(terminate_btn)
+            layout.addLayout(top_row)
 
+            # ===== Scrollable area =====
+            scroll_area = QScrollArea(dialog)
+            scroll_area.setWidgetResizable(True)
+            form_widget = QWidget()
+            form_layout = QFormLayout(form_widget)
+            form_layout.setHorizontalSpacing(12)
+            form_layout.setVerticalSpacing(8)
+
+            # Input fields
             for color in colors:
                 row = QHBoxLayout()
                 input_map[color] = {}
-
                 for cond in conditions:
                     input_field = QLineEdit()
-                    input_field.setPlaceholderText(f"{cond}: 0")
+                    input_field.setPlaceholderText(cond)
                     input_field.setFixedWidth(90)
                     input_field.setMinimumHeight(32)
                     input_map[color][cond] = input_field
                     row.addWidget(input_field)
+                form_layout.addRow(QLabel(f"{color}:"), row)
 
-                form.addRow(QLabel(f"{color}:") , row)
+            scroll_area.setWidget(form_widget)
+            layout.addWidget(scroll_area)
 
-            layout.addLayout(form)
-
-            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-            buttons.accepted.connect(dialog.accept)
-            buttons.rejected.connect(dialog.reject)
-            layout.addWidget(buttons)
-
-            if dialog.exec_() == QDialog.Accepted:
+            # ===== Helpers =====
+            def save_current_data():
                 branch_data = {}
                 for color, cond_inputs in input_map.items():
                     color_data = {}
                     for cond, input_field in cond_inputs.items():
-                        try:
-                            qty = int(input_field.text().strip() or 0)
-                            if qty > 0:
-                                color_data[cond] = qty
-                        except ValueError:
-                            pass
-                    if color_data:
+                        text = input_field.text().strip()
+                        color_data[cond] = int(text) if text.isdigit() else 0
+                    branch_data[color] = color_data
+                qty_data[branch] = branch_data
+
+            def terminate_process():
+                terminated["flag"] = True
+                qty_data.clear()
+                dialog.reject()
+                dialog.deleteLater()
+
+            def go_to_next():
+                if terminated["flag"]:
+                    return
+                save_current_data()
+                dialog.accept()
+                dialog.deleteLater()
+                if branch_index + 1 < len(self.branches):
+                    QApplication.processEvents()
+                    show_branch_popup(branch_index + 1)
+
+            def go_to_prev():
+                if terminated["flag"]:
+                    return
+                save_current_data()
+                dialog.accept()
+                dialog.deleteLater()
+                if branch_index - 1 >= 0:
+                    QApplication.processEvents()
+                    show_branch_popup(branch_index - 1)
+
+            terminate_btn.clicked.connect(terminate_process)
+
+            # ===== Navigation Buttons =====
+            button_layout = QHBoxLayout()
+            if branch_index > 0:
+                prev_button = QPushButton("Back")
+                prev_button.clicked.connect(go_to_prev)
+                button_layout.addWidget(prev_button)
+            else:
+                button_layout.addStretch(1)
+
+            next_button = QPushButton("Finish" if branch_index + 1 >= len(self.branches) else "Next")
+            next_button.clicked.connect(go_to_next)
+            button_layout.addWidget(next_button)
+
+            layout.addLayout(button_layout)
+
+            # Restore any previous data
+            branch_data = qty_data.get(branch, {})
+            for color, cond_inputs in input_map.items():
+                for cond, input_field in cond_inputs.items():
+                    val = branch_data.get(color, {}).get(cond, 0)
+                    input_field.setText("" if val == 0 else str(val))
+
+            dialog.exec_()
+
+        # Start process
+        show_branch_popup(0)
+
+        # Return None if user terminated
+        if terminated["flag"]:
+            return None
+        return qty_data
+
+    def edit_item_qty(self):
+        """Allow admin or permitted user to edit existing product quantity via popup."""
+        index = self.item_list.currentRow()
+        if index < 0:
+            QMessageBox.warning(self, "No Selection", "Select a product to edit its quantity.")
+            return
+
+        # Get selected product data
+        doc_id, data = self.items[index]
+        current_qty = data.get("qty", {}) or {}
+
+        # Load existing qty into form
+        branches = self.branches
+        colors = self.fetch_colors()
+        conditions = ["New", "Used", "Bad"]
+
+        # --- Prefill Support Version of get_qty_per_branch_and_color() ---
+        def open_edit_qty_popup():
+            qty_data = {}
+            terminated = {"flag": False}
+
+            def show_branch_popup(branch_index):
+                if terminated["flag"]:
+                    return
+
+                branch = branches[branch_index]
+                input_map = {}
+
+                dialog = QDialog(self)
+                dialog.setWindowTitle(f"Edit Qty for Branch: {branch}")
+                dialog.setMinimumWidth(520)
+                dialog.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
+                dialog.setModal(True)
+
+                layout = QVBoxLayout(dialog)
+
+                # === Header + Terminate ===
+                top_row = QHBoxLayout()
+                heading = QLabel(f"Branch: {branch}")
+                heading.setObjectName("DialogHeading")
+                top_row.addWidget(heading)
+
+                terminate_btn = QPushButton("Terminate")
+                terminate_btn.setObjectName("Danger")
+                terminate_btn.setFixedHeight(28)
+                terminate_btn.setStyleSheet("QPushButton { background-color: #fee2e2; color: #b91c1c; border-radius: 6px; padding: 4px 10px; }"
+                                            "QPushButton:hover { background-color: #fecaca; }")
+                top_row.addStretch(1)
+                top_row.addWidget(terminate_btn)
+                layout.addLayout(top_row)
+
+                scroll_area = QScrollArea(dialog)
+                scroll_area.setWidgetResizable(True)
+                form_widget = QWidget()
+                form_layout = QFormLayout(form_widget)
+                form_layout.setHorizontalSpacing(12)
+                form_layout.setVerticalSpacing(8)
+
+                # Fields per color/condition
+                for color in colors:
+                    row = QHBoxLayout()
+                    input_map[color] = {}
+                    for cond in conditions:
+                        input_field = QLineEdit()
+                        input_field.setPlaceholderText(cond)
+                        input_field.setFixedWidth(90)
+                        input_field.setMinimumHeight(32)
+
+                        # Prefill with existing qty (if available)
+                        val = (current_qty.get(branch, {})
+                                        .get(color, {})
+                                        .get(cond, 0))
+                        input_field.setText("" if val == 0 else str(val))
+                        input_map[color][cond] = input_field
+                        row.addWidget(input_field)
+                    form_layout.addRow(QLabel(f"{color}:"), row)
+
+                scroll_area.setWidget(form_widget)
+                layout.addWidget(scroll_area)
+
+                # Helpers
+                def save_current_data():
+                    branch_data = {}
+                    for color, cond_inputs in input_map.items():
+                        color_data = {}
+                        for cond, input_field in cond_inputs.items():
+                            text = input_field.text().strip()
+                            color_data[cond] = int(text) if text.isdigit() else 0
                         branch_data[color] = color_data
-                if branch_data:
                     qty_data[branch] = branch_data
 
-        return qty_data
+                def terminate_process():
+                    terminated["flag"] = True
+                    qty_data.clear()
+                    dialog.reject()
+                    dialog.deleteLater()
+
+                def go_to_next():
+                    if terminated["flag"]:
+                        return
+                    save_current_data()
+                    dialog.accept()
+                    dialog.deleteLater()
+                    if branch_index + 1 < len(branches):
+                        QApplication.processEvents()
+                        show_branch_popup(branch_index + 1)
+
+                def go_to_prev():
+                    if terminated["flag"]:
+                        return
+                    save_current_data()
+                    dialog.accept()
+                    dialog.deleteLater()
+                    if branch_index - 1 >= 0:
+                        QApplication.processEvents()
+                        show_branch_popup(branch_index - 1)
+
+                terminate_btn.clicked.connect(terminate_process)
+
+                # Navigation Buttons
+                button_layout = QHBoxLayout()
+                if branch_index > 0:
+                    prev_button = QPushButton("Back")
+                    prev_button.clicked.connect(go_to_prev)
+                    button_layout.addWidget(prev_button)
+                else:
+                    button_layout.addStretch(1)
+
+                next_button = QPushButton("Finish" if branch_index + 1 >= len(branches) else "Next")
+                next_button.clicked.connect(go_to_next)
+                button_layout.addWidget(next_button)
+                layout.addLayout(button_layout)
+
+                dialog.exec_()
+
+            show_branch_popup(0)
+            if terminated["flag"]:
+                return None
+            return qty_data
+
+        # Launch the edit popup
+        new_qty = open_edit_qty_popup()
+        if not new_qty:
+            QMessageBox.information(self, "Terminated", "Quantity editing was terminated.")
+            return
+
+        # Confirm save
+        confirm = QMessageBox.question(
+            self, "Confirm Update",
+            "Update product inventory with these new quantities?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if confirm == QMessageBox.No:
+            return
+
+        # Update Firestore
+        loader = self.show_loader(self, "Updating Qty", "Applying changes...")
+        try:
+            db.collection("products").document(doc_id).update({"qty": new_qty})
+            QMessageBox.information(self, "Success", "Quantities updated successfully.")
+            self.refresh_items()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to update qty: {e}")
+        finally:
+            loader.close()

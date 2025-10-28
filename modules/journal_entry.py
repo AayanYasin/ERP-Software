@@ -359,13 +359,31 @@ class JournalEntryForm(QWidget):
             bal_item.setText(f"{abs(projected):,.2f} {'DR' if dr else 'CR'}")
 
     def load_accounts(self):
+        """Load only active, posting accounts that match the current user's branch(es)."""
         self.accounts = []
         try:
-            fields = ["code","name","type","current_balance","opening_balance","slug","is_posting","active"]
-            docs = db.collection("accounts")\
-                    .where("active", "==", True)\
-                    .select(fields)\
-                    .get()
+            # Normalize the user's branches to a list
+            user_branch = self.user_data.get("branch")
+            if isinstance(user_branch, str):
+                branches = [user_branch]
+            elif isinstance(user_branch, list):
+                branches = user_branch
+            else:
+                branches = []
+
+            fields = ["code","name","type","current_balance","opening_balance",
+                    "slug","is_posting","active","branch"]
+
+            # Base query: active accounts only
+            q = db.collection("accounts").where("active", "==", True).select(fields)
+
+            # Restrict to the user's branch(es) if provided
+            # (expects account docs to store branch as an array)
+            if branches:
+                q = q.where("branch", "array_contains_any", branches)
+
+            docs = q.get()
+
             for doc in docs:
                 data = doc.to_dict() or {}
 
@@ -389,6 +407,7 @@ class JournalEntryForm(QWidget):
                     })
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load accounts: {e}")
+
             
     def update_totals(self):
         debit, credit = 0, 0
@@ -402,6 +421,18 @@ class JournalEntryForm(QWidget):
         self.update_row_balances()
 
     def save_entry(self):
+        # ✅ Prevent selecting the same account in both lines
+        if self.table.rowCount() >= 2:
+            acc1 = self.table.cellWidget(0, 0).currentData()
+            acc2 = self.table.cellWidget(1, 0).currentData()
+            if acc1 and acc2 and acc1.get("id") == acc2.get("id"):
+                QMessageBox.warning(
+                    self,
+                    "Invalid Selection",
+                    "You cannot select the same account in both lines."
+                )
+                return
+            
         date_py = self.date_edit.date().toPyDate()
         date = datetime.datetime.combine(date_py, datetime.datetime.min.time())
         desc = self.desc_input.text().strip()
@@ -457,6 +488,7 @@ class JournalEntryForm(QWidget):
             credit_total += credit
 
         # --- Validations (unchanged) ---
+        
         if self.table.rowCount() != 2:
             QMessageBox.warning(self, "Validation", "Exactly two lines are required.")
             return

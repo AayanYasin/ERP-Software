@@ -142,6 +142,32 @@ def _generate_code_once_tx(db_ref, acc_type: str) -> str:
 
     return _inc(transaction)
 
+def _admin_branches_or(fallback_branches):
+        """
+        Returns the branch list from an admin user (preferred).
+        Falls back to the provided list if no admin is found or schema differs.
+        """
+        try:
+            # Try common schemas: is_admin True OR role == 'admin'
+            admins = db.collection("users").where("is_admin", "==", True).limit(1).get()
+            if not admins:
+                admins = db.collection("users").where("role", "==", "admin").limit(1).get()
+
+            if admins:
+                admin_doc = admins[0].to_dict() or {}
+                branches = admin_doc.get("branch", [])
+                if isinstance(branches, str):
+                    branches = [branches]
+                # Ensure unique, non-empty strings
+                branches = [b for b in {*(branches or [])} if isinstance(b, str) and b.strip()]
+                if branches:
+                    return branches
+        except Exception:
+            pass
+        # Fallback to whatever caller provided
+        if isinstance(fallback_branches, str):
+            fallback_branches = [fallback_branches]
+        return fallback_branches or []
 
 def _post_opening_balance_je(db_ref, user_data: dict, account_id: str, account_name: str,
                              amount: float, drcr: str, acc_type: str, description: str = None):
@@ -158,9 +184,9 @@ def _post_opening_balance_je(db_ref, user_data: dict, account_id: str, account_n
         equity_account_name = (eq_q[0].to_dict() or {}).get("name", "System Offset Account")
     else:
         equity_code = _generate_code_once_tx(db_ref, "Asset")
-        branches = user_data.get("branch", [])
-        if isinstance(branches, str):
-            branches = [branches]
+        # NEW: always take branches from an admin user (fallback to current user's branches)
+        user_branches = user_data.get("branch", [])
+        branches = _admin_branches_or(user_branches)
         equity_account = {
             "name": "System Offset Account",
             "slug": "opening_balances_equity",
@@ -223,12 +249,28 @@ def _post_opening_balance_je(db_ref, user_data: dict, account_id: str, account_n
 class AccountsLoader(QThread):
     loaded = pyqtSignal(list, dict, int, int)  # rows, parent_map, active_cnt, inactive_cnt
     failed = pyqtSignal(str)
+    
+    def __init__(self, branches=None, parent=None):
+        super().__init__(parent)
+        # normalize to list; supports both single and multi-branch users
+        if isinstance(branches, str):
+            branches = [branches]
+        self.branches = branches or []
 
     def run(self):
         try:
             fields = ["name", "code", "type", "branch", "active", "is_posting",
                       "parent", "current_balance", "opening_balance"]
-            account_docs = db.collection("accounts").select(fields).get()
+            
+            # Only load accounts for the user's branch(es)
+            if self.branches:
+                q = db.collection("accounts") \
+                      .where("branch", "array_contains_any", self.branches) \
+                      .select(fields)
+                account_docs = q.get()
+            else:
+                # Fallback (should not happen if every user has at least one branch)
+                account_docs = db.collection("accounts").select(fields).get()
 
             rows = []
             parent_map = {}
@@ -386,7 +428,7 @@ class AccountDialog(QDialog):
         form.addRow("Parent Account:", self.parent_combo)
 
         self.branch_list = QListWidget()
-        self.branch_list.setSelectionMode(QAbstractItemView.MultiSelection)
+        self.branch_list.setSelectionMode(QAbstractItemView.SingleSelection)
         for b in self.user_data.get("branch", []):
             self.branch_list.addItem(QListWidgetItem(b))
         form.addRow("Branches:", self.branch_list)
@@ -678,10 +720,21 @@ class ChartOfAccounts(QWidget):
         cached = self._load_cache()
         if not cached:
             return
+
         rows = [(r["id"], r["data"], r.get("base_balance", 0.0)) for r in cached.get("rows", [])]
         parent_map = cached.get("parent_map", {})
         active_count = cached.get("active_count", 0)
         inactive_count = cached.get("inactive_count", 0)
+
+        # Filter cached rows by current user's branch(es) to avoid showing other branches from an older snapshot
+        user_branches = self.user_data.get("branch", [])
+        if isinstance(user_branches, str):
+            user_branches = [user_branches]
+        if user_branches:
+            ub = set(user_branches)
+            def _has_overlap(acc_branches):
+                return bool(ub & set(acc_branches or []))
+            rows = [(rid, data, base) for (rid, data, base) in rows if _has_overlap(data.get("branch", []))]
 
         self._on_loaded_accounts(rows, parent_map, active_count, inactive_count)
         if self._offline_read_only:
@@ -706,6 +759,19 @@ class ChartOfAccounts(QWidget):
             self.refresh()
 
     # ------------------------------------------
+    
+    
+    def _is_system_offset(self, item_or_data) -> bool:
+        """Return True if this is the auto-generated System Offset account."""
+        # Accept either a QTreeWidgetItem or a raw data dict
+        if hasattr(item_or_data, "data"):
+            data = item_or_data.data(1, Qt.UserRole) or {}
+        else:
+            data = item_or_data or {}
+
+        slug = (data.get("slug") or "").strip().lower()
+        name = (data.get("name") or "").strip()
+        return slug == "opening_balances_equity" or name == "System Offset Account"
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -901,7 +967,12 @@ class ChartOfAccounts(QWidget):
             self._loader_thread.terminate()
             self._loader_thread.wait()
 
-        self._loader_thread = AccountsLoader(self)
+        # pass the current user's branch(es) into the loader
+        branches = self.user_data.get("branch", [])
+        if isinstance(branches, str):
+            branches = [branches]
+
+        self._loader_thread = AccountsLoader(branches=branches, parent=self)
         self._loader_thread.loaded.connect(self._on_loaded_accounts)
         self._loader_thread.failed.connect(self._on_load_failed)
         self._loader_thread.start()
@@ -1055,10 +1126,16 @@ class ChartOfAccounts(QWidget):
 
     # Double-click guarded in offline mode (does nothing)
     def _on_double_click(self, item):
+        # Block editing via double-click for the system offset account
+        if self._is_system_offset(item):
+            # (Optional) brief nudge. Remove if you prefer silent no-op.
+            QMessageBox.information(self, "Read-only", "This system account cannot be edited.")
+            return
         if self._offline_read_only:
             return
         if item:
             self.edit_account(item)
+        # self.edit_account(item)
 
     def _context_menu(self, pos):
         item = self.tree.itemAt(pos)
@@ -1075,6 +1152,10 @@ class ChartOfAccounts(QWidget):
             a_add.setEnabled(False)
             a_edit.setEnabled(False)
             a_del.setEnabled(False)
+            
+        # 🔒 Additionally, for the System Offset Account, disable Edit
+        if item and self._is_system_offset(item):
+            a_edit.setEnabled(False)
 
         action = menu.exec_(self.tree.viewport().mapToGlobal(pos))
         if action == a_add and not self._offline_read_only:
@@ -1120,11 +1201,25 @@ class ChartOfAccounts(QWidget):
 
     def edit_selected(self):
         acc = self.get_selected_account()
-        if acc:
-            dialog = AccountDialog(self.user_data, acc, parent=self, parents_seed=self._parents_seed)
-            if dialog.exec_():
-                self.refresh()
+        if not acc:
+            return
 
+        # 🚫 Prevent editing of the auto-generated System Offset account
+        slug = (acc.get("slug") or "").strip().lower()
+        name = (acc.get("name") or "").strip()
+        if slug == "opening_balances_equity" or name == "System Offset Account":
+            QMessageBox.information(
+                self,
+                "Read-only Account",
+                "The Auto-Generated System Offset Account cannot be edited."
+            )
+            return
+
+        # ✅ Normal behavior for all other accounts
+        dialog = AccountDialog(self.user_data, acc, parent=self, parents_seed=self._parents_seed)
+        if dialog.exec_():
+            self.refresh()
+            
     def delete_selected(self):
         acc = self.get_selected_account()
         if not acc:
@@ -1154,40 +1249,43 @@ class ChartOfAccounts(QWidget):
                 QMessageBox.critical(self, "Error", str(e))
 
     def export_csv(self):
-        default_dir = os.path.join(os.path.expanduser("~"), "Desktop")
-        try:
-            os.makedirs(default_dir, exist_ok=True)
-        except Exception:
-            pass
-        default_path = os.path.join(default_dir, "chart_of_accounts.csv")
+        if self.user_data.get("role", []) == "admin" or "can_imp_exp_anything" in self.user_data.get("extra_perm", []):
+            default_dir = os.path.join(os.path.expanduser("~"), "Desktop")
+            try:
+                os.makedirs(default_dir, exist_ok=True)
+            except Exception:
+                pass
+            default_path = os.path.join(default_dir, "chart_of_accounts.csv")
 
-        path, _ = QFileDialog.getSaveFileName(self, "Export Accounts", default_path, "CSV Files (*.csv)")
-        if not path:
-            return
-        try:
-            rows = []
+            path, _ = QFileDialog.getSaveFileName(self, "Export Accounts", default_path, "CSV Files (*.csv)")
+            if not path:
+                return
+            try:
+                rows = []
 
-            def collect(item):
-                data = item.data(1, Qt.UserRole) or {}
-                rows.append([
-                    data.get("code", ""),
-                    data.get("name", ""),
-                    data.get("type", ""),
-                    item.text(2),
-                    ", ".join(data.get("branch", [])),
-                    "Active" if data.get("active", True) else "Inactive",
-                    "Yes" if data.get("is_posting", True) else "No"
-                ])
-                for i in range(item.childCount()):
-                    collect(item.child(i))
+                def collect(item):
+                    data = item.data(1, Qt.UserRole) or {}
+                    rows.append([
+                        data.get("code", ""),
+                        data.get("name", ""),
+                        data.get("type", ""),
+                        item.text(2),
+                        ", ".join(data.get("branch", [])),
+                        "Active" if data.get("active", True) else "Inactive",
+                        "Yes" if data.get("is_posting", True) else "No"
+                    ])
+                    for i in range(item.childCount()):
+                        collect(item.child(i))
 
-            for i in range(self.tree.topLevelItemCount()):
-                collect(self.tree.topLevelItem(i))
+                for i in range(self.tree.topLevelItemCount()):
+                    collect(self.tree.topLevelItem(i))
 
-            with open(path, "w", newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(["Code", "Name", "Type", "Closing Balance", "Branches", "Status", "Postable"])
-                writer.writerows(rows)
-            QMessageBox.information(self, "Exported", f"CSV exported to:\n{path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Export Error", f"Failed to export: {e}")
+                with open(path, "w", newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["Code", "Name", "Type", "Closing Balance", "Branches", "Status", "Postable"])
+                    writer.writerows(rows)
+                QMessageBox.information(self, "Exported", f"CSV exported to:\n{path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", f"Failed to export: {e}")
+        else:
+            QMessageBox.warning(self, "Not Allowed", "You do not have permission to perform this action.")

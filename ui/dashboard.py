@@ -28,6 +28,7 @@ from modules.invoice import InvoiceModule
 from modules.view_invoice import ViewInvoicesModule
 from modules.delivery_chalan import DeliveryChalanModule
 from modules.view_users import ViewUsersModule
+from modules.powder_coating_cycle import PowderCoatingMain
 
 
 
@@ -429,6 +430,7 @@ class DashboardApp(QMainWindow):
 
             # Group 8: Manufacturing
             ("Manufacturing", [
+                ("Powder Coating", lambda: self.launch_module("powdercoating_window", )),
                 ("Create Order", lambda: self.launch_module("manufacturing_window", ManufacturingModule)),
                 ("View Orders", lambda: self.launch_module("view_orders_window", ViewManufacturingWindow, self.user_data, self)),
             ]),
@@ -444,15 +446,51 @@ class DashboardApp(QMainWindow):
 
         # For non-admin users, filter out the modules that are not in the allowed_modules list
         if not self._is_admin:
-            allowed_modules = self.user_data.get('allowed_modules', [])
-            sidebar_items = [
-                (label, actions)  # If actions are a list, iterate over them
-                if isinstance(actions, list)
-                else (label, actions)  # Handle the function case (e.g., "Dashboard")
-                for label, actions in sidebar_items
-                for label, action in (actions if isinstance(actions, list) else [(label, actions)])  # Ensure it's iterable
-                if label in allowed_modules  # Check if the module is in allowed_modules
-            ]
+            raw = set(self.user_data.get("allowed_modules", [])) | {"Dashboard"}
+
+            # Map your “human” labels to the exact sidebar child labels
+            ALIASES = {
+                "Journal": "Open Journal",
+                "Create Manufacturing Order": "Create Order",
+                "View Manufacturing Order": "View Orders",
+                "Manage / View Parties": ("Parties", "Manage/View"),
+                "Manage / View Employees": ("Employees", "Manage/View"),
+                # You can add more synonyms here if needed
+            }
+
+            # Build two allow lists:
+            # 1) global child labels (no group restriction)
+            # 2) group-qualified child labels: (group, child)
+            allowed_child_labels = set()
+            allowed_pairs = set()
+
+            for label in raw:
+                aliased = ALIASES.get(label, label)
+                if isinstance(aliased, tuple):
+                    allowed_pairs.add(aliased)        # e.g., ("Parties", "Manage/View")
+                else:
+                    allowed_child_labels.add(aliased) # e.g., "Open Journal"
+
+            filtered = []
+            for group_label, actions in sidebar_items:
+                if not isinstance(actions, list):
+                    # Single callable like “Dashboard”
+                    if group_label in raw:
+                        filtered.append((group_label, actions))
+                    continue
+
+                kept = []
+                for (child_label, fn) in actions:
+                    # keep if either:
+                    # - exact child label is allowed, or
+                    # - (group, child) pair is allowed
+                    if child_label in allowed_child_labels or (group_label, child_label) in allowed_pairs:
+                        kept.append((child_label, fn))
+
+                if kept:
+                    filtered.append((group_label, kept))
+
+            sidebar_items = filtered
 
         sidebar = create_expandable_sidebar(self, sidebar_items, self.logout, font_scale=1.1)
         
