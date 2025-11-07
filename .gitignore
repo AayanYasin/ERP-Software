@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+
+# Firebase
+*.json
+.env
+secrets/
+firebase/credentials.txt
+firebase/MEGA-RECOVERYKEY
+firebase/github-recovery-codes
+firebase/storagesolutions-drive
+
+# IDEs
+.vscode/
+.idea/
+
+ERP-SETUP-INSTALLER.py
+release_build_publish.py
+
+# System
+.DS_Store
+Thumbs.db

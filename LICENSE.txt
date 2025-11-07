@@ -1,0 +1,11 @@
+Copyright (c) 2025 Aayan
+
+All rights reserved.
+
+This software and associated documentation files (the "Software") are the exclusive intellectual property of Aayan and/or his company.
+
+Unauthorized copying, reproduction, modification, distribution, or usage of any part of this software is strictly prohibited, unless express written permission is granted by the copyright holder.
+
+The software is provided "AS IS", without warranty of any kind, express or implied.
+
+For licensing, commercial use, or redistribution inquiries, please contact: aayan06pk@gmail.com
