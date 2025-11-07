@@ -15,7 +15,7 @@ from PyQt5 import QtWebEngineWidgets
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from firebase.config import db
 import pandas as pd
-
+from urllib.parse import urlparse, unquote
 
 
 from firebase_admin import storage
@@ -313,7 +313,8 @@ class ProductsPage(QWidget):
         actions.addStretch(1)
         actions.addWidget(self._btn("Add", self.add_item, kind="primary"))
         
-        actions.addWidget(self._btn("Add Image", self.add_image_to_firebase, kind="subtle"))
+        self.image_btn = self._btn("Add Image", self.image_action, kind="subtle")
+        actions.addWidget(self.image_btn)
         
         # Disable delete button for non-admins
         # Check if the user is an admin or if they have the permission to delete
@@ -350,14 +351,99 @@ class ProductsPage(QWidget):
 
         # Start in the right mode for current size
         self._apply_responsive_layout()
+        self.update_image_button_state()
         
     # ================= FIREBASE STORAGE UPLOAD =================
+    def delete_image_from_firebase(self, doc_id, data):
+        """Deletes image blob from Firebase Storage and clears Firestore references."""
+        try:
+            image_url = data.get("image_url", "")
+            image_path = data.get("image_path", "")  # we’ll start saving this on upload
+
+            if not image_url and not image_path:
+                QMessageBox.information(self, "No Image", "This item has no image to delete.")
+                return
+
+            # Ask confirmation
+            reply = QMessageBox.question(
+                self,
+                "Confirm Delete",
+                "Delete the image from storage and remove its reference?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+            loader = self.show_loader(self, "Deleting", "Removing image…")
+
+            # Find storage object path
+            # Prefer explicit image_path; otherwise parse from signed URL (/o/<object> part)
+            if not image_path and image_url:
+                try:
+                    p = urlparse(image_url)
+                    # signed URLs commonly look like: /download/storage/v1/b/<bucket>/o/<object>?...
+                    marker = "/o/"
+                    if marker in p.path:
+                        encoded_obj = p.path.split(marker, 1)[1]
+                        # strip any trailing query-like part if present (defensive)
+                        encoded_obj = encoded_obj.split("?", 1)[0]
+                        image_path = unquote(encoded_obj)
+                except Exception:
+                    image_path = ""
+
+            # Delete blob if we could determine the path
+            deleted_blob = False
+            if image_path:
+                try:
+                    bucket = storage.bucket("danish-brothers---erp-so-382b6.firebasestorage.app")
+                    blob = bucket.blob(image_path)
+                    if blob.exists():
+                        blob.delete()
+                        deleted_blob = True
+                except Exception as e:
+                    # continue to clear references; show detailed error after
+                    print("Delete blob error:", e)
+
+            # Clear Firestore refs regardless of blob deletion success
+            try:
+                from firebase_admin import firestore
+                db.collection("products").document(doc_id).update({
+                    "image_url": firestore.DELETE_FIELD,
+                    "image_path": firestore.DELETE_FIELD
+                })
+            except Exception as e:
+                loader.close()
+                QMessageBox.critical(self, "Firestore Error", f"Failed clearing image refs: {e}")
+                return
+
+            # Reflect in UI
+            if "image_url" in self.fields:
+                self.fields["image_url"].clear()
+
+            self.refresh_items(preserve_selection=True)
+            self.update_image_button_state()
+
+            loader.close()
+            if deleted_blob:
+                QMessageBox.information(self, "Image Deleted", "Image removed from storage and reference cleared.")
+            else:
+                QMessageBox.information(
+                    self,
+                    "Reference Cleared",
+                    "Could not locate the storage file from the saved URL, but the Firestore reference was cleared.\n"
+                    "Future uploads will save a precise storage path so deletion is exact."
+                )
+        except Exception as e:
+            QMessageBox.critical(self, "Delete Failed", str(e))
+
+
     def upload_to_firebase_storage(self, local_path, item_code=None):
         """
         Uploads a file to Firebase Storage (using the initialized Firebase Admin app).
+        Returns (signed_url, remote_path).
         """
         try:
-            # Use the same initialized app and credentials
             bucket = storage.bucket("danish-brothers---erp-so-382b6.firebasestorage.app")
 
             base = os.path.basename(local_path)
@@ -366,23 +452,18 @@ class ProductsPage(QWidget):
             blob = bucket.blob(remote_path)
             blob.upload_from_filename(local_path)
 
-            # Optional: Generate signed download URL (valid for 1 year)
             url = blob.generate_signed_url(
                 expiration=datetime.timedelta(days=365),
                 method="GET"
             )
 
-            return url
+            return url, remote_path
 
         except Exception as e:
             QMessageBox.critical(self, "Firebase Upload Failed", str(e))
-            return None
-
+            return None, None
 
     def add_image_to_firebase(self):
-        """
-        Lets user pick an image and upload to Firebase Storage.
-        """
         index = self.item_list.currentRow()
         if index < 0 or index >= len(self.items):
             QMessageBox.warning(self, "No Product Selected", "Select a product in the list first.")
@@ -411,29 +492,32 @@ class ProductsPage(QWidget):
         loader = self.show_loader(self, "Uploading", "Uploading image to Firebase Storage…")
 
         try:
-            url = self.upload_to_firebase_storage(file_path, item_code)
+            url, remote_path = self.upload_to_firebase_storage(file_path, item_code)
             if not url:
                 QMessageBox.critical(self, "Upload Failed", "Could not upload the image.")
                 return
 
-            # Save link to Firestore
-            db.collection("products").document(doc_id).update({"image_url": url})
-
-            # # Reflect in UI
-            # if "image_url" in self.fields:
-            #     self.fields["image_url"].setText(url)
+            # Save link + storage path to Firestore
+            db.collection("products").document(doc_id).update({
+                "image_url": url,
+                "image_path": remote_path
+            })
 
             QMessageBox.information(self, "Image Added", "Upload complete and URL saved.")
-            
-            self.refresh_items()
-            
+
+            self.refresh_items(preserve_selection=True)
+
             # Reflect in UI
             if "image_url" in self.fields:
                 self.fields["image_url"].setText(url)
+
+            self.update_image_button_state()
+
         except Exception as e:
             QMessageBox.critical(self, "Firebase Upload Failed", str(e))
         finally:
             loader.close()
+
 
     # ================= Helpers (no logic change) =================
     def _fetch_name_autocomplete_keys(self):
@@ -819,27 +903,23 @@ class ProductsPage(QWidget):
         self.fields["weight"].setText(f"{weight:.2f}")
         
     def open_image_url(self):
-        """Opens the image URL from the image_url field."""
+        """Opens the image URL from the image_url field asynchronously."""
         url = self.fields["image_url"].text().strip()
         if not url:
             QMessageBox.warning(self, "No URL", "Please enter an image URL first.")
             return
 
-        # Option 1: Open in default browser
-        # QDesktopServices.openUrl(QUrl(url))
-
-        # --- Optional Option 2: open in a small popup window ---
-        # Uncomment to use a popup viewer instead of browser
-        # """
         dialog = QDialog(self)
         dialog.setWindowTitle("Image Preview")
         dialog.resize(600, 400)
+
         layout = QVBoxLayout(dialog)
         viewer = QWebEngineView(dialog)
-        viewer.setUrl(QUrl(url))
         layout.addWidget(viewer)
-        dialog.exec_()
-        # """
+
+        dialog.show()  # ✅ Non-blocking — UI stays responsive
+        QApplication.processEvents()
+        viewer.setUrl(QUrl(url))
 
 
     # ================= Behavior (unchanged) =================
@@ -891,6 +971,7 @@ class ProductsPage(QWidget):
                 if unit_cb:
                     idx = unit_cb.findText(unit)
                     unit_cb.setCurrentIndex(idx if idx >= 0 else 0)
+            self.update_image_button_state()
 
     def validate_fields(self):
         length = self.fields["length"].text().strip()
@@ -961,48 +1042,96 @@ class ProductsPage(QWidget):
 
         # Deselect current product so on_item_selected() doesn't repopulate fields later
         self.item_list.clearSelection()
-        self.selected_main_id = None
-        self.selected_sub_id = None
+        # self.selected_main_id = None
+        # self.selected_sub_id = None
 
         # Re-enable signals
         self.item_list.blockSignals(False)
 
-    def refresh_categories(self):
+    def refresh_categories(self, preserve_selection=False):
         loader = self.show_loader(self, "Loading Categories", "Fetching categories...")
+        prev_id = self.selected_main_id if preserve_selection else None
+
+        self.cat_list.blockSignals(True)
         self.cat_list.clear()
         self.categories = []
+
         for doc in db.collection("product_main_categories").stream():
             data = doc.to_dict()
             self.categories.append((doc.id, data["name"]))
             self.cat_list.addItem(data["name"])
+
+        # restore previous selection if any
+        if preserve_selection and prev_id:
+            for i, (cid, _) in enumerate(self.categories):
+                if cid == prev_id:
+                    self.cat_list.setCurrentRow(i)
+                    break
+
+        self.cat_list.blockSignals(False)
         loader.close()
 
-    def refresh_subcategories(self):
-        loader = self.show_loader(self, "Loading Categories", "Fetching subcategories...")
+
+    def refresh_subcategories(self, preserve_selection=False):
+        loader = self.show_loader(self, "Loading Subcategories", "Fetching subcategories...")
+        prev_id = self.selected_sub_id if preserve_selection else None
+
+        self.subcat_list.blockSignals(True)
         self.subcat_list.clear()
         self.subcategories = []
+
         if not self.selected_main_id:
             loader.close()
+            self.subcat_list.blockSignals(False)
             return
+
         for doc in db.collection("product_sub_categories").where("main_id", "==", self.selected_main_id).stream():
             data = doc.to_dict()
             self.subcategories.append((doc.id, data["name"]))
             self.subcat_list.addItem(data["name"])
+
+        # restore selection
+        if preserve_selection and prev_id:
+            for i, (sid, _) in enumerate(self.subcategories):
+                if sid == prev_id:
+                    self.subcat_list.setCurrentRow(i)
+                    break
+
+        self.subcat_list.blockSignals(False)
         loader.close()
 
-    def refresh_items(self):
-        loader = self.show_loader(self, "Loading Categories", "Refreshing Items...")
+
+    def refresh_items(self, preserve_selection=False):
+        loader = self.show_loader(self, "Loading Items", "Refreshing Items...")
+        prev_doc_id = None
+        if preserve_selection and 0 <= self.item_list.currentRow() < len(self.items):
+            prev_doc_id = self.items[self.item_list.currentRow()][0]
+
+        self.item_list.blockSignals(True)
         self.item_list.clear()
         self.items = []
+
         if not self.selected_sub_id:
             loader.close()
+            self.item_list.blockSignals(False)
             return
+
         query = db.collection("products").where("sub_id", "==", self.selected_sub_id)
         for doc in query.stream():
             data = doc.to_dict()
             self.items.append((doc.id, data))
             self.item_list.addItem(f"{data.get('item_code', '')} - {data.get('name', '')}")
+
+        # restore selected product
+        if preserve_selection and prev_doc_id:
+            for i, (doc_id, _) in enumerate(self.items):
+                if doc_id == prev_doc_id:
+                    self.item_list.setCurrentRow(i)
+                    break
+
+        self.item_list.blockSignals(False)
         loader.close()
+        self.update_image_button_state()
 
     def add_category(self):
         name = self.cat_input.text().strip()
@@ -1107,8 +1236,10 @@ class ProductsPage(QWidget):
             doc_id = self.items[index][0]
             data = self.get_item_data()
             data.pop("qty", None)  # prevent qty update on edit
+            data.pop("sub_id", None) 
+            data.pop("item_code", None)  
             db.collection("products").document(doc_id).update(data)
-            self.refresh_items()
+            self.refresh_items(preserve_selection=True)
         loader.close()
 
     def delete_item(self):
@@ -1205,6 +1336,34 @@ class ProductsPage(QWidget):
             return str(new_code)
 
         return increment_code(transaction)
+    
+    def update_image_button_state(self):
+        """Make the image action button say Add or Delete based on selected item's state."""
+        try:
+            index = self.item_list.currentRow()
+            has_image = False
+            if 0 <= index < len(self.items):
+                _, data = self.items[index]
+                has_image = bool(data.get("image_url"))
+            if hasattr(self, "image_btn"):
+                self.image_btn.setText("Delete Image" if has_image else "Add Image")
+        except Exception:
+            # fail-safe: default label
+            if hasattr(self, "image_btn"):
+                self.image_btn.setText("Add Image")
+
+    def image_action(self):
+        """Route click to add or delete depending on selected item's image presence."""
+        index = self.item_list.currentRow()
+        if index < 0 or index >= len(self.items):
+            QMessageBox.warning(self, "No Product Selected", "Select a product in the list first.")
+            return
+
+        doc_id, data = self.items[index]
+        if data.get("image_url"):
+            self.delete_image_from_firebase(doc_id, data)
+        else:
+            self.add_image_to_firebase()
 
     def get_qty_per_branch_and_color(self):
         """Handle quantity input for each branch using separate pop-ups and navigation."""
@@ -1346,6 +1505,8 @@ class ProductsPage(QWidget):
         if terminated["flag"]:
             return None
         return qty_data
+    
+    
 
     def edit_item_qty(self):
         """Allow admin or permitted user to edit existing product quantity via popup WITHOUT overwriting unchanged values."""
@@ -1361,7 +1522,7 @@ class ProductsPage(QWidget):
         branches = self.branches
         colors = self.fetch_colors()
         conditions = ["New", "Used", "Bad"]
-
+        
         # ------------------------------------------------------------------
         # ORIGINAL POPUP UI (kept fully intact)
         # ------------------------------------------------------------------
@@ -1568,7 +1729,7 @@ class ProductsPage(QWidget):
         try:
             db.collection("products").document(doc_id).update(updates)
             QMessageBox.information(self, "Success", "Quantities updated without overwriting others.")
-            self.refresh_items()
+            self.refresh_items(preserve_selection=True)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to update qty: {e}")
         finally:
@@ -1590,7 +1751,6 @@ class ProductsPage(QWidget):
                 loader.close()
                 return
 
-            # Get the product document
             product_doc = query[0]
             product_data = product_doc.to_dict()
             sub_id = product_data.get("sub_id")
@@ -1600,7 +1760,6 @@ class ProductsPage(QWidget):
                 loader.close()
                 return
 
-            # Find subcategory document
             sub_doc = db.collection("product_sub_categories").document(sub_id).get()
             if not sub_doc.exists:
                 QMessageBox.warning(self, "Data Error", "Product subcategory not found.")
@@ -1610,28 +1769,33 @@ class ProductsPage(QWidget):
             sub_data = sub_doc.to_dict()
             main_id = sub_data.get("main_id")
 
-            # --- Select main category ---
-            self.refresh_categories()
+            # --- Refresh while preserving any prior selections ---
+            self.refresh_categories(preserve_selection=True)
             QApplication.processEvents()
-            for i, (cat_id, name) in enumerate(self.categories):
+
+            for i, (cat_id, _) in enumerate(self.categories):
                 if cat_id == main_id:
                     self.cat_list.setCurrentRow(i)
                     self.selected_main_id = main_id
                     break
 
-            # --- Select subcategory ---
-            self.refresh_subcategories()
+            self.refresh_subcategories(preserve_selection=True)
             QApplication.processEvents()
-            for i, (subcat_id, name) in enumerate(self.subcategories):
+
+            for i, (subcat_id, _) in enumerate(self.subcategories):
                 if subcat_id == sub_id:
                     self.subcat_list.setCurrentRow(i)
                     self.selected_sub_id = sub_id
+                    for i, (sid, _) in enumerate(self.subcategories):
+                        if sid == sub_id:
+                            self.subcat_list.setCurrentRow(i)
+                            break
                     break
 
-            # --- Select product item ---
-            self.refresh_items()
+            self.refresh_items(preserve_selection=True)
             QApplication.processEvents()
-            for i, (doc_id, data) in enumerate(self.items):
+
+            for i, (doc_id, _) in enumerate(self.items):
                 if doc_id == product_doc.id:
                     self.item_list.setCurrentRow(i)
                     break
@@ -1652,7 +1816,12 @@ class ProductsPage(QWidget):
                     idx = unit_cb.findText(unit)
                     unit_cb.setCurrentIndex(idx if idx >= 0 else 0)
 
-            # QMessageBox.information(self, "Success", f"Product {code} loaded successfully.")
+            # # ✅ Re-trigger the normal selection behavior
+            # self.on_main_category_selected()
+            # self.on_sub_category_selected()
+            # self.on_item_selected()
+
+            QMessageBox.information(self, "Success", f"Product {code} loaded successfully.")
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error fetching product: {e}")
