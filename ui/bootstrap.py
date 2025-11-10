@@ -2,9 +2,6 @@
 
 from PyQt5.QtWidgets import QMessageBox, QApplication
 from PyQt5.QtCore import QTimer, QThread
-from firebase.config import db
-from ui.login import LoginWindow
-from modules.create_new_login import CreateUserModule
 
 import sys, subprocess
 
@@ -15,6 +12,7 @@ class AppBootstrap:
         self.create_admin_window = None
 
     def launch_login(self):
+        from ui.login import LoginWindow
         self.login_window = LoginWindow()
         self.login_window.show()
 
@@ -84,6 +82,7 @@ class AppBootstrap:
         dlg = WelcomeDialog(); dlg.exec_()
 
         dummy_admin_data = {"role": "admin", "branch": []}
+        from modules.create_new_login import CreateUserModule
         self.create_admin_window = CreateUserModule(dummy_admin_data, first_time=True)
 
         def after_admin_created():
@@ -103,14 +102,12 @@ class _SetupWorker(QThread):
     error = pyqtSignal(str)
 
     def run(self):
+        from firebase.config import db
         try:
             # ensure meta docs
             meta_ref = db.collection("meta").document("item_code_counter")
             if not meta_ref.get().exists:
                 meta_ref.set({"last_code": 1000})
-            colors_ref = db.collection("meta").document("colors")
-            if not colors_ref.get().exists:
-                colors_ref.set({"pc_colors": ["No Color", "Black", "White", "Red", "Blue", "Orange"]})
 
             # ensure main/sub categories
             collection_name = "product_main_categories"

@@ -4,8 +4,8 @@ from PyQt5.QtWidgets import (
     QMessageBox, QPushButton, QFileDialog, QMenu, QComboBox, QApplication,
     QGridLayout, QFrame, QToolButton, QGraphicsDropShadowEffect
 )
-from PyQt5.QtCore import QDate, Qt, QSize, QTimer
-from PyQt5.QtGui import QIcon, QFont, QColor
+from PyQt5.QtCore import QDate, Qt, QTimer
+from PyQt5.QtGui import  QFont, QColor
 from firebase.config import db
 from firebase_admin import firestore
 import datetime

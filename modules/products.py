@@ -6,13 +6,11 @@ if not hasattr(asyncio, "coroutine"):
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QListWidget,
     QComboBox, QGridLayout, QMessageBox, QFileDialog, QProgressDialog, QApplication,
-    QDialog, QFormLayout, QDialogButtonBox, QFrame, QSplitter, QSizePolicy, QCompleter, QShortcut
+    QDialog, QFormLayout, QFrame, QSplitter, QSizePolicy, QCompleter, QShortcut
 )
 from PyQt5.QtCore import Qt, QSize, QUrl
 from PyQt5.QtWidgets import QScrollArea, QDialog, QVBoxLayout
-from PyQt5.QtGui import QIcon, QKeySequence, QDesktopServices
-from PyQt5 import QtWebEngineWidgets
-from PyQt5.QtWebEngineWidgets import QWebEngineView
+from PyQt5.QtGui import QIcon, QKeySequence
 from firebase.config import db
 import pandas as pd
 from urllib.parse import urlparse, unquote
@@ -739,8 +737,14 @@ class ProductsPage(QWidget):
         layout.addWidget(heading)
 
         # --- Auto-close logic --- 
-        def calculate_and_close(length_add, width_add, height_add, btn_type):
-            self.calculate_weight(length_add, width_add, height_add, btn_type)
+        def calculate_and_close(length_add, width_add, height_add, btn_type, Calc_type="normal"):
+            if Calc_type=="normal":
+                self.calculate_weight(length_add, width_add, height_add, btn_type)
+            elif Calc_type=="foresupportAngle":
+                self.calculate_foursupport_angle()
+            elif Calc_type == "wallpost":
+                self.calculate_wallpost()
+                
             dialog.accept()  # ✅ closes the popup immediately
 
         # Buttons for options
@@ -758,8 +762,8 @@ class ProductsPage(QWidget):
         bracket_btn = self._btn("Bracket", lambda: calculate_and_close(1.5, 1.5, 1, "bracket"), kind="subtle")
         
         # Add new buttons for Foursupport Angle and Wallpost
-        foursupport_angle_btn = self._btn("Foursupport Angle", lambda: self.calculate_foursupport_angle(), kind="subtle")
-        wallpost_btn = self._btn("Wallpost", lambda: self.calculate_wallpost(), kind="subtle")
+        foursupport_angle_btn = self._btn("Foursupport Angle", lambda: calculate_and_close(0,0,0,None, "foresupportAngle"), kind="subtle")
+        wallpost_btn = self._btn("Wallpost", lambda: calculate_and_close(0,0,0,None, "wallpost"), kind="subtle")
         
         # Add buttons to layout
         layout.addWidget(plain_shelf_btn)
@@ -776,7 +780,7 @@ class ProductsPage(QWidget):
     def calculate_foursupport_angle(self):
         # Get gauge value from the user input, defaulting to 0 if invalid
         try:
-            gauge_mm = int(self.fields["gauge"].text().strip())
+            gauge_mm = float(self.fields["gauge"].text().strip())
         except ValueError:
             gauge_mm = 0  # Default to 0 if gauge is empty or invalid
         
@@ -816,7 +820,7 @@ class ProductsPage(QWidget):
     def calculate_wallpost(self):
         # Get gauge value from the user input, defaulting to 0 if invalid
         try:
-            gauge_mm = int(self.fields["gauge"].text().strip())
+            gauge_mm = float(self.fields["gauge"].text().strip())
         except ValueError:
             gauge_mm = 0  # Default to 0 if gauge is empty or invalid
         
@@ -914,6 +918,7 @@ class ProductsPage(QWidget):
         dialog.resize(600, 400)
 
         layout = QVBoxLayout(dialog)
+        from PyQt5.QtWebEngineWidgets import QWebEngineView
         viewer = QWebEngineView(dialog)
         layout.addWidget(viewer)
 
@@ -1703,7 +1708,7 @@ class ProductsPage(QWidget):
         confirm = QMessageBox.question(
             self,
             "Confirm Update",
-            "Apply these qty changes without overwriting other quantities?",
+            "Apply these qty changes?",
             QMessageBox.Yes | QMessageBox.No
         )
         if confirm != QMessageBox.Yes:
@@ -1728,7 +1733,7 @@ class ProductsPage(QWidget):
         loader = self.show_loader(self, "Updating Qty", "Applying changes...")
         try:
             db.collection("products").document(doc_id).update(updates)
-            QMessageBox.information(self, "Success", "Quantities updated without overwriting others.")
+            QMessageBox.information(self, "Success", "Quantities updated!")
             self.refresh_items(preserve_selection=True)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to update qty: {e}")

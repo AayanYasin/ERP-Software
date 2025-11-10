@@ -3,7 +3,7 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem, QHeaderView, QMessageBox, QApplication, QProgressDialog, QListWidget, QLineEdit, QListWidgetItem
 )
 from PyQt5.QtGui import QFont
-from PyQt5.QtCore import Qt, QDateTime, QTimer
+from PyQt5.QtCore import Qt, QDateTime
 from firebase.config import db
 
 class StockAdjustment(QWidget):

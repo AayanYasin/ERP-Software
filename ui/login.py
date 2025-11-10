@@ -8,9 +8,8 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 import requests
 from packaging.version import Version, InvalidVersion
 
-from firebase.config import db, FIREBASE_LOGIN_URL, SECURE_TOKEN_URL, APP_VERSION
+from firebase.config import FIREBASE_LOGIN_URL, SECURE_TOKEN_URL, APP_VERSION
 from firebase.cred_loader import get_refresh_token, set_refresh_token
-from ui.dashboard import DashboardApp
 from ui.network_monitor import NetworkMonitor
 import subprocess
 import hashlib
@@ -33,6 +32,7 @@ class LoginWorker(QThread):
 
     def run(self):
         try:
+            from firebase.config import db
             payload = {"email": self.email, "password": self.password, "returnSecureToken": True}
             res = self.session.post(FIREBASE_LOGIN_URL, json=payload, timeout=(3, 7))
             if res.status_code != 200:
@@ -86,6 +86,7 @@ class RefreshWorker(QThread):
             if new_refresh:
                 set_refresh_token(new_refresh)
 
+            from firebase.config import db
             user_doc = db.collection("users").document(uid).get()
             if not user_doc.exists:
                 raise Exception("User profile not found in database.")
@@ -105,6 +106,7 @@ class UpdateChecker(QThread):
 
     def run(self):
         try:
+            from firebase.config import db
             doc = db.collection("meta").document("appdata").get()
             self.found.emit(doc.to_dict() if doc.exists else {})
         except Exception as e:
@@ -173,14 +175,7 @@ class UpdateDownloader(QThread):
 class LoginWindow(QWidget):
     def __init__(self):
         super().__init__()
-        try:
-            doc = db.collection("meta").document("company_name").get()
-            self.company_name = "ERP"
-            if doc.exists:
-                data = doc.to_dict()
-                self.company_name = data.get("name", "ERP")
-        except Exception:
-            self.company_name = "ERP"
+        self.company_name = "Storage Solutions"
 
         self.setWindowTitle(f"{self.company_name} ERP - Login")
         self.setFixedSize(520, 540)
@@ -236,7 +231,7 @@ class LoginWindow(QWidget):
         self.monitor.start()
 
         # Updater check after monitor starts
-        self._check_for_updates()
+        QTimer.singleShot(0, self._check_for_updates)
 
         # Try session refresh if token exists
         rtok = get_refresh_token()
@@ -316,42 +311,56 @@ class LoginWindow(QWidget):
             updater_path = os.path.join(tempfile.gettempdir(), "erp_updater.bat")
 
             bat_script = f"""@echo off
-            echo Waiting for application to close...
+            setlocal enableextensions
 
+            REM Paths injected by Python:
+            set "NEW_EXE={new_exe}"
+            set "TARGET_EXE={current_exe}"
+            for %%I in ("%TARGET_EXE%") do (
+            set "EXE_NAME=%%~nxI"
+            set "EXE_DIR=%%~dpI"
+            )
+
+            echo Waiting for application to close...
             :waitloop
-            tasklist | find /i "YourApp.exe" >nul
+            tasklist /FI "IMAGENAME eq %EXE_NAME%" | find /I "%EXE_NAME%" >nul
             if not errorlevel 1 (
-                timeout /t 1 /nobreak >nul
-                goto waitloop
+            timeout /t 1 /nobreak >nul
+            goto waitloop
             )
 
             echo App closed. Waiting for cleanup...
             timeout /t 4 /nobreak >nul
 
             echo Replacing old version...
-            move /y "{new_exe}" "{current_exe}" >nul 2>&1
-
+            copy /y "%NEW_EXE%" "%TARGET_EXE%" >nul
             if errorlevel 1 (
-                echo Move failed, retrying...
-                timeout /t 2 /nobreak >nul
-                move /y "{new_exe}" "{current_exe}" >nul 2>&1
+            echo Copy failed, retrying...
+            timeout /t 2 /nobreak >nul
+            copy /y "%NEW_EXE%" "%TARGET_EXE%" >nul
             )
 
-            echo Starting updated version...
-            timeout /t 1 /nobreak >nul
-            start "" "{current_exe}"
+            REM Extra settle time for AV/indexers
+            timeout /t 3 /nobreak >nul
 
-            :: delete the updater script itself
+            REM Use a stable per-app temp to avoid _MEI races
+            set "TEMP=%EXE_DIR%\\_rt"
+            set "TMP=%EXE_DIR%\\_rt"
+            if not exist "%EXE_DIR%\\_rt" mkdir "%EXE_DIR%\\_rt"
+
+            echo Starting updated version...
+            start "" /D "%EXE_DIR%" "%TARGET_EXE%"
+
             del "%~f0" & exit
             """
 
-            with open(updater_path, "w") as f:
+            with open(updater_path, "w", newline="\r\n", encoding="utf-8") as f:
                 f.write(bat_script)
 
-            # Start the updater and forcefully exit immediately
-            subprocess.Popen(["cmd", "/c", updater_path], creationflags=subprocess.CREATE_NO_WINDOW)
-
-            # Give the subprocess a small head start, then kill this process completely
+            subprocess.Popen(
+                ["cmd", "/c", updater_path],
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
             QTimer.singleShot(300, lambda: os._exit(0))
 
         except Exception as e:
@@ -555,6 +564,7 @@ class LoginWindow(QWidget):
 
     def _on_login_success(self, profile: dict, company_name: str):
         self._set_busy(False)
+        from ui.dashboard import DashboardApp
         self.dashboard = DashboardApp(profile.get("name", "User"), profile, company_name=company_name)
         self.dashboard.show()
         try:

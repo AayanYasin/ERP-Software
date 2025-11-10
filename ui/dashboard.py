@@ -2,10 +2,10 @@
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QTextEdit,
     QDateEdit, QFrame, QGridLayout, QScrollArea, QSplitter, QMessageBox, QTableWidget,
-    QTableWidgetItem, QSizePolicy, QHeaderView, QToolButton
+    QTableWidgetItem, QSizePolicy, QHeaderView, QToolButton, QGraphicsBlurEffect
 )
-from PyQt5.QtCore import Qt, QDate, QPoint, QThread, pyqtSignal
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import Qt, QPoint, QThread, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QRect, QPointF
+from PyQt5.QtGui import QFont, QPainter, QPen
 
 from ui.sidebar import create_expandable_sidebar
 from ui.network_monitor import NetworkMonitor, MaintenanceWatcher
@@ -30,7 +30,120 @@ from modules.delivery_chalan import DeliveryChalanModule
 from modules.view_users import ViewUsersModule
 from modules.powder_coating_cycle import PowderCoatingMain
 
+# ------- Fancy loader (spinner) -------
+class _Spinner(QWidget):
+    def __init__(self, parent=None, size=44):
+        super().__init__(parent)
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(16)  # ~60 FPS
+        self._size = size
+        self.setFixedSize(size, size)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
 
+    def _tick(self):
+        self._angle = (self._angle + 6) % 360
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        r = min(self.width(), self.height())
+        pen = QPen()
+        pen.setWidthF(max(2.0, r * 0.08))
+        pen.setCapStyle(Qt.RoundCap)
+        p.translate(self.width()/2, self.height()/2)
+        p.rotate(self._angle)
+        # draw 12 fading ticks
+        for i in range(12):
+            a = 1.0 - (i / 12.0)
+            pen.setColor(Qt.black)                      # Qt will mix with overlay bg
+            pen.setColor(pen.color().lighter(100 + int(a*70)))
+            p.setPen(pen)
+            p.drawLine(QPointF(0.0, -r/2.8), QPointF(0.0, -r/2.0))
+            p.rotate(30)
+
+# ------- Blur + overlay container -------
+class LoadingOverlay(QFrame):
+    def __init__(self, parent, blur_target: QWidget, blur_radius: int = 8):
+        super().__init__(parent)
+        self.setObjectName("LoadingOverlay")
+        self.setStyleSheet("""
+            #LoadingOverlay {
+                background: rgba(255,255,255,0.65);
+                border-radius: 0px;
+            }
+            QFrame#Card {
+                background: rgba(255,255,255,0.92);
+                border: 1px solid #e5e7eb;
+                border-radius: 14px;
+            }
+            QLabel#txt {
+                color:#0b1220; font-size:14px; font-weight:800;
+            }
+        """)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)  # block clicks
+        self.hide()
+
+        self._blur_target = blur_target
+        self._blur_radius = blur_radius
+        self._blur = QGraphicsBlurEffect(self)
+        self._blur.setBlurRadius(blur_radius)
+
+        # center card
+        self.card = QFrame(self)
+        self.card.setObjectName("Card")
+        v = QVBoxLayout(self.card)
+        v.setContentsMargins(18, 16, 18, 16)
+        v.setSpacing(10)
+        self.spinner = _Spinner(self.card, size=44)
+        self.label = QLabel("Loading…", self.card); self.label.setObjectName("txt")
+        self.label.setAlignment(Qt.AlignCenter)
+        v.addWidget(self.spinner, 0, Qt.AlignHCenter)
+        v.addWidget(self.label, 0, Qt.AlignHCenter)
+
+        self._anim = QPropertyAnimation(self, b"windowOpacity", self)
+        self._anim.setDuration(140)
+        self._anim.setEasingCurve(QEasingCurve.InOutQuad)
+
+    def set_message(self, text: str):
+        self.label.setText(text or "Loading…")
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        # center card
+        w, h = 260, 120
+        x = (self.width() - w)//2
+        y = (self.height() - h)//2
+        self.card.setGeometry(QRect(x, y, w, h))
+
+    def show_overlay(self, text="Loading…"):
+        self.set_message(text)
+        try:
+            self._blur_target.setGraphicsEffect(self._blur)
+        except Exception:
+            pass
+        self.setWindowOpacity(0.0)
+        self.show()
+        self.raise_()
+        self._anim.stop()
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.start()
+
+    def hide_overlay(self):
+        def _finish():
+            try:
+                self._blur_target.setGraphicsEffect(None)
+            except Exception:
+                pass
+            self.hide()
+        self._anim.stop()
+        self._anim.setStartValue(self.windowOpacity())
+        self._anim.setEndValue(0.0)
+        self._anim.finished.connect(_finish)
+        self._anim.start()
 
 # ---------------- Floating notice chip (offline) ----------------
 class FloatingNotice(QFrame):
@@ -504,6 +617,9 @@ class DashboardApp(QMainWindow):
         right = QVBoxLayout(content)
         right.setContentsMargins(24, 20, 24, 24)
         right.setSpacing(16)
+        
+        # >>> overlay: keep a reference to the content to blur
+        self._content_widget = content
 
         # ======= Header (glassy gradient bar with quick actions) =======
         header = QFrame(); header.setObjectName("Glass")
@@ -639,6 +755,10 @@ class DashboardApp(QMainWindow):
         splitter.addWidget(scroll)
         splitter.setSizes([200, 1200])
         root.addWidget(splitter)
+        
+        # >>> overlay: create it last, parented to the window, blurring only the content
+        self.loading = LoadingOverlay(self, blur_target=self._content_widget, blur_radius=8)
+        self.loading.setGeometry(self.rect())  # initial sizing; kept in sync in resizeEvent
 
     # ---------------- Card builders ----------------
     def _kpi_card(self, title: str, value_text: str):
@@ -697,15 +817,39 @@ class DashboardApp(QMainWindow):
             except Exception:
                 pass
 
+        # show loader + blur
+        try:
+            if hasattr(self, "loading") and self.loading:
+                self.loading.setGeometry(self.rect())
+                self.loading.show_overlay("Refreshing dashboard…")
+        except Exception:
+            pass
+
         self.worker = DashboardDataWorker(self)
         # partial renders
         self.worker.accounts_ready.connect(self._render_accounts)
         self.worker.top_ready.connect(self._render_top)
         self.worker.stock_ready.connect(self._render_stock)
-        # final (optional)
-        self.worker.done.connect(lambda _p: None)
-        self.worker.fail.connect(lambda e: QMessageBox.critical(self, "Dashboard", f"Failed to load dashboard data:\n{e}"))
+        # final
+        self.worker.done.connect(self._on_worker_done)
+        self.worker.fail.connect(self._on_worker_fail)
         self.worker.start()
+
+    def _on_worker_done(self, _payload):
+        try:
+            if hasattr(self, "loading") and self.loading:
+                self.loading.hide_overlay()
+        except Exception:
+            pass
+
+    def _on_worker_fail(self, e: str):
+        try:
+            if hasattr(self, "loading") and self.loading:
+                self.loading.hide_overlay()
+        except Exception:
+            pass
+        QMessageBox.critical(self, "Dashboard", f"Failed to load dashboard data:\n{e}")
+
 
     def _render_accounts(self, accounts: dict):
         tot = accounts.get("totals", {})
@@ -992,6 +1136,9 @@ class DashboardApp(QMainWindow):
         try:
             if self.offline_chip.isVisible():
                 self.offline_chip._reposition()
+                
+            if hasattr(self, "loading") and self.loading:
+                self.loading.setGeometry(self.rect())  # keep full-window
 
             # Reposition version watermark
             if hasattr(self, "version_label"):

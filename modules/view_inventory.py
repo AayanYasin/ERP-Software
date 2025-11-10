@@ -3,7 +3,7 @@ from PyQt5.QtWidgets import (
     QHeaderView, QComboBox, QPushButton, QDialog,
     QDialogButtonBox, QFileDialog, QMessageBox, QCheckBox, QSpinBox, QProgressDialog, QApplication, QShortcut, QAbstractSpinBox
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl, QTimer, QPoint
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl, QPoint
 from PyQt5.QtGui import QFont, QKeySequence
 from firebase.config import db
 from fpdf import FPDF
@@ -11,9 +11,6 @@ import pandas as pd
 from datetime import datetime
 import os
 import json  # cache
-
-from PyQt5 import QtWebEngineWidgets
-from PyQt5.QtWebEngineWidgets import QWebEngineView
 
 # ---------------- Worker Thread: fetch inventory from Firestore (no UI freeze) ----------------
 class _InventoryLoaderWorker(QThread):
@@ -72,6 +69,16 @@ class _InventoryLoaderWorker(QThread):
                 "colors": sorted(colors),
                 "main_category_names": sorted(main_categories.keys()),
             }
+            admin_branches = []
+            try:
+                for admin in db.collection("users").where("role", "==", "admin").limit(1).stream():
+                    data = admin.to_dict() or {}
+                    admin_branches = data.get("branch", []) or []
+                    break
+            except Exception:
+                admin_branches = []
+                
+            payload["admin_branches"] = admin_branches
             self.finished_ok.emit(payload)
         except Exception as e:
             self.failed.emit(str(e))
@@ -83,16 +90,9 @@ class ViewInventory(QWidget):
         self.user_data = user_data
         self.is_admin = user_data.get("role") == "admin"  # Check if user is admin
         
-        # Fetch admin's branches from Firestore
-        admin_branches = self.get_admin_branches()
-        
-        # Check if current user has permission to see other branches
-        if "can_see_other_branches_inventory" in user_data.get("extra_perm", []):
-            # User has permission to see all branches from the admin
-            self.branches = admin_branches
-        else:
-            # Default: Show only the user's own branches
-            self.branches = user_data.get("branch", [])
+        self.branches = user_data.get("branch", [])
+        if isinstance(self.branches, str):
+            self.branches = [self.branches]
         
         self.main_categories = {}      # {name: doc_id}
         self.sub_categories = {}       # {sub_id: main_id}
@@ -456,16 +456,16 @@ class ViewInventory(QWidget):
             self.reload_async()
 
     # ---------------- UI loader ----------------
-    def get_admin_branches(self):
-        # Fetch branches from admin role document in Firestore
-        try:
-            admin_doc = db.collection("users").where("role", "==", "admin").limit(1).stream()
-            for admin in admin_doc:
-                admin_data = admin.to_dict()
-                return admin_data.get("branch", [])
-        except Exception as e:
-            print(f"Error fetching admin branches: {e}")
-            return []  # Return empty if something goes wrong
+    # def get_admin_branches(self):
+    #     # Fetch branches from admin role document in Firestore
+    #     try:
+    #         admin_doc = db.collection("users").where("role", "==", "admin").limit(1).stream()
+    #         for admin in admin_doc:
+    #             admin_data = admin.to_dict()
+    #             return admin_data.get("branch", [])
+    #     except Exception as e:
+    #         print(f"Error fetching admin branches: {e}")
+    #         return []  # Return empty if something goes wrong
         
     def show_loader(self, parent, title="Please wait...", message="Processing..."):
         loader = QProgressDialog(message, None, 0, 0, parent)
@@ -546,6 +546,19 @@ class ViewInventory(QWidget):
             payload.get("colors", []),
             payload.get("main_category_names", []),
         )
+        
+        # --- PERMISSIONS (moved from __init__) ---
+        admin_branches = payload.get("admin_branches", [])
+        user_branches  = self.user_data.get("branch", [])
+        if "can_see_other_branches_inventory" in self.user_data.get("extra_perm", []):
+            self.branches = admin_branches
+        else:
+            self.branches = user_branches
+        if isinstance(self.branches, str):
+            self.branches = [self.branches]
+
+        # force header rebuild on next refresh (branches changed)
+        self._last_headers = None
 
         # NEW: recompute filtered list once, then paginate
         self._filtered_dirty = True
@@ -579,6 +592,7 @@ class ViewInventory(QWidget):
             self._set_offline_badge(True)
             
     def open_image_for_row(self, row, col):
+        from PyQt5.QtWebEngineWidgets import QWebEngineView
         # Find the nearest header row upward that has an Item Code
         item_code_col = self.col_index.get("Item Code", 1)
         r = row

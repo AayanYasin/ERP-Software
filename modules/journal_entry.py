@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import (
     QMessageBox, QHeaderView, QAbstractItemView, QCompleter, QFrame, QSpacerItem, QSizePolicy, QStyledItemDelegate, QGraphicsDropShadowEffect
 )
 from PyQt5.QtCore import Qt, QDate
-from PyQt5.QtGui import QFont, QDoubleValidator, QColor
+from PyQt5.QtGui import QDoubleValidator, QColor
 from firebase.config import db
 import uuid
 import datetime

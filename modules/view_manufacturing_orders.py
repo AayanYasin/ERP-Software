@@ -1,9 +1,8 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QPushButton, QGraphicsScene, QDialog, QMessageBox, QListView, QFrame,
-    QTextBrowser, QScrollArea, QProgressDialog, QApplication, QInputDialog
+    QPushButton, QDialog, QMessageBox, QListView, QFrame,
+    QTextBrowser, QProgressDialog, QApplication
 )
-from PyQt5.QtGui import QPainter, QPen
 from PyQt5.QtCore import Qt, QSize
 from firebase.config import db
 from firebase_admin import firestore

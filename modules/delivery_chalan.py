@@ -57,6 +57,75 @@ QTableWidget { gridline-color: #e6e9f2; }
 QHeaderView::section { background: #f7f9fc; padding: 6px; border: none; border-bottom: 1px solid #e6e9f2; }
 """
 
+# ---- Live availability + transactional inventory helpers ----
+def _get_product_ref_by_code(item_code: str):
+    q = db.collection("products").where("item_code", "==", item_code).limit(1).get()
+    if not q:
+        raise RuntimeError(f"Product not found for code {item_code}")
+    return q[0].reference
+
+def _fetch_live_availability_for_keys(keys):
+    """
+    keys: iterable of tuples (item_code, branch, color, condition)
+    returns: {(item_code, branch, color, condition): live_available_float}
+    """
+    live = {}
+    # Minimize reads: one query per unique item_code
+    from collections import defaultdict
+    by_code = defaultdict(list)
+    for code, br, col, cond in keys:
+        by_code[code].append((code, br, col, cond))
+
+    for code, targets in by_code.items():
+        q = db.collection("products").where("item_code", "==", code).limit(1).get()
+        if not q:
+            for tup in targets:
+                live[tup] = 0.0
+            continue
+        d = q[0].to_dict() or {}
+        qty = d.get("qty") or {}
+        for _, br, col, cond in targets:
+            live[(code, br, col, cond)] = float(((qty.get(br) or {}).get(col) or {}).get(cond) or 0.0)
+    return live
+
+def _tx_mutate_qty(item_code: str,
+                   dec_branch: str, color: str, condition: str, dec_qty: float,
+                   inc_branch: str = None, inc_color: str = None, inc_condition: str = None, inc_qty: float = 0.0):
+    """
+    Single Firestore transaction on the product doc:
+      - Decrement dec_branch/color/condition by dec_qty (preventing negatives)
+      - Optionally increment inc_branch/inc_color/inc_condition by inc_qty
+    """
+    ref = _get_product_ref_by_code(item_code)
+    tr = firestore.client().transaction()
+
+    @firestore.transactional
+    def _do(tx):
+        snap = ref.get(transaction=tx)
+        data = snap.to_dict() or {}
+        qty_map = data.get("qty") or {}
+
+        # current values
+        curr_dec = int(((qty_map.get(dec_branch) or {}).get(color) or {}).get(condition) or 0)
+        new_dec  = curr_dec - int(dec_qty)
+        if new_dec < 0:
+            raise RuntimeError(f"Insufficient stock for {item_code} [{dec_branch}/{color}/{condition}] (have {curr_dec}, need {int(dec_qty)})")
+
+        update = {"qty": {dec_branch: {color: {condition: new_dec}}}}
+
+        if inc_branch and inc_qty > 0:
+            curr_inc = int(((qty_map.get(inc_branch) or {}).get(inc_color or color) or {}).get(inc_condition or condition) or 0)
+            new_inc  = curr_inc + int(inc_qty)
+            # merge the increment path too
+            update["qty"].setdefault(inc_branch, {})
+            update["qty"][inc_branch].setdefault(inc_color or color, {})
+            update["qty"][inc_branch][inc_color or color][inc_condition or condition] = new_inc
+
+        tx.set(ref, update, merge=True)
+
+    _do(tr)
+
+
 def _safe_float(v, default=0.0):
     try:
         return float(v)
@@ -348,52 +417,31 @@ def export_delivery_chalan_pdf(dc: dict, out_path: str):
 # -------------------------------
 
 class InventorySelectorDialog(QDialog):
-    """Select flattened inventory rows for a chosen branch. Returns list of items with quantities.
-
-    Changes:
-      - Detailed product label in Name column: "{name} - {L}{Lu}×{W}{Wu}[×{H}{Hu}] - {gauge}G"
-      - Removed "Add" checkbox. On OK, any row with Qty>0 is selected.
-      - LIVE FILTERING: filters apply instantly on any change (typing/selecting).
-      - NEW: Accepts `preselected` mapping so reopening dialog prefills previous quantities.
     """
+    Fast inventory picker:
+      - Builds the table once
+      - Filters by toggling row visibility (no rebuilds)
+      - Tiny debounce on text filters (120 ms)
+      - Per-row live 'Available' update as Qty changes
+    Returns selected rows in self.selected on accept().
+    """
+
     def __init__(self, branch: str, preselected=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Select Inventory Items")
         self.setMinimumSize(1100, 650)
+
+        # Inputs/state
         self.branch = branch
-        self.rows = []
-        self.selected = []
-        # preseed with previously selected rows (from main dialog)
-        self.selection = {**(preselected or {})}  # key -> qty typed by user (preserved across filters)
-        self.base_available = {}  # key -> original available
-        self.row_by_key = {}  # key -> row dict for later retrieval
+        self.rows = []                  # full dataset (dicts)
+        self.row_keys = []              # row index -> key string
+        self.selection = dict(preselected or {})   # key -> qty (float)
+        self.base_available = {}        # key -> base available (float)
+        self.row_by_key = {}            # key -> row dict
+        self.selected = []              # output on accept()
 
-        v = QVBoxLayout(self)
-
-        # Helpers for label formatting
-        def _fmt_dim(x):
-            try:
-                x = float(x)
-                if abs(x) < 1e-12:
-                    return ""
-                if abs(x - int(x)) < 1e-12:
-                    return str(int(x))
-                return str(x).rstrip('0').rstrip('.') if '.' in str(x) else str(x)
-            except Exception:
-                return ""
-
-        def _unit_disp(u: str) -> str:
-            u = (u or "").strip()
-            if u.lower() in ("inch", "inches", 'in'):
-                return '"'
-            if u.lower() in ("ft", "feet", "foot"):
-                return "'"
-            return u  # keep MM etc.
-
-        self._fmt_dim = _fmt_dim
-        self._unit_disp = _unit_disp
-
-        # Filters
+        # ---- UI: Filters ----
+        main = QVBoxLayout(self)
         filt_box = QGroupBox("Filters")
         grid = QGridLayout(filt_box)
 
@@ -417,155 +465,147 @@ class InventorySelectorDialog(QDialog):
         grid.addWidget(QLabel("Color"), 2, 0); grid.addWidget(self.f_color, 2, 1, 1, 3)
         grid.addWidget(QLabel("Condition"), 2, 4); grid.addWidget(self.f_cond, 2, 5, 1, 3)
         grid.addWidget(btn_clear, 0, 7)
+        main.addWidget(filt_box)
 
-        v.addWidget(filt_box)
-
-        # Live wiring
-        self.search.textChanged.connect(self._apply_filter)
-        self.f_len.textChanged.connect(self._apply_filter)
-        self.f_wid.textChanged.connect(self._apply_filter)
-        self.f_hei.textChanged.connect(self._apply_filter)
-        self.f_gau.textChanged.connect(self._apply_filter)
-        self.f_color.currentIndexChanged.connect(self._apply_filter)
-        self.f_cond.currentIndexChanged.connect(self._apply_filter)
-
-        # Table
+        # ---- UI: Table ----
         self.tbl = QTableWidget(0, 7)
-        self.tbl.setHorizontalHeaderLabels(["Branch", "Item Code", "Name", "Color", "Condition", "Available", "Qty to Deliver"])
-        self.tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.tbl.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.tbl.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        self.tbl.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        self.tbl.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        self.tbl.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.tbl.setHorizontalHeaderLabels([
+            "Branch", "Item Code", "Name", "Color", "Condition", "Available", "Qty to Deliver"
+        ])
+        hh = self.tbl.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.Stretch)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(6, QHeaderView.ResizeToContents)
         self.tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
-        # NEW: make all table cells read-only; Qty stays editable because it's a QLineEdit cell widget
         self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        v.addWidget(self.tbl)
+        main.addWidget(self.tbl)
 
+        # ---- UI: Buttons ----
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self._collect_and_accept)
         btns.rejected.connect(self.reject)
-        v.addWidget(btns)
+        main.addWidget(btns)
 
+        # ---- Debounce for text filters ----
+        self._debounce = QTimer(self); self._debounce.setSingleShot(True)
+        self._debounce.timeout.connect(self._apply_filter)
+        for w in (self.search, self.f_len, self.f_wid, self.f_hei, self.f_gau):
+            w.textChanged.connect(lambda _=None: self._debounce.start(120))
+        self.f_color.currentIndexChanged.connect(self._apply_filter)
+        self.f_cond.currentIndexChanged.connect(self._apply_filter)
+
+        # ---- Load + render once ----
         self._load_inventory()
+        self._render_all_rows_once()
+        self._apply_filter()  # respect default filters
+
+    # ---------- Helpers ----------
+    def _fmt_dim(self, x):
+        try:
+            x = float(x)
+            if abs(x) < 1e-12: return ""
+            if abs(x - int(x)) < 1e-12: return str(int(x))
+            s = f"{x}"
+            return s.rstrip("0").rstrip(".") if "." in s else s
+        except Exception:
+            return ""
+
+    def _unit_disp(self, u: str) -> str:
+        u = (u or "").strip().lower()
+        return '"' if u in ("inch","inches","in") else ("'" if u in ("ft","feet","foot") else (u or ""))
 
     def _make_label(self, it):
-        L = self._fmt_dim(it.get("length"))
-        W = self._fmt_dim(it.get("width"))
-        H = self._fmt_dim(it.get("height"))
-        Lu = self._unit_disp(it.get("length_unit"))
-        Wu = self._unit_disp(it.get("width_unit"))
-        Hu = self._unit_disp(it.get("height_unit"))
-        size = f"{L}{Lu}×{W}{Wu}"
-        if H:
-            size += f"×{H}{Hu}"
-        return f"{it.get('name','')} - {size} - {self._fmt_dim(it.get('gauge'))}G"
+        L = self._fmt_dim(it.get("length")); W = self._fmt_dim(it.get("width")); H = self._fmt_dim(it.get("height"))
+        Lu = self._unit_disp(it.get("length_unit")); Wu = self._unit_disp(it.get("width_unit")); Hu = self._unit_disp(it.get("height_unit"))
+        size = f"{L}{Lu}×{W}{Wu}" + (f"×{H}{Hu}" if H else "")
+        g = self._fmt_dim(it.get("gauge"))
+        return f"{it.get('name','')} - {size} - {g}G"
 
+    # ---------- Data load ----------
     def _load_inventory(self):
         self.rows.clear()
+        color_values, cond_values = set(), set()
         want_branch = (self.branch or "").strip() or None
-
-        color_values = set()
-        cond_values = set()
 
         for snap in db.collection("products").stream():
             d = snap.to_dict() or {}
             item_code = (d.get("item_code") or "").strip()
             name = (d.get("name") or "Unnamed").strip()
 
-            length = _safe_float(d.get("length"))
-            width  = _safe_float(d.get("width"))
-            height = _safe_float(d.get("height"))
-            gauge  = _safe_float(d.get("gauge"))
+            length = _safe_float(d.get("length")); width = _safe_float(d.get("width"))
+            height = _safe_float(d.get("height")); gauge = _safe_float(d.get("gauge"))
             length_unit = str(d.get("length_unit") or "").strip()
             width_unit  = str(d.get("width_unit") or "").strip()
             height_unit = str(d.get("height_unit") or "").strip()
 
-            qty_map = d.get("qty") or {}
-            for branch, color, cond, av in _flatten_qty_rows(qty_map):
+            for branch, color, cond, av in _flatten_qty_rows(d.get("qty") or {}):
                 if want_branch and branch != want_branch:
                     continue
-                color_values.add(color)
-                cond_values.add(cond)
+                if _safe_float(av, 0.0) <= 0:       # skip zero/negative stock
+                    continue
+                color_values.add(color); cond_values.add(cond)
                 row = {
                     "product_id": snap.id,
                     "branch": branch,
-
                     "item_code": item_code,
                     "name": name,
                     "color": color,
                     "condition": cond,
-                    "available": av,
+                    "available": _safe_float(av, 0.0),
                     "length": length, "width": width, "height": height, "gauge": gauge,
                     "length_unit": length_unit, "width_unit": width_unit, "height_unit": height_unit,
                 }
                 row["detailed_label"] = self._make_label(row)
                 self.rows.append(row)
+
                 key = f"{branch}|{item_code}|{color}|{cond}"
-                self.base_available[key] = av
+                self.base_available[key] = _safe_float(av, 0.0)
                 self.row_by_key[key] = row
 
-        # populate combos
-        for c in sorted(color_values):
-            self.f_color.addItem(c)
-        for c in sorted(cond_values):
-            self.f_cond.addItem(c)
+        for c in sorted(color_values): self.f_color.addItem(c)
+        for c in sorted(cond_values):  self.f_cond.addItem(c)
 
-        self._render_rows(self.rows)  # selections preserved; avail recalculated per row
+    # ---------- Build once ----------
+    def _render_all_rows_once(self):
+        self.tbl.setRowCount(len(self.rows))
+        self.row_keys = []
 
-    def _render_rows(self, rows):
-        self.tbl.setRowCount(len(rows))
-        for r, it in enumerate(rows):
+        for r, it in enumerate(self.rows):
             key = f"{it['branch']}|{it['item_code']}|{it['color']}|{it['condition']}"
-            sel_q = self.selection.get(key, 0.0)
-            base_av = self.base_available.get(key, it.get('available', 0.0))
-            live_av = max(0.0, float(base_av) - float(sel_q))
+            self.row_keys.append(key)
 
-            # Cells
-            self.tbl.setItem(r, 0, QTableWidgetItem(it['branch']))
-            item_code_cell = QTableWidgetItem(it['item_code'])
-            item_code_cell.setData(Qt.UserRole, key)
-            self.tbl.setItem(r, 1, item_code_cell)
-            self.tbl.setItem(r, 2, QTableWidgetItem(it['detailed_label']))
-            self.tbl.setItem(r, 3, QTableWidgetItem(it['color']))
-            self.tbl.setItem(r, 4, QTableWidgetItem(it['condition']))
+            sel_q = _safe_float(self.selection.get(key, 0.0), 0.0)
+            base_av = _safe_float(self.base_available.get(key, it.get("available", 0.0)), 0.0)
+            live_av = max(0.0, base_av - sel_q)
+
+            # Col 0: Branch
+            self.tbl.setItem(r, 0, QTableWidgetItem(it["branch"]))
+
+            # Col 1: Item Code (store key)
+            code_item = QTableWidgetItem(it["item_code"])
+            code_item.setData(Qt.UserRole, key)
+            self.tbl.setItem(r, 1, code_item)
+
+            # Col 2: Name (detailed)
+            self.tbl.setItem(r, 2, QTableWidgetItem(it["detailed_label"]))
+
+            # Col 3–5: Color / Condition / Available
+            self.tbl.setItem(r, 3, QTableWidgetItem(it["color"]))
+            self.tbl.setItem(r, 4, QTableWidgetItem(it["condition"]))
             self.tbl.setItem(r, 5, QTableWidgetItem(f"{live_av:g}"))
 
-            qty_str = (str(int(sel_q)) if abs(sel_q - int(sel_q)) < 1e-12 else str(sel_q)) if sel_q else "0"
-            qty = QLineEdit(qty_str)
-            qty.textChanged.connect(lambda text, k=key: self._on_qty_changed(k, text))
-            self.tbl.setCellWidget(r, 6, qty)
+            # Col 6: Qty editor (per-row widget kept alive; cheap now that we don't rebuild)
+            qty_str = (str(int(sel_q)) if abs(sel_q - int(sel_q)) < 1e-12 else f"{sel_q:g}") if sel_q else "0"
+            editor = QLineEdit(qty_str); editor.setPlaceholderText("0")
+            editor.textChanged.connect(lambda text, k=key, row=r: self._on_qty_changed(k, text, row))
+            self.tbl.setCellWidget(r, 6, editor)
 
-    def _on_qty_changed(self, key, text):
-        # Parse, clamp to >=0; do not mutate text to avoid cursor jumps
-        q = 0.0
-        try:
-            q = float(text) if str(text).strip() else 0.0
-        except Exception:
-            q = 0.0
-        if q < 0:
-            q = 0.0
-        self.selection[key] = q
-        # Update the 'Available' cell live
-        base_av = self.base_available.get(key, 0.0)
-        live_av = max(0.0, float(base_av) - float(q))
-        # Find the row with this key
-        for r in range(self.tbl.rowCount()):
-            it = self.tbl.item(r, 1)
-            if it and it.data(Qt.UserRole) == key:
-                av_item = self.tbl.item(r, 5)
-                if av_item:
-                    av_item.setText(f"{live_av:g}")
-                break
-
-    def _clear_filters(self):
-        self.search.clear()
-        self.f_len.clear(); self.f_wid.clear(); self.f_hei.clear(); self.f_gau.clear()
-        self.f_color.setCurrentIndex(0); self.f_cond.setCurrentIndex(0)
-        self._render_rows(self.rows)
-
+    # ---------- Filtering (hide/show only) ----------
     def _apply_filter(self):
         term = (self.search.text() or "").lower().strip()
         want_len = self.f_len.text().strip()
@@ -573,74 +613,93 @@ class InventorySelectorDialog(QDialog):
         want_hei = self.f_hei.text().strip()
         want_gau = self.f_gau.text().strip()
         want_color = self.f_color.currentText()
-        want_cond = self.f_cond.currentText()
+        want_cond  = self.f_cond.currentText()
 
         def match_num(filter_text, value):
-            if not filter_text:
-                return True
+            if not filter_text: return True
             try:
                 return abs(float(filter_text) - float(value)) < 1e-9
             except Exception:
                 return filter_text.lower() in str(value).lower()
 
-        filtered = []
-        for it in self.rows:
-            if want_color != "Any" and it["color"] != want_color:
-                continue
-            if want_cond != "Any" and it["condition"] != want_cond:
-                continue
-            if not match_num(want_len, it["length"]):
-                continue
-            if not match_num(want_wid, it["width"]):
-                continue
-            if not match_num(want_hei, it["height"]):
-                continue
-            if not match_num(want_gau, it["gauge"]):
-                continue
+        for r, it in enumerate(self.rows):
+            show = True
+            if _safe_float(it.get("available", 0.0), 0.0) <= 0:
+                show = False
+            if show and want_color != "Any" and it["color"] != want_color: show = False
+            if show and want_cond  != "Any" and it["condition"] != want_cond: show = False
+            if show and not match_num(want_len, it["length"]): show = False
+            if show and not match_num(want_wid, it["width"]):  show = False
+            if show and not match_num(want_hei, it["height"]): show = False
+            if show and not match_num(want_gau, it["gauge"]):  show = False
 
-            if term:
-                hay = " ".join([it["branch"], it["item_code"], it["name"], it["color"], it["condition"], it["detailed_label"]]).lower()
+            if show and term:
+                # Build once per row; cheap enough without full rebuild
+                hay = " ".join([
+                    it["branch"], it["item_code"], it["name"],
+                    it["color"], it["condition"], it["detailed_label"]
+                ]).lower()
                 if term not in hay:
-                    continue
-            filtered.append(it)
+                    show = False
 
-        self._render_rows(filtered)
+            self.tbl.setRowHidden(r, not show)
+
+    # ---------- Qty edits (update only this row's 'Available') ----------
+    def _on_qty_changed(self, key, text, row_idx):
+        try:
+            q = float(text) if str(text).strip() else 0.0
+        except Exception:
+            q = 0.0
+        if q < 0: q = 0.0
+        self.selection[key] = q
+
+        base_av = _safe_float(self.base_available.get(key, 0.0), 0.0)
+        live_av = max(0.0, base_av - q)
+        av_item = self.tbl.item(row_idx, 5)
+        if av_item:
+            av_item.setText(f"{live_av:g}")
+
+    # ---------- Clear + Accept ----------
+    def _clear_filters(self):
+        self.search.clear()
+        self.f_len.clear(); self.f_wid.clear(); self.f_hei.clear(); self.f_gau.clear()
+        self.f_color.setCurrentIndex(0); self.f_cond.setCurrentIndex(0)
+        self._apply_filter()
 
     def _collect_and_accept(self):
-        items = []
-        # Validate selections against base availability
+        # Validate selected against base availability
         for key, qty in self.selection.items():
-            qty = float(qty or 0)
-            if qty <= 0:
-                continue
-            base_av = float(self.base_available.get(key, 0.0))
-            if qty > base_av + 1e-9:
-                # Find label for friendly message
-                row = self.row_by_key.get(key, {})
-                branch, code, color, cond = key.split('|')
-                QMessageBox.warning(self, 'Qty too high', f"[{branch}] {code} / {color} / {cond}: Qty {qty:g} exceeds available {base_av:g}. Reduce it.")
+            q = _safe_float(qty, 0.0)
+            if q <= 0: continue
+            base_av = _safe_float(self.base_available.get(key, 0.0), 0.0)
+            if q > base_av + 1e-9:
+                b, code, col, cond = key.split("|")
+                QMessageBox.warning(self, "Qty too high",
+                                    f"[{b}] {code} / {col} / {cond}: Qty {q:g} exceeds available {base_av:g}. Reduce it.")
                 return
-        # Build items list
+
+        # Build results
+        out = []
         for key, qty in self.selection.items():
-            qty = float(qty or 0)
-            if qty <= 0:
-                continue
-            row = self.row_by_key.get(key, {})
-            if not row:
-                continue
-            items.append({
-                'branch': row.get('branch',''),
-                'item_code': row.get('item_code',''),
-                'product_name': row.get('detailed_label','') or row.get('name',''),
-                'color': row.get('color',''),
-                'condition': row.get('condition',''),
-                'qty': qty,
+            q = _safe_float(qty, 0.0)
+            if q <= 0: continue
+            row = self.row_by_key.get(key)
+            if not row: continue
+            out.append({
+                "branch": row.get("branch", ""),
+                "item_code": row.get("item_code", ""),
+                "product_name": row.get("detailed_label", "") or row.get("name", ""),
+                "color": row.get("color", ""),
+                "condition": row.get("condition", ""),
+                "qty": q,
             })
-        if not items:
-            QMessageBox.warning(self, 'No items', 'Enter quantity (> 0) for at least one row.')
+        if not out:
+            QMessageBox.warning(self, "No items", "Enter quantity (> 0) for at least one row.")
             return
-        self.selected = items
+
+        self.selected = out
         self.accept()
+
 
 # -------------------------------
 # Delivery chalan form
@@ -970,29 +1029,14 @@ class DeliveryChalanForm(QDialog):
         return f"DC-{nxt:06d}"
 
     def _save(self):
+        # --- 0) Basic checks ---
         if not self.items:
             QMessageBox.warning(self, "Missing Items", "Please select at least one item.")
             return
 
-        # Source branch
         branch = (self.branch_cb.currentText() or "").strip() or "-"
-
-        # 1) Reserve DC number now and show preview (assignment happens here)
-        dc_number = self._reserve_dc_number()
-        try:
-            self.dc_no_preview.setText(dc_number)
-        except Exception:
-            pass
-
-        # 2) Physical DC number (optional integer)
-        phys_text = (self.phys_dc_no.text() or "").strip()
-        try:
-            physical_dc_no = int(phys_text) if phys_text else 0
-        except Exception:
-            physical_dc_no = 0
-
-        # 3) Canonicalize mode and destination branch ONCE
         mode = (self.mode_cb.currentText() or "").strip()  # "Chalan" or "Inventory Transfer"
+
         dest_branch = ""
         if mode == "Inventory Transfer":
             dest_branch = (self.dest_branch_cb.currentText() or "").strip() if self.dest_branch_cb.isVisible() else ""
@@ -1003,22 +1047,21 @@ class DeliveryChalanForm(QDialog):
                 QMessageBox.warning(self, "Invalid Destination", "Destination branch must be different from the source branch.")
                 return
 
-        # 4) Delivery location text (hidden/ignored for transfers)
+        # Delivery location (ignored for transfer)
         delivery_location_text = "" if mode == "Inventory Transfer" else (self.delivery_location.text() or "").strip()
 
-        # 5) Vehicle Person from dropdown (account-linked)
+        # Vehicle person (+ account id if available)
         vp_data = self.vehicle_person_cb.currentData() or {}
         vehicle_person_name = (vp_data.get("name") or self.vehicle_person_cb.currentText() or "").strip()
         vehicle_person_account_id = (vp_data.get("account_id") or "").strip()
 
-        # 6) Delivery Fare (+ payer) — VALIDATION: required iff Sender Will Pay
+        # Delivery fare (+ payer)
         fare_text = (self.delivery_fare_edit.text() or "0").replace(",", "").strip()
         try:
             delivery_fare = float(fare_text)
         except Exception:
             delivery_fare = 0.0
         delivery_fare_payer = (self.delivery_fare_payer_cb.currentText() or "").strip()  # "Sender Will Pay" | "Receiver Will Pay"
-
         if delivery_fare_payer == "Sender Will Pay":
             if delivery_fare <= 0:
                 QMessageBox.warning(self, "Delivery Fare Required", "Enter a positive Delivery Fare when 'Sender Will Pay' is selected.")
@@ -1027,7 +1070,112 @@ class DeliveryChalanForm(QDialog):
                 QMessageBox.warning(self, "Vehicle Person Required", "Select a Vehicle Person/Employee account for 'Sender Will Pay'.")
                 return
 
-        # 7) Build payload (include fields the detail dialog expects)
+        # Physical DC number (optional int)
+        phys_text = (self.phys_dc_no.text() or "").strip()
+        try:
+            physical_dc_no = int(phys_text) if phys_text else 0
+        except Exception:
+            physical_dc_no = 0
+
+        # --- 1) Reserve DC number now (visible to the user, but don't write the doc yet) ---
+        dc_number = self._reserve_dc_number()
+        try:
+            self.dc_no_preview.setText(dc_number)
+        except Exception:
+            pass
+
+        # --- 2) PRE-FLIGHT: recheck live stock for every (item_code, branch, color, condition) ---
+        keys = []
+        for it in (self.items or []):
+            code = str(it.get("item_code") or "").strip()
+            col  = str(it.get("color") or "No Color")
+            cond = str(it.get("condition") or "New")
+            qty  = _safe_float(it.get("qty", 0), 0.0)
+            if code and qty > 0:
+                keys.append((code, branch, col, cond))
+        if not keys:
+            QMessageBox.warning(self, "Missing Items", "Please select at least one valid item with qty > 0.")
+            return
+
+        try:
+            live = _fetch_live_availability_for_keys(keys)
+        except Exception as e:
+            QMessageBox.warning(self, "Inventory", f"Could not fetch live availability:\n{e}")
+            return
+
+        problems = []
+        for it in (self.items or []):
+            code = str(it.get("item_code") or "").strip()
+            col  = str(it.get("color") or "No Color")
+            cond = str(it.get("condition") or "New")
+            need = _safe_float(it.get("qty", 0), 0.0)
+            have = float(live.get((code, branch, col, cond), 0.0))
+            if need > have + 1e-9:
+                problems.append(f"{code} / {col} / {cond}: need {need:g}, have {have:g}")
+        if problems:
+            QMessageBox.information(
+                self, "Inventory changed",
+                "Some items no longer have enough stock:\n\n- " + "\n- ".join(problems) + "\n\nPlease adjust and try again."
+            )
+            return
+
+        # --- 3) TRANSACTIONAL MUTATION: decrement (and increment for transfers) per product ---
+        # We apply each product change in its own Firestore transaction via _tx_mutate_qty.
+        # To be safe against cross-user races, we keep a log and attempt best-effort rollback if any step fails.
+        applied = []  # list of tuples for rollback: (code, branch, color, cond, dec_qty, inc_branch, inc_color, inc_cond, inc_qty)
+        try:
+            for it in self.items:
+                code = str(it.get("item_code") or "").strip()
+                color = str(it.get("color") or "No Color")
+                cond  = str(it.get("condition") or "New")
+                qty   = _safe_float(it.get("qty", 0), 0.0)
+                if not code or qty <= 0:
+                    continue
+
+                if mode == "Inventory Transfer" and dest_branch and dest_branch != branch:
+                    # atomic dec @ source + inc @ dest (same transaction on the product doc)
+                    _tx_mutate_qty(
+                        item_code=code,
+                        dec_branch=branch, color=color, condition=cond, dec_qty=qty,
+                        inc_branch=dest_branch, inc_color=color, inc_condition=cond, inc_qty=qty
+                    )
+                    applied.append((code, branch, color, cond, qty, dest_branch, color, cond, qty))
+                else:
+                    # chalan out: just decrement from source
+                    _tx_mutate_qty(
+                        item_code=code,
+                        dec_branch=branch, color=color, condition=cond, dec_qty=qty
+                    )
+                    applied.append((code, branch, color, cond, qty, None, None, None, 0.0))
+        except Exception as e:
+            # Best-effort rollback for anything we already applied
+            try:
+                for code, dec_br, col, cnd, q, inc_br, inc_col, inc_cnd, inc_q in reversed(applied):
+                    # Reverse what we did:
+                    # If it was a transfer: dec dest, inc back to source
+                    if inc_br and inc_q > 0:
+                        try:
+                            _tx_mutate_qty(
+                                item_code=code,
+                                dec_branch=inc_br, color=inc_col, condition=inc_cnd, dec_qty=inc_q,
+                                inc_branch=dec_br, inc_color=col, inc_condition=cnd, inc_qty=q
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        # Plain chalan: add back to source
+                        try:
+                            _tx_mutate_qty(
+                                item_code=code,
+                                dec_branch=dec_br, color=col, condition=cnd, dec_qty= -q  # negative dec = increment
+                            )
+                        except Exception:
+                            pass
+            finally:
+                QMessageBox.warning(self, "Inventory", f"Could not update inventory:\n{e}\n\nNo DC was saved.")
+                return
+
+        # --- 4) If we are here, inventory is successfully adjusted. Build & save the DC document. ---
         payload = {
             "dc_no": dc_number,
             "date": self.date_edit.date().toString("yyyy-MM-dd"),
@@ -1051,51 +1199,23 @@ class DeliveryChalanForm(QDialog):
             "transfer_to_branch": dest_branch,
         }
 
-        # 8) Save chalan
         chalan_ref = db.collection("delivery_chalans").document()
-        chalan_ref.set(payload)
+        try:
+            chalan_ref.set(payload)
+        except Exception as e:
+            # Extremely rare: doc save failed after inventory mutated.
+            # We won't attempt to roll back inventory again here (already succeeded); instead, inform the user.
+            QMessageBox.warning(
+                self, "Saved Partially",
+                f"Inventory updated but Delivery Chalan save failed:\n{e}\n\n"
+                "Please contact admin with this message. You can manually reconstruct the DC from recent activity."
+            )
+            return
 
-        # 9) Inventory adjustments
-        for it in self.items:
-            code = it.get("item_code", ""); color = it.get("color", ""); cond = it.get("condition", "")
-            qty = _safe_float(it.get("qty", 0))
-            if not code or qty <= 0:
-                continue
-            try:
-                qdocs = db.collection("products").where("item_code", "==", code).limit(1).get()
-                if not qdocs:
-                    continue
-                pd = qdocs[0]; pobj = pd.to_dict() or {}
-                qty_dict = pobj.get("qty") or {}
-
-                # Decrement from source branch/color/condition
-                try:
-                    qty_dict.setdefault(branch, {})
-                    qty_dict[branch].setdefault(color, {})
-                    prev = _safe_float(qty_dict[branch][color].get(cond, 0))
-                    qty_dict[branch][color][cond] = max(0.0, prev - qty)
-                    db.collection("products").document(pd.id).update({"qty": qty_dict})
-                except Exception as e1:
-                    print("Inventory decrement failed for", code, color, cond, ":", e1)
-
-                # Inventory Transfer: increment destination branch
-                if mode == "Inventory Transfer" and dest_branch and dest_branch != branch:
-                    try:
-                        qty_dict.setdefault(dest_branch, {})
-                        qty_dict[dest_branch].setdefault(color, {})
-                        prev_to = _safe_float(qty_dict[dest_branch][color].get(cond, 0))
-                        qty_dict[dest_branch][color][cond] = prev_to + qty
-                        db.collection("products").document(pd.id).update({"qty": qty_dict})
-                    except Exception as e2:
-                        print("Inventory increment (transfer) failed for", code, color, cond, ":", e2)
-            except Exception as e:
-                print("Inventory product fetch failed for", code, ":", e)
-
-        # 10) If Sender Will Pay → create JE (Credit Employee/Vehicle Person, Debit Opening Balances Equity)
-        #     — with balance_before snapshots and atomic balance bumps (matches journal_entry.py).
+        # --- 5) Post Delivery Fare JE if Sender Will Pay (unchanged logic, but now after DC is saved) ---
         if delivery_fare_payer == "Sender Will Pay" and delivery_fare > 0 and vehicle_person_account_id:
             try:
-                # Find or create Opening Balances Equity (type **Equity**)
+                # Find or create Opening Balances Equity (type **Equity/Asset** as per your existing logic)
                 eq_q = db.collection("accounts").where("slug", "==", "opening_balances_equity").limit(1).get()
                 if eq_q:
                     equity_id = eq_q[0].id
@@ -1103,6 +1223,7 @@ class DeliveryChalanForm(QDialog):
                     equity_name = eq_doc.get("name", "System Offset Account")
                     equity_type = eq_doc.get("type", "Asset")
                 else:
+                    # Fallback create (mirrors existing logic)
                     from re import sub as _re_sub
                     def _generate_code_once(acc_type):
                         prefix = {"Asset":"1","Liability":"2","Equity":"3","Income":"4","Expense":"5"}.get(acc_type, "9")
@@ -1150,50 +1271,34 @@ class DeliveryChalanForm(QDialog):
                     equity_name = "System Offset Account"
                     equity_type = "Asset"
 
-                # Fetch current balances / types for both accounts (to set balance_before & compute net)
+                # Current balances (for balance_before snapshots)
+                def _curr_bal(acc_id):
+                    try: a = db.collection("accounts").document(acc_id).get().to_dict() or {}; return float(a.get("current_balance", 0.0) or 0.0)
+                    except Exception: return 0.0
+
                 # Vehicle/employee account
                 try:
                     vp_snap = db.collection("accounts").document(vehicle_person_account_id).get()
                     vp_doc = vp_snap.to_dict() or {}
-                    vp_type = (vp_doc.get("type") or "Liability")  # employees are usually Liability sub-accounts
-                    vp_pre = float(vp_doc.get("current_balance", 0.0) or 0.0)
+                    vp_type = (vp_doc.get("type") or "Liability")
+                    vp_pre  = float(vp_doc.get("current_balance", 0.0) or 0.0)
                 except Exception:
-                    vp_type = "Liability"
-                    vp_pre = 0.0
+                    vp_type = "Liability"; vp_pre = 0.0
 
-                # Equity account pre-balance
-                try:
-                    eq_snap = db.collection("accounts").document(equity_id).get()
-                    eq_doc2 = eq_snap.to_dict() or {}
-                    eq_pre = float(eq_doc2.get("current_balance", 0.0) or 0.0)
-                except Exception:
-                    eq_pre = 0.0
-
-                # Build JE lines (Sender Will Pay: Credit Employee, Debit Equity)
                 debit_line = {
-                    "account_id": equity_id,
-                    "account_name": equity_name,
-                    "debit": delivery_fare,
-                    "credit": 0.0,
-                    "balance_before": 0,
+                    "account_id": equity_id, "account_name": equity_name,
+                    "debit": delivery_fare, "credit": 0.0, "balance_before": _curr_bal(equity_id),
                 }
                 credit_line = {
-                    "account_id": vehicle_person_account_id,
-                    "account_name": vehicle_person_name or "Vehicle Person",
-                    "debit": 0.0,
-                    "credit": delivery_fare,
-                    "balance_before": vp_pre,
+                    "account_id": vehicle_person_account_id, "account_name": vehicle_person_name or "Vehicle Person",
+                    "debit": 0.0, "credit": delivery_fare, "balance_before": vp_pre,
                 }
 
-                # Net changes per journal_entry.py rules:
-                # For Asset/Expense: net = debit - credit; else (Liability/Equity/Income): net = credit - debit
                 def _net_change(acc_type, debit, credit):
                     return (debit - credit) if acc_type in ["Asset", "Expense"] else (credit - debit)
 
-                eq_net = _net_change(equity_type, debit_line["debit"], debit_line["credit"])
                 vp_net = _net_change(vp_type, credit_line["debit"], credit_line["credit"])
 
-                # JE header — use the UI date as a proper datetime (like journal_entry.py)
                 date_py = self.date_edit.date().toPyDate()
                 je_date = datetime.datetime.combine(date_py, datetime.datetime.min.time())
                 branch_val = self.user_data.get("branch")
@@ -1212,7 +1317,6 @@ class DeliveryChalanForm(QDialog):
                     "meta": {"kind": "opening_balance", "dc_no": dc_number}
                 }
 
-                # Atomically create JE + bump balances for both accounts
                 batch = db.batch()
                 je_ref = db.collection("journal_entries").document()
                 batch.set(je_ref, je)
@@ -1220,9 +1324,8 @@ class DeliveryChalanForm(QDialog):
                             {"current_balance": firestore.Increment(vp_net)})
                 batch.commit()
 
-                # Link the JE back to this DC
+                # Link JE back to DC
                 chalan_ref.update({"fare_je_id": je_ref.id})
-
             except Exception as e:
                 # Non-fatal: DC already saved; just inform user
                 print("Failed to post Delivery Fare JE:", e)
@@ -1232,9 +1335,9 @@ class DeliveryChalanForm(QDialog):
                     f"Chalan {dc_number} saved, but the Delivery Fare journal entry could not be posted.\n{e}"
                 )
 
+        # --- 6) Done ---
         QMessageBox.information(self, "Saved", f"Delivery Chalan {dc_number} created and inventory updated.")
         self.accept()
-
 
 
 

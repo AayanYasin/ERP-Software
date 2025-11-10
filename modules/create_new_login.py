@@ -1,7 +1,7 @@
 # ui/create_new_login.py
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QLineEdit, QPushButton, QVBoxLayout,
-    QHBoxLayout, QCheckBox, QMessageBox, QComboBox, QScrollArea, QFrame
+    QHBoxLayout, QCheckBox, QMessageBox, QComboBox, QScrollArea
 )
 from PyQt5.QtGui import QFont
 from PyQt5.QtCore import Qt, pyqtSignal

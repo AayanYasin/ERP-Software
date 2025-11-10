@@ -19,24 +19,732 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget,
     QTableWidgetItem, QDialog, QFormLayout, QComboBox, QLineEdit, QTextEdit,
     QHeaderView, QAbstractItemView, QMessageBox, QDateEdit, QFileDialog,
-    QDoubleSpinBox, QToolBar, QAction, QFrame, QSpinBox
+    QDoubleSpinBox, QToolBar, QAction, QFrame, QDialogButtonBox, QGridLayout, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QDate
+from PyQt5.QtCore import Qt, QDate, QTimer
 from PyQt5.QtGui import QFont
 from firebase.config import db
 from firebase_admin import firestore
-import os, sys, tempfile, shutil, datetime
+import os, sys, tempfile, shutil
+import tempfile, os
+from datetime import datetime
 
-# If you use your Inventory selector
-try:
-    from modules.delivery_chalan import InventorySelectorDialog
-except Exception:
-    InventorySelectorDialog = None
+# ---------- Helper dialogs used by the module (kept unchanged, referenced functions) ----------
+# Note: The functions _edit_single_item_dialog and _edit_rates_dialog are referenced
+# in the original implementation. Ensure they exist elsewhere in your codebase.
+# If not present, you will need to re-add them here (they were in original file).
 
-# ============ Utilities & Helpers ============
+# End of file
+
+# -------- Inline editors --------
+
+def _edit_single_item_dialog(parent, item):
+    dlg = QDialog(parent); dlg.setWindowTitle("Edit Item")
+    lay = QFormLayout(dlg)
+
+    code = QLabel(item.get("item_code",""))
+    name = QLabel(item.get("product_name",""))
+
+    colors = _load_pc_colors()
+    src_lbl = QLabel(str(item.get("src_color") or ""))
+    pc_cb = QComboBox()
+    if colors: pc_cb.addItems(colors)
+    pc_init = str(item.get("pc_color") or item.get("src_color") or "")
+    if pc_init and (pc_init not in (colors or [])): pc_cb.insertItem(0, pc_init)
+    if pc_init: pc_cb.setCurrentText(pc_init)
+
+    cond = QLineEdit(str(item.get("condition") or ""))
+    qty_sp = QDoubleSpinBox(); qty_sp.setDecimals(3); qty_sp.setMaximum(1e9); qty_sp.setValue(float(item.get("qty") or 0))
+    rate_sp = QDoubleSpinBox(); rate_sp.setDecimals(2); rate_sp.setMaximum(1e9); rate_sp.setValue(float(item.get("rate") or 0))
+
+    unit_cb = QComboBox(); unit_cb.addItems(["sqft","rft","cbft"]); unit_cb.setCurrentText(item.get("unit") or "sqft")
+
+    lay.addRow("Item Code:", code)
+    lay.addRow("Name:", name)
+    lay.addRow("Source Color:", src_lbl)
+    lay.addRow("PC Color:", pc_cb)
+    lay.addRow("Condition:", cond)
+    lay.addRow("Qty:", qty_sp)
+    lay.addRow("Rate:", rate_sp)
+    lay.addRow("Unit:", unit_cb)
+
+    bb = QHBoxLayout(); ok = QPushButton("OK"); cc = QPushButton("Cancel")
+    ok.clicked.connect(dlg.accept); cc.clicked.connect(dlg.reject)
+    bb.addStretch(1); bb.addWidget(ok); bb.addWidget(cc); lay.addRow(bb)
+
+    if dlg.exec_():
+        obj = dict(item)
+        obj.update({
+            "pc_color": pc_cb.currentText(),
+            "condition": cond.text().strip() or item.get("condition"),
+            "qty": float(qty_sp.value()),
+            "rate": float(rate_sp.value()),
+            "unit": unit_cb.currentText(),
+        })
+
+        # detailed amount = qty × (measure by unit) × rate
+        meta = obj.get("meta") or {}
+        def _to_feet(v, u):
+            u = (str(u or "").strip().lower())
+            vv = _safe_float(v, 0.0)
+            if u in ("ft","foot","feet",""): return vv
+            if u in ("in","inch","inches"):  return vv/12.0
+            if u in ("mm",):                 return vv*0.003280839895
+            return vv
+
+        L_ft = _to_feet(meta.get("length"), meta.get("length_unit"))
+        W_ft = _to_feet(meta.get("width"),  meta.get("width_unit"))
+        H_ft = _to_feet(meta.get("height"), meta.get("height_unit"))
+
+        unit = (obj.get("unit") or "sqft").lower()
+        if unit == "sqft":
+            measure = (L_ft * W_ft)
+        elif unit == "rft":
+            measure = H_ft
+        elif unit in ("cbft","cft","cubic ft","cubic feet"):
+            measure = (L_ft * W_ft * H_ft)
+        else:
+            measure = 1.0
+
+        obj["amount"] = float(obj["qty"]) * float(obj["rate"]) * float(measure)
+        return obj
+    return item
+
+
+def _edit_rates_dialog(parent, items, enable_color_select=False, show_src_color=False):
+    """
+    Multi-row editor before saving:
+    - If enable_color_select: per-row PC Color combobox
+    - If show_src_color: include read-only Src Color column
+    """
+    dlg = QDialog(parent); dlg.setWindowTitle("Confirm Items / Rates")
+    lay = QVBoxLayout(dlg)
+
+    cols = ["Item Code","Name"]
+    if show_src_color: cols.append("Src Color")
+    if enable_color_select: cols.append("PC Color")
+    cols.extend(["Cond.","Qty","Rate","Amount","Unit"])
+
+    tbl = QTableWidget(0, len(cols))
+    tbl.setHorizontalHeaderLabels(cols)
+    tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+    tbl.verticalHeader().setVisible(False)
+    tbl.setAlternatingRowColors(True)
+    lay.addWidget(tbl)
+
+    all_colors = _load_pc_colors() if enable_color_select else []
+
+    def add_row(x):
+        r = tbl.rowCount()
+        tbl.insertRow(r)
+        c = 0
+        tbl.setItem(r, c, QTableWidgetItem(x["item_code"])); c += 1
+        tbl.setItem(r, c, QTableWidgetItem(x["product_name"])); c += 1
+
+        if show_src_color:
+            it = QTableWidgetItem(str(x.get("src_color") or ""))
+            it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+            tbl.setItem(r, c, it); c += 1
+
+        if enable_color_select:
+            pc_widget = QComboBox()
+            if all_colors:
+                pc_widget.addItems(all_colors)
+            init_color = str(x.get("pc_color") or x.get("src_color") or "")
+            if init_color and (init_color not in (all_colors or [])):
+                pc_widget.insertItem(0, init_color)
+            if init_color:
+                pc_widget.setCurrentText(init_color)
+            tbl.setCellWidget(r, c, pc_widget)
+            c += 1
+
+        tbl.setItem(r, c, QTableWidgetItem(str(x.get("condition")))); c += 1
+        tbl.setItem(r, c, QTableWidgetItem(str(x.get("qty")))); c += 1
+
+        rate_sp = QDoubleSpinBox()
+        rate_sp.setDecimals(2)
+        rate_sp.setMaximum(1e9)
+        rate_sp.setValue(float(x.get("rate") or 0))
+        tbl.setCellWidget(r, c, rate_sp)
+        c += 1
+
+        # ---- ✅ compute proper amount here (sqft / rft / cbft) ----
+        meta = x.get("meta") or {}
+
+        def _to_feet(v, u):
+            u = (str(u or "").strip().lower())
+            vv = _safe_float(v, 0.0)
+            if u in ("ft", "foot", "feet", ""):
+                return vv
+            if u in ("in", "inch", "inches"):
+                return vv / 12.0
+            if u in ("mm",):
+                return vv * 0.003280839895
+            return vv  # assume feet if unknown
+
+        L_ft = _to_feet(meta.get("length"), meta.get("length_unit"))
+        W_ft = _to_feet(meta.get("width"),  meta.get("width_unit"))
+        H_ft = _to_feet(meta.get("height"), meta.get("height_unit"))
+
+        unit_val = (x.get("unit") or "sqft").lower()
+        qty_val = _safe_float(x.get("qty"), 0.0)
+        rate_val = _safe_float(x.get("rate"), 0.0)
+
+        if unit_val == "sqft":
+            measure = L_ft * W_ft
+        elif unit_val == "rft":
+            measure = H_ft
+        elif unit_val in ("cbft", "cft", "cubic ft", "cubic feet"):
+            measure = L_ft * W_ft * H_ft
+        else:
+            measure = 1.0
+
+        amount = qty_val * measure * rate_val
+        # --------------------------------------------
+
+        amt_item = QTableWidgetItem(_fmt_money(amount))
+        amt_item.setFlags(amt_item.flags() & ~Qt.ItemIsEditable)
+        tbl.setItem(r, c, amt_item)
+        c += 1
+
+        unit_cb = QComboBox()
+        unit_cb.addItems(["sqft", "rft", "cbft"])
+        if x.get("unit") in ["sqft", "rft", "cbft"]:
+            unit_cb.setCurrentText(x.get("unit"))
+        tbl.setCellWidget(r, c, unit_cb)
+
+
+    for it in items:
+        add_row(it)
+
+    bb = QHBoxLayout(); ok = QPushButton("OK"); cc = QPushButton("Cancel")
+    ok.clicked.connect(dlg.accept); cc.clicked.connect(dlg.reject)
+    bb.addStretch(1); bb.addWidget(ok); bb.addWidget(cc); lay.addLayout(bb)
+
+    if dlg.exec_():
+        out = []
+        for r in range(tbl.rowCount()):
+            c = 0
+            code = tbl.item(r, c).text(); c += 1
+            name = tbl.item(r, c).text(); c += 1
+            src_color = None
+            if show_src_color:
+                src_color = tbl.item(r, c).text() if tbl.item(r, c) else None
+                c += 1
+            pc_color = None
+            if enable_color_select:
+                pc_widget = tbl.cellWidget(r, c)
+                pc_color = pc_widget.currentText() if pc_widget else None
+                c += 1
+            cond = tbl.item(r, c).text(); c += 1
+            qty  = float(tbl.item(r, c).text()); c += 1
+            rate = float(tbl.cellWidget(r, c).value()); c += 1
+            c += 1  # skip displayed amount
+            unit = tbl.cellWidget(r, c).currentText()
+            out.append({
+                "item_code": code,
+                "product_name": name,
+                "src_color": src_color,
+                "pc_color": pc_color,
+                "condition": cond,
+                "qty": qty,
+                "rate": rate,
+                "unit": unit,
+                "amount": qty * rate
+            })
+        return out
+    return items
+
+# ---- Imported from Delivery Chalan: helpers + InventorySelectorDialog ----
+def _safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        try:
+            return float(str(v).strip() or 0)
+        except Exception:
+            return default
+
+def _flatten_qty_rows(qty_map):
+    """
+    Yield (branch, color, condition, qty) from nested qty structure.
+
+    Handles None/empty dicts and string/number quantities.
+    Ensures color/condition keys are treated as strings (including 'No Color', etc.).
+    """
+    qty_map = qty_map or {}
+    for branch, colors in qty_map.items():
+        colors = colors or {}
+        for color, conds in colors.items():
+            conds = conds or {}
+            for condition, q in conds.items():
+                yield str(branch), str(color), str(condition), _safe_float(q)
+                
+class InventorySelectorDialog(QDialog):
+    """
+    Unified inventory picker for Powder Coating:
+      • Pick items with (branch, item_code, src color, condition, available)
+      • Edit PC Color, Qty, Rate, Unit inline in the same table
+      • Auto-calc Amount (qty × rate)
+      • Preserves user inputs (qty/rate/pc_color/unit) across opens via `preselected`
+      • Returns full rows in `self.selected` on accept()
+    """
+
+    COLUMNS = [
+        "Branch", "Item Code", "Name", "Src Color", "PC Color",
+        "Condition", "Available", "Qty", "Rate", "Unit", "Amount"
+    ]
+
+    def __init__(self, branch: str, vendor_id: str = None, preselected: dict = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Inventory Items")
+        self.setMinimumSize(1200, 700)
+
+        # Inputs/state
+        self.branch = branch
+        self.vendor_id = vendor_id
+        # preselected: { f"{branch}|{item_code}|{src_color}|{condition}": {qty, rate, pc_color, unit} }
+        self.preselected = preselected or {}
+
+        # Lookups
+        self.pc_colors = _load_pc_colors() or ["No Color"]
+        self.rates_map = _load_rates(vendor_id) if vendor_id else {}
+
+        # Working containers
+        self.rows = []             # list of product/stock rows
+        self.row_by_key = {}       # key -> row dict
+        self.base_available = {}   # key -> float (original available)
+        self.selection = {}        # key -> {qty, rate, pc_color, unit}
+
+        # --- UI scaffold ---
+        main = QVBoxLayout(self); main.setContentsMargins(12, 12, 12, 12); main.setSpacing(8)
+
+        # Filters row
+        filt = QWidget(); grid = QGridLayout(filt); grid.setContentsMargins(0,0,0,0); grid.setHorizontalSpacing(8); grid.setVerticalSpacing(6)
+        self.search = QLineEdit(); self.search.setPlaceholderText("Search code/name…")
+        self.f_color = QComboBox(); self.f_color.addItem("Any")
+        self.f_cond  = QComboBox(); self.f_cond.addItem("Any")
+        self.f_len = QLineEdit(); self.f_len.setPlaceholderText("Length")
+        self.f_wid = QLineEdit(); self.f_wid.setPlaceholderText("Width")
+        self.f_hei = QLineEdit(); self.f_hei.setPlaceholderText("Height")
+        self.f_gau = QLineEdit(); self.f_gau.setPlaceholderText("Gauge")
+        btn_clear = QPushButton("Clear"); btn_clear.clicked.connect(self._clear_filters)
+
+        grid.addWidget(QLabel("Search"), 0, 0); grid.addWidget(self.search, 0, 1, 1, 6)
+        grid.addWidget(QLabel("Length"), 1, 0); grid.addWidget(self.f_len, 1, 1)
+        grid.addWidget(QLabel("Width"), 1, 2); grid.addWidget(self.f_wid, 1, 3)
+        grid.addWidget(QLabel("Height"), 1, 4); grid.addWidget(self.f_hei, 1, 5)
+        grid.addWidget(QLabel("Gauge"), 1, 6); grid.addWidget(self.f_gau, 1, 7)
+        grid.addWidget(QLabel("Color"), 2, 0); grid.addWidget(self.f_color, 2, 1)
+        grid.addWidget(QLabel("Condition"), 2, 2); grid.addWidget(self.f_cond, 2, 3)
+        grid.addWidget(btn_clear, 0, 7)
+        main.addWidget(filt)
+
+        # Table
+        self.tbl = QTableWidget(); self.tbl.setColumnCount(len(self.COLUMNS)); self.tbl.setHorizontalHeaderLabels(self.COLUMNS)
+        self.tbl.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tbl.setSelectionMode(QAbstractItemView.NoSelection)
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)  # child widgets handle editing
+        
+        header = self.tbl.horizontalHeader()
+
+        # First three: fit to content
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Branch
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # Item Code
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # Name
+
+        # Remaining: stretch to fill remaining width
+        for i in range(3, len(self.COLUMNS)):
+            header.setSectionResizeMode(i, QHeaderView.Stretch)
+        
+        main.addWidget(self.tbl)
+
+        # Buttons
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._collect_and_accept)
+        btns.rejected.connect(self.reject)
+        main.addWidget(btns)
+
+        # Debounce filter
+        self._debounce = QTimer(self); self._debounce.setSingleShot(True)
+        self._debounce.timeout.connect(self._apply_filter)
+        for w in (self.search, self.f_len, self.f_wid, self.f_hei, self.f_gau):
+            w.textChanged.connect(lambda _=None: self._debounce.start(120))
+        self.f_color.currentIndexChanged.connect(self._apply_filter)
+        self.f_cond.currentIndexChanged.connect(self._apply_filter)
+
+        # Load and render
+        self._load_inventory()
+        self._render_all_rows_once()
+        self._apply_filter()
+
+    # ========== Data loading ==========
+    def _fmt_dim(self, x):
+        try:
+            x = float(x)
+            if abs(x) < 1e-12: return ""
+            if abs(x - int(x)) < 1e-12: return str(int(x))
+            s = f"{x}"; return s.rstrip("0").rstrip(".") if "." in s else s
+        except Exception:
+            return ""
+
+    def _make_label(self, row):
+        dims = []
+        if row.get("length"): dims.append(f"L {self._fmt_dim(row['length'])}{row.get('length_unit','')}")
+        if row.get("width"):  dims.append(f"W {self._fmt_dim(row['width'])}{row.get('width_unit','')}")
+        if row.get("height"): dims.append(f"H {self._fmt_dim(row['height'])}{row.get('height_unit','')}")
+        if row.get("gauge"):  dims.append(f"G {self._fmt_dim(row['gauge'])}")
+        dims_s = (" " + " · ".join(dims)) if dims else ""
+        return f"{row.get('name','Unnamed')} - {dims_s}"
+
+    def _load_inventory(self):
+        self.rows.clear(); self.row_by_key.clear(); self.base_available.clear()
+        color_values, cond_values = set(), set()
+        want_branch = (self.branch or "").strip() or None
+
+        for snap in db.collection("products").stream():
+            d = snap.to_dict() or {}
+            item_code = (d.get("item_code") or "").strip()
+            name = (d.get("name") or "Unnamed").strip()
+
+            length = _safe_float(d.get("length")); width = _safe_float(d.get("width"))
+            height = _safe_float(d.get("height")); gauge = _safe_float(d.get("gauge"))
+            length_unit = str(d.get("length_unit") or "").strip()
+            width_unit  = str(d.get("width_unit") or "").strip()
+            height_unit = str(d.get("height_unit") or "").strip()
+
+            qty_map = ((d.get("qty") or {}) if isinstance(d.get("qty"), dict) else {})
+            for branch, branch_map in qty_map.items():
+                if want_branch and branch != want_branch: continue
+                if not isinstance(branch_map, dict): continue
+                for color, cond_map in branch_map.items():
+                    if not isinstance(cond_map, dict): continue
+                    for cond, av in cond_map.items():
+                        try: av = float(av)
+                        except Exception: av = 0.0
+                        if av <= 0: continue
+                        row = {
+                            "branch": branch,
+                            "item_code": item_code,
+                            "name": name,
+                            "color": str(color or ""),
+                            "condition": str(cond or ""),
+                            "available": _safe_float(av, 0.0),
+                            "length": length, "width": width, "height": height, "gauge": gauge,
+                            "length_unit": length_unit, "width_unit": width_unit, "height_unit": height_unit,
+                        }
+                        row["detailed_label"] = self._make_label(row)
+                        self.rows.append(row)
+
+                        key = f"{branch}|{item_code}|{color}|{cond}"
+                        self.base_available[key] = _safe_float(av, 0.0)
+                        self.row_by_key[key] = row
+                        color_values.add(str(color))
+                        cond_values.add(str(cond))
+
+        for c in sorted(color_values): self.f_color.addItem(c)
+        for c in sorted(cond_values):  self.f_cond.addItem(c)
+
+    # ========== Rendering ==========
+    def _make_qty_spin(self, key, base_av):
+        spin = QDoubleSpinBox(); spin.setDecimals(3); spin.setMinimum(0.0); spin.setMaximum(base_av)
+        if key in self.preselected:
+            spin.setValue(_safe_float(self.preselected[key].get("qty"), 0.0))
+        spin.valueChanged.connect(lambda _=None, k=key: self._on_qty_changed(k))
+        return spin
+
+    def _make_rate_spin(self, key, default_rate):
+        spin = QDoubleSpinBox(); spin.setDecimals(2); spin.setMinimum(0.0); spin.setMaximum(1_000_000)
+        val = None
+        if key in self.preselected: val = _safe_float(self.preselected[key].get("rate"), None)
+        if val is None: val = _safe_float(default_rate, 0.0)
+        spin.setValue(val)
+        spin.valueChanged.connect(lambda _=None, k=key: self._recalc_amount(k))
+        return spin
+
+    def _make_pc_color_combo(self, key, src_color):
+        cb = QComboBox(); cb.addItems(self.pc_colors)
+        chosen = None
+        if key in self.preselected: chosen = self.preselected[key].get("pc_color")
+        if not chosen:
+            chosen = src_color if src_color in self.pc_colors else (self.pc_colors[0] if self.pc_colors else "No Color")
+        idx = max(0, cb.findText(str(chosen)))
+        cb.setCurrentIndex(idx)
+        cb.currentIndexChanged.connect(lambda _=None, k=key: self._on_pc_color_changed(k))
+        return cb
+
+    def _make_unit_combo(self, key):
+        cb = QComboBox(); cb.addItems(["sqft", "rft", "cbft"])
+        if key in self.preselected:
+            saved = self.preselected[key].get("unit")
+            if saved:
+                i = cb.findText(saved)
+                if i >= 0: cb.setCurrentIndex(i)
+        cb.currentIndexChanged.connect(lambda _=None, k=key: self._on_unit_changed(k))
+        return cb
+
+    def _render_all_rows_once(self):
+        self.tbl.setRowCount(len(self.rows))
+        self.row_keys = []
+
+        for r, it in enumerate(self.rows):
+            key = f"{it['branch']}|{it['item_code']}|{it['color']}|{it['condition']}"
+            self.row_keys.append(key)
+
+            base_av = _safe_float(self.base_available.get(key, it.get("available", 0.0)), 0.0)
+            default_rate = _rate_for_product(self.rates_map, it.get("name"), it.get("item_code"))
+
+            # Static cells
+            self.tbl.setItem(r, 0, QTableWidgetItem(it["branch"]))
+            self.tbl.setItem(r, 1, QTableWidgetItem(it["item_code"]))
+            self.tbl.setItem(r, 2, QTableWidgetItem(it.get("detailed_label") or it.get("name") or ""))
+            self.tbl.setItem(r, 3, QTableWidgetItem(it["color"]))
+            self.tbl.setItem(r, 5, QTableWidgetItem(it["condition"]))
+
+            # Available (live remaining shown)
+            av_item = QTableWidgetItem(f"{base_av:g}")
+            av_item.setData(Qt.UserRole, base_av)
+            self.tbl.setItem(r, 6, av_item)
+
+            # Editors
+            pc_cb = self._make_pc_color_combo(key, it["color"]) ; self.tbl.setCellWidget(r, 4, pc_cb)
+            qty_sp = self._make_qty_spin(key, base_av)           ; self.tbl.setCellWidget(r, 7, qty_sp)
+            rate_sp = self._make_rate_spin(key, default_rate)    ; self.tbl.setCellWidget(r, 8, rate_sp)
+            unit_cb = self._make_unit_combo(key)                 ; self.tbl.setCellWidget(r, 9, unit_cb)
+
+            # Amount (read-only)
+            amt_item = QTableWidgetItem("0.00"); amt_item.setFlags(amt_item.flags() & ~Qt.ItemIsEditable)
+            self.tbl.setItem(r, 10, amt_item)
+
+            # Seed selection dict
+            if key in self.preselected:
+                self.selection[key] = {
+                    "qty": _safe_float(self.preselected[key].get("qty"), 0.0),
+                    "rate": _safe_float(self.preselected[key].get("rate"), _safe_float(default_rate, 0.0)),
+                    "pc_color": self.preselected[key].get("pc_color") or it["color"],
+                    "unit": self.preselected[key].get("unit") or "sqft",
+                }
+            else:
+                self.selection[key] = {"qty": 0.0, "rate": _safe_float(default_rate, 0.0), "pc_color": it["color"], "unit": "sqft"}
+                
+            #  show remaining = base_av - preselected_qty on first render
+            pre_qty = _safe_float(self.selection[key].get("qty"), 0.0)
+            remain = max(0.0, base_av - pre_qty)
+            av_item.setText(f"{remain:g}")
+
+            self._recalc_amount(key)
+
+        self.tbl.resizeColumnsToContents()
+
+    # ========== Interactions ==========
+    def _row_index_for_key(self, key):
+        try: return self.row_keys.index(key)
+        except ValueError: return -1
+
+    def _on_qty_changed(self, key):
+        r = self._row_index_for_key(key)
+        if r < 0: return
+        sp: QDoubleSpinBox = self.tbl.cellWidget(r, 7)
+        qty = _safe_float(sp.value(), 0.0)
+        self.selection.setdefault(key, {}).update({"qty": qty})
+        # live remaining
+        av_item = self.tbl.item(r, 6); base_av = _safe_float(av_item.data(Qt.UserRole), 0.0)
+        remain = max(0.0, base_av - qty)
+        av_item.setText(f"{remain:g}")
+        self._recalc_amount(key)
+
+    def _on_pc_color_changed(self, key):
+        r = self._row_index_for_key(key)
+        if r < 0: return
+        cb: QComboBox = self.tbl.cellWidget(r, 4)
+        self.selection.setdefault(key, {}).update({"pc_color": cb.currentText()})
+
+    def _on_unit_changed(self, key):
+        r = self._row_index_for_key(key)
+        if r < 0: return
+        cb: QComboBox = self.tbl.cellWidget(r, 9)
+        self.selection.setdefault(key, {}).update({"unit": cb.currentText()})
+
+    def _recalc_amount(self, key):
+        def _to_feet(val, unit):
+            u = (str(unit or "").strip().lower())
+            v = _safe_float(val, 0.0)
+            if v == 0.0: return 0.0
+            if u in ("ft", "foot", "feet", ""): return v
+            if u in ("in", "inch", "inches"):   return v / 12.0
+            if u in ("mm",):                    return v * 0.003280839895
+            return v  # unknown => assume feet
+
+        r = self._row_index_for_key(key)
+        if r < 0: return
+
+        qty_sp: QDoubleSpinBox  = self.tbl.cellWidget(r, 7)
+        rate_sp: QDoubleSpinBox = self.tbl.cellWidget(r, 8)
+        unit_cb: QComboBox      = self.tbl.cellWidget(r, 9)
+
+        qty  = _safe_float(qty_sp.value(), 0.0)
+        rate = _safe_float(rate_sp.value(), 0.0)
+        unit = (unit_cb.currentText().lower() if unit_cb else "sqft")
+
+        row = self.row_by_key.get(key, {}) or {}
+        L_ft = _to_feet(row.get("length"), row.get("length_unit"))
+        W_ft = _to_feet(row.get("width"),  row.get("width_unit"))
+        H_ft = _to_feet(row.get("height"), row.get("height_unit"))
+
+        # measure per piece
+        if unit == "sqft":
+            measure = (L_ft * W_ft)
+        elif unit == "rft":
+            measure = H_ft
+        elif unit in ("cbft", "cft", "cubic ft", "cubic feet"):
+            measure = (L_ft * W_ft * H_ft)
+        else:
+            measure = 1.0  # fallback
+
+        amount = qty * measure * rate
+
+        self.selection.setdefault(key, {}).update({
+            "qty": qty,
+            "rate": rate,
+            "unit": unit,
+            "amount": amount,
+        })
+
+        amt_item = self.tbl.item(r, 10)
+        if amt_item:
+            amt_item.setText(f"{amount:0.2f}")
+
+
+    # ========== Filters ==========
+    def _apply_filter(self):
+        term = (self.search.text() or "").strip().lower()
+        want_color = self.f_color.currentText() or "Any"
+        want_cond  = self.f_cond.currentText() or "Any"
+
+        def match_num(want, value):
+            if not want: return True
+            try: return abs(float(want) - float(value)) < 1e-9
+            except Exception: return False
+
+        for r, it in enumerate(self.rows):
+            show = True
+            base_av = _safe_float(it.get("available", 0.0), 0.0)
+            if base_av <= 0: show = False
+            if show and want_color != "Any" and it["color"] != want_color: show = False
+            if show and want_cond  != "Any" and it["condition"] != want_cond: show = False
+            if show and not match_num(self.f_len.text(), it["length"]): show = False
+            if show and not match_num(self.f_wid.text(), it["width"]):  show = False
+            if show and not match_num(self.f_hei.text(), it["height"]): show = False
+            if show and not match_num(self.f_gau.text(), it["gauge"]):  show = False
+
+            if show and term:
+                blob = " ".join([
+                    it.get("item_code",""), it.get("name",""), it.get("color",""), it.get("condition",""),
+                    str(it.get("length","")), str(it.get("width","")), str(it.get("height","")), str(it.get("gauge",""))
+                ]).lower()
+                show = term in blob
+            self.tbl.setRowHidden(r, not show)
+
+    def _clear_filters(self):
+        self.search.clear(); self.f_len.clear(); self.f_wid.clear(); self.f_hei.clear(); self.f_gau.clear()
+        self.f_color.setCurrentIndex(0); self.f_cond.setCurrentIndex(0)
+        self._apply_filter()
+
+    # ========== Accept ==========
+    def _collect_and_accept(self):
+        # Validate at least one qty > 0 and not exceeding base available
+        had_any = False
+        for key, data in self.selection.items():
+            q = _safe_float(data.get("qty"), 0.0)
+            if q <= 0: continue
+            had_any = True
+            base_av = _safe_float(self.base_available.get(key, 0.0), 0.0)
+            if q > base_av + 1e-9:
+                b, code, col, cond = key.split("|")
+                QMessageBox.warning(self, "Qty too high",
+                                    f"[{b}] {code} / {col} / {cond}: Qty {q:g} exceeds available {base_av:g}. Reduce it.")
+                return
+        if not had_any:
+            QMessageBox.information(self, "No quantity", "Enter Qty for at least one row.")
+            return
+
+        def _to_feet(val, unit):
+            u = (str(unit or "").strip().lower())
+            v = _safe_float(val, 0.0)
+            if v == 0.0: return 0.0
+            if u in ("ft", "foot", "feet", ""): return v
+            if u in ("in", "inch", "inches"):   return v / 12.0
+            if u in ("mm",):                    return v * 0.003280839895
+            return v
+
+        out = []
+        for key, data in self.selection.items():
+            q = _safe_float(data.get("qty"), 0.0)
+            if q <= 0: 
+                continue
+            row = self.row_by_key.get(key)
+            if not row:
+                continue
+
+            rate = _safe_float(data.get("rate"), 0.0)
+            unit = (data.get("unit") or "sqft").strip().lower()
+            pc_color = data.get("pc_color") or row.get("color")
+
+            L_ft = _to_feet(row.get("length"), row.get("length_unit"))
+            W_ft = _to_feet(row.get("width"),  row.get("width_unit"))
+            H_ft = _to_feet(row.get("height"), row.get("height_unit"))
+
+            if unit == "sqft":
+                measure = (L_ft * W_ft)
+            elif unit == "rft":
+                measure = H_ft
+            elif unit in ("cbft", "cft", "cubic ft", "cubic feet"):
+                measure = (L_ft * W_ft * H_ft)
+            else:
+                measure = 1.0
+
+            amount = q * measure * rate
+
+            out.append({
+                "branch": row.get("branch", ""),
+                "item_code": row.get("item_code", ""),
+                "product_name": row.get("detailed_label", "") or row.get("name", ""),
+                "src_color": row.get("color", ""),
+                "pc_color": pc_color,
+                "condition": row.get("condition", ""),
+                "qty": q,
+                "rate": rate,
+                "unit": unit,
+                "amount": amount,
+                "meta": {
+                    "length": row.get("length"),
+                    "width":  row.get("width"),
+                    "height": row.get("height"),
+                    "gauge":  row.get("gauge"),
+                    "length_unit": row.get("length_unit"),
+                    "width_unit":  row.get("width_unit"),
+                    "height_unit": row.get("height_unit"),
+                }
+            })
+        self.selected = out
+
+        # keep preselected_out update the same
+        self.preselected_out = {}
+        for row in out:
+            k = f"{row['branch']}|{row['item_code']}|{row['src_color']}|{row['condition']}"
+            self.preselected_out[k] = {
+                "qty": row["qty"], "rate": row["rate"],
+                "pc_color": row["pc_color"], "unit": row["unit"],
+            }
+        self.accept()
+
+
+
 def _fmt_money(n):
     try:
-        return f"{float(n or 0):,.2f}"
+        return f"{float(n or 0):,.2f}" 
     except Exception:
         return "0.00"
 
@@ -149,12 +857,18 @@ def _export_pc_bill_pdf(pc_doc: dict, out_path: str):
     pdf.add_page()
     pdf.set_auto_page_break(True, 15)
     pdf.set_text_color(0, 0, 0)
+    
+    date_raw = str(pc_doc.get("date", "")).split(" ")[0]
+    try:
+        date_fmt = datetime.strptime(date_raw, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except Exception:
+        date_fmt = date_raw
 
     # --- Bill Info ---
     pdf.set_font("Arial", "B", 12)
     info = [
         ("PCID", pc_doc.get("pcid", "")),
-        ("Date", str(pc_doc.get("date", ""))),
+        ("Date", date_fmt),
         ("Branch", pc_doc.get("branch", "")),
         ("Vendor", pc_doc.get("vendor_name", "")),
     ]
@@ -167,7 +881,7 @@ def _export_pc_bill_pdf(pc_doc: dict, out_path: str):
 
     # --- Table Header ---
     headers = ["Sr", "Item Code", "Product Name", "Src Color", "PC Color", "Cond.", "Qty", "Rate", "Amount"]
-    widths = [10, 25, 55, 25, 25, 18, 15, 22, 25]
+    widths = [10,   25,          95,             25,          25,          18,      15,    22,    25]
     pdf.set_fill_color(220, 220, 220)
     pdf.set_font("Arial", "B", 10)
     for h, w in zip(headers, widths):
@@ -184,7 +898,11 @@ def _export_pc_bill_pdf(pc_doc: dict, out_path: str):
         fill = not fill
 
         try:
-            amount = float(item.get("qty", 0)) * float(item.get("rate", 0))
+            if item.get("amount") is not None:
+                amount = float(item.get("amount") or 0)
+            else:
+                # fallback if old data
+                amount = float(item.get("qty", 0)) * float(item.get("rate", 0))
         except Exception:
             amount = 0.0
         row = [
@@ -238,6 +956,7 @@ def _export_gate_pass_pdf(pcid: str, bill_ref: str, branch: str, vendor_name: st
     pdf.add_page()
     pdf.set_auto_page_break(True, 15)
     pdf.set_text_color(0, 0, 0)
+    now_str = datetime.datetime.now().strftime("%d/%m/%Y %I:%M:%S %p")
 
     # --- Details ---
     pdf.set_font("Arial", "B", 12)
@@ -245,7 +964,7 @@ def _export_gate_pass_pdf(pcid: str, bill_ref: str, branch: str, vendor_name: st
         ("Bill Ref", bill_ref),
         ("Branch", branch),
         ("Vendor", vendor_name),
-        ("Date", str(datetime.date.today())),
+        ("Date & Time", now_str),
     ]:
         pdf.cell(30, 8, f"{k}:", 0, 0)
         pdf.set_font("Arial", "", 12)
@@ -255,7 +974,7 @@ def _export_gate_pass_pdf(pcid: str, bill_ref: str, branch: str, vendor_name: st
 
     # --- Table Header ---
     headers = ["Sr", "Item Code", "Product Name", "Current -> PC Color", "Cond.", "Qty"]
-    widths = [10, 25, 70, 55, 20, 15]
+    widths = [10,   25,          110,            55,                     20,      15]
     pdf.set_fill_color(220, 220, 220)
     pdf.set_font("Arial", "B", 10)
     for h, w in zip(headers, widths):
@@ -463,6 +1182,31 @@ def _post_payment_je(user_data, bill_ref, cashbank_account_id, pcid, amount):
     db.collection("accounts").document(cashbank_account_id).update({"current_balance": firestore.Increment(-float(amount))})
     return je_ref.id
 
+def _fetch_live_availability_for_pc(branch: str, items):
+    """
+    items: list of dicts with item_code, src_color, condition, qty
+    Returns a dict {(code, branch, color, condition): live_available_float}
+    """
+    from collections import defaultdict
+    by_code = defaultdict(list)
+    for it in (items or []):
+        code = str(it.get("item_code") or "")
+        col  = str(it.get("src_color") or "No Color")
+        cond = str(it.get("condition") or "New")
+        if code:
+            by_code[code].append((code, branch, col, cond))
+    live = {}
+    for code, targets in by_code.items():
+        q = db.collection("products").where("item_code", "==", code).limit(1).get()
+        if not q:
+            for tup in targets:
+                live[tup] = 0.0
+            continue
+        d = q[0].to_dict() or {}
+        qty = d.get("qty") or {}
+        for _, br, col, cond in targets:
+            live[(code, br, col, cond)] = float(((qty.get(br) or {}).get(col) or {}).get(cond) or 0.0)
+    return live
 
 # ============ Windows & Dialogs (UI restyled to match view_inventory theme) ============
 
@@ -492,6 +1236,7 @@ class PowderCoatingMain(QWidget):
     def __init__(self, user_data):
         super().__init__()
         self.user_data = user_data or {}
+        self.orders_in_progress = []  # cache for grouped view
         self.setWindowTitle("Powder Coating Cycle")
         self.setMinimumSize(1100, 640)
         self.setStyleSheet(_COMMON_STYLE)
@@ -563,6 +1308,7 @@ class PowderCoatingMain(QWidget):
     # --- unchanged logic; same method names and internals as original file ---
     def _load_orders(self):
         self.table.setRowCount(0)
+        self.orders_in_progress = []  # reset cache every load
         branches = self.user_data.get("branch", [])
         if isinstance(branches, str):
             branches = [branches] if branches else []
@@ -584,6 +1330,14 @@ class PowderCoatingMain(QWidget):
             self.table.setItem(r,6, cell(int(row.get("totals",{}).get("lines",0)), Qt.AlignRight))
             self.table.setItem(r,7, cell(row.get("totals",{}).get("qty",0), Qt.AlignRight))
             self.table.setItem(r,8, cell(_fmt_money(row.get("totals",{}).get("net",0)), Qt.AlignRight))
+            # Cache data needed by the grouped window
+            if (row.get("status") or "").upper() == "IN_PROGRESS":
+                self.orders_in_progress.append({
+                    "pcid": row.get("pcid"),
+                    "branch": row.get("branch"),
+                    "vendor_name": row.get("vendor_name"),
+                    "items": row.get("items") or [],
+                })
 
     def _selected_order_id(self):
         sel = self.table.selectionModel().selectedRows()
@@ -621,8 +1375,31 @@ class PowderCoatingMain(QWidget):
         dlg.exec_()
 
     def _open_inprogress_grouped(self):
-        w = InProgressGroupedWindow(self.user_data, parent=self)
-        w.show()
+        """Open Grouped In-Progress in a separate window."""
+        # Build your grouped data (use your existing logic)
+        grouped_rows = []
+        for order in (getattr(self, "orders_in_progress", []) or []):
+            for it in (order.get("items") or []):
+                meta = it.get("meta") or {}
+                grouped_rows.append({
+                    "branch": order.get("branch"),
+                    "vendor_name": order.get("vendor_name"),
+                    "item_code": it.get("item_code"),
+                    "name": it.get("product_name") or it.get("name"),
+                    "gauge": meta.get("gauge"),
+                    "src_color": it.get("src_color"),
+                    "pc_color": it.get("pc_color") or it.get("src_color"),
+                    "qty": it.get("qty"),
+                })
+
+        # Reuse if already open, else make new
+        if not hasattr(self, "_grp_win") or self._grp_win is None:
+            self._grp_win = InProgressGroupedWindow(self.user_data, parent=None)
+            self._grp_win.setAttribute(Qt.WA_DeleteOnClose, True)
+        self._grp_win.set_rows(grouped_rows)
+        self._grp_win.show()
+        self._grp_win.raise_()
+        self._grp_win.activateWindow()
 
     # ---- Double-click dialog with 4 actions (kept intact) ----
     def _on_row_double_clicked(self, item):
@@ -759,8 +1536,6 @@ class AddPowderCoatingDialog(QDialog):
 
         self.manual_id = QLineEdit(); self.manual_id.setPlaceholderText("Optional manual ID")
         self.notes = QTextEdit(); self.notes.setPlaceholderText("Optional notes")
-        self.btn_pick = QPushButton("Pick Inventory + Rates")
-        self.btn_pick.clicked.connect(self._pick_inventory)
 
         # Items live table
         self.items_tbl = QTableWidget(0, 9)
@@ -774,7 +1549,7 @@ class AddPowderCoatingDialog(QDialog):
         row_btns = QHBoxLayout()
         self.btn_edit_row = QPushButton("Edit Selected"); self.btn_edit_row.clicked.connect(self._edit_selected_row)
         self.btn_remove_row = QPushButton("Remove Selected"); self.btn_remove_row.clicked.connect(self._remove_selected_row)
-        self.btn_add_more = QPushButton("Add More Items"); self.btn_add_more.clicked.connect(self._pick_inventory)
+        self.btn_add_more = QPushButton("Add Items"); self.btn_add_more.clicked.connect(self._pick_inventory)
         row_btns.addWidget(self.btn_edit_row); row_btns.addWidget(self.btn_remove_row); row_btns.addStretch(1); row_btns.addWidget(self.btn_add_more)
 
         self.items = []
@@ -784,7 +1559,6 @@ class AddPowderCoatingDialog(QDialog):
         form.addRow("Branch:", self.branch_cb)
         form.addRow("Vendor:", self.vendor_cb)
         form.addRow("Manual ID:", self.manual_id)
-        form.addRow(self.btn_pick)
         form.addRow(self.items_tbl)
         form.addRow(row_btns)
         form.addRow("Notes:", self.notes)
@@ -811,7 +1585,7 @@ class AddPowderCoatingDialog(QDialog):
         for it in (self.items or []):
             r = self.items_tbl.rowCount(); self.items_tbl.insertRow(r)
             def cell(v): return QTableWidgetItem(str(v if v is not None else ""))
-            amt = float(it.get("qty",0)) * float(it.get("rate",0))
+            amt = _safe_float(it.get("amount"), _safe_float(it.get("qty",0))*_safe_float(it.get("rate",0)))
             self.items_tbl.setItem(r, 0, cell(it.get("item_code")))
             self.items_tbl.setItem(r, 1, cell(it.get("product_name")))
             self.items_tbl.setItem(r, 2, cell(it.get("src_color")))
@@ -840,58 +1614,49 @@ class AddPowderCoatingDialog(QDialog):
             QMessageBox.information(self, "Select a row", "Please select an item row to remove.")
             return
         del self.items[idx]
+        # also rebuild _preselected so the selector doesn't restore removed rows
+        self._preselected = {}
+        branch = self.branch_cb.currentText().strip()
+        for it in self.items:
+            key = f"{branch}|{it.get('item_code','')}|{it.get('src_color','')}|{it.get('condition','')}"
+            self._preselected[key] = {
+                "qty": _safe_float(it.get("qty"), 0.0),
+                "rate": _safe_float(it.get("rate"), 0.0),
+                "pc_color": it.get("pc_color") or it.get("src_color"),
+                "unit": (it.get("unit") or "sqft").strip(),
+            }
         self._refresh_items_table()
 
     def _pick_inventory(self):
         branch = self.branch_cb.currentText().strip()
-        if branch in ("", "-"):
-            QMessageBox.warning(self, "Select Branch", "Please select a valid branch first.")
-            return
-        if not InventorySelectorDialog:
-            QMessageBox.warning(self, "Missing", "Inventory selector not available in this build.")
+        if not branch:
+            QMessageBox.warning(self, "Select Branch", "Please select a branch first.")
             return
 
-        dlg = InventorySelectorDialog(branch=branch, preselected=self._preselected, parent=self)
+        # Build preselected mapping (preserve qty, rate, unit, pc_color) from current self.items
+        if not hasattr(self, "_preselected") or self._preselected is None:
+            self._preselected = {}
+        for it in getattr(self, "items", []) or []:
+            key = f"{branch}|{it.get('item_code','')}|{it.get('src_color','')}|{it.get('condition','')}"
+            self._preselected[key] = {
+                "qty": _safe_float(it.get("qty"), 0.0),
+                "rate": _safe_float(it.get("rate"), 0.0),
+                "pc_color": it.get("pc_color") or it.get("src_color"),
+                "unit": (it.get("unit") or "sqft").strip(),
+            }
+
+        vendor_id = self.vendor_cb.currentData() if hasattr(self, "vendor_cb") else None
+        dlg = InventorySelectorDialog(branch=branch, vendor_id=vendor_id, preselected=self._preselected, parent=self)
+
         if dlg.exec_():
-            picked = dlg.selected
-            vendor_id = self.vendor_cb.currentData()
-            rates_map = _load_rates(vendor_id)  # vendor-only rates
-            colors_all = _load_pc_colors()
-            items, pre = [], {}
-            for r in picked:
-                code = str(r.get("item_code") or r.get("code") or "").strip()
-                qty  = float(r.get("qty") or 0)
-                if qty <= 0: continue
-                product_name = r.get("product_name") or r.get("name") or code
-                rate = _rate_for_product(rates_map, product_name, code)
-
-                src_color = r.get("color")
-                pc_color_default = src_color if src_color in (colors_all or []) else ((colors_all or ["No Color"])[0])
-                unit = "sqft"
-
-                item = {
-                    "item_code": code,
-                    "product_name": product_name,
-                    "src_color": src_color,
-                    "pc_color": pc_color_default,
-                    "condition": r.get("condition"),
-                    "qty": qty,
-                    "rate": rate,
-                    "unit": unit,
-                    "amount": qty * rate,
-                    "meta": {
-                        "length": r.get("length"), "width": r.get("width"),
-                        "height": r.get("height"), "gauge": r.get("gauge")
-                    }
-                }
-                items.append(item)
-                pre_key = f"{branch}|{code}|{r.get('color')}|{r.get('condition')}"
-                pre[pre_key] = qty
-
-            edited = _edit_rates_dialog(self, items, enable_color_select=True, show_src_color=True)
-            self.items.extend(edited)
-            self._preselected.update(pre)
+            # Replace items with chosen rows (already contain qty/rate/unit/pc_color/amount)
+            self.items = dlg.selected[:]  # list of dicts with fields expected by the Add dialog table
+            # Persist selections so reopening the dialog shows the same values
+            self._preselected = dlg.preselected_out
+            # Refresh UI totals / table
             self._refresh_items_table()
+
+
 
     def _save(self):
         if not self.items:
@@ -953,56 +1718,87 @@ class AddPowderCoatingDialog(QDialog):
 
 
 class InProgressGroupedWindow(QWidget):
+    """Standalone window showing grouped in-progress orders."""
+
     def __init__(self, user_data, parent=None):
         super().__init__(parent)
-        self.user_data = user_data or {}
-        self.setWindowTitle("Grouped In-Progress Items")
-        self.setMinimumSize(980, 600)
-        self.setStyleSheet(_COMMON_STYLE)
+        self.user_data = user_data
+        self.setWindowTitle("Grouped In-Progress Orders")
+        self.setMinimumSize(1000, 550)
+        self.setWindowFlag(Qt.Window, True)       # <-- makes it a standalone window
+        self.setWindowModality(Qt.NonModal)       # <-- not blocking
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(10)
+        # ---------- Layout setup ----------
+        layout = QVBoxLayout(self)
 
-        title = QLabel("📋 Grouped In-Progress Items")
-        title.setFont(QFont("Segoe UI", 14, QFont.Bold))
-        root.addWidget(title)
+        # Header
+        hdr = QHBoxLayout()
+        title = QLabel("Grouped In-Progress")
+        title.setStyleSheet("font-weight: 600; font-size: 16px;")
+        hdr.addWidget(title)
+        hdr.addStretch(1)
 
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["Item Code","Name","Src Color","PC Color","Total Qty (In-Progress)","Orders"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.setAlternatingRowColors(True)
-        root.addWidget(self.table, 1)
+        btn_refresh = QPushButton("Refresh")
+        btn_refresh.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        btn_refresh.clicked.connect(self._on_refresh_clicked)
+        hdr.addWidget(btn_refresh)
 
-        self._load()
+        btn_close = QPushButton("Close")
+        btn_close.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        btn_close.clicked.connect(self.close)
+        hdr.addWidget(btn_close)
 
-    def _load(self):
-        self.table.setRowCount(0)
-        branches = self.user_data.get("branch", [])
-        if isinstance(branches, str): branches = [branches] if branches else []
-        q = db.collection("powder_coating_orders").where("status","==","IN_PROGRESS").get()
-        agg = {}
-        for d in q:
-            row = d.to_dict() or {}
-            if branches and row.get("branch") not in branches: continue
-            for it in (row.get("items") or []):
-                key = (it.get("item_code"), it.get("src_color"), it.get("pc_color"))
-                g = agg.setdefault(key, {"name": it.get("product_name"), "qty": 0.0, "orders": set()})
-                try: g["qty"] += float(it.get("qty") or 0)
-                except Exception: pass
-                g["orders"].add(row.get("pcid"))
-        for (code, src_color, pc_color), v in agg.items():
-            r = self.table.rowCount(); self.table.insertRow(r)
-            def cell(x, align=Qt.AlignLeft):
-                it = QTableWidgetItem(str(x or "")); it.setTextAlignment(align | Qt.AlignVCenter); return it
-            self.table.setItem(r,0,cell(code))
-            self.table.setItem(r,1,cell(v["name"]))
-            self.table.setItem(r,2,cell(src_color))
-            self.table.setItem(r,3,cell(pc_color))
-            self.table.setItem(r,4,cell(v["qty"], Qt.AlignRight))
-            self.table.setItem(r,5,cell(", ".join(sorted(v["orders"]))))
+        layout.addLayout(hdr)
+
+        # ---------- Table ----------
+        self.tbl = QTableWidget(0, 8)
+        self.tbl.setHorizontalHeaderLabels([
+            "Branch", "Vendor", "Item Code", "Name",
+            "Gauge", "Src Color", "PC Color", "Qty"
+        ])
+        self.tbl.setAlternatingRowColors(True)
+        self.tbl.setSelectionBehavior(QTableWidget.SelectRows)
+        self.tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.tbl, 1)
+
+    # ---------- Methods ----------
+    def set_rows(self, rows):
+        """Populate table with grouped data."""
+        self.tbl.setRowCount(0)
+        for g in rows:
+            r = self.tbl.rowCount()
+            self.tbl.insertRow(r)
+
+            def cell(v):
+                it = QTableWidgetItem("" if v is None else str(v))
+                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                return it
+
+            self.tbl.setItem(r, 0, cell(g.get("branch")))
+            self.tbl.setItem(r, 1, cell(g.get("vendor_name")))
+            self.tbl.setItem(r, 2, cell(g.get("item_code")))
+            self.tbl.setItem(r, 3, cell(g.get("name")))
+            self.tbl.setItem(r, 4, cell(g.get("gauge")))
+            self.tbl.setItem(r, 5, cell(g.get("src_color")))
+            self.tbl.setItem(r, 6, cell(g.get("pc_color")))
+            self.tbl.setItem(r, 7, cell(g.get("qty")))
+        self.tbl.resizeColumnsToContents()
+
+    def _on_refresh_clicked(self):
+        """Emit signal or reload if parent has reload method."""
+        p = self.parent()
+        if p and hasattr(p, "_show_grouped_in_progress"):
+            p._show_grouped_in_progress()
+
+    def closeEvent(self, e):
+        """Ensure main window reference is cleared when closed."""
+        p = self.parent()
+        if p is not None and hasattr(p, "_grp_win"):
+            p._grp_win = None
+        super().closeEvent(e)
+
 
 
 # -------- Modify Rates (Keyword Rules) --------
@@ -1106,152 +1902,3 @@ class ModifyRatesDialog(QDialog):
 # If not present, you will need to re-add them here (they were in original file).
 
 # End of file
-
-# -------- Inline editors --------
-
-def _edit_single_item_dialog(parent, item):
-    dlg = QDialog(parent); dlg.setWindowTitle("Edit Item")
-    lay = QFormLayout(dlg)
-
-    code = QLabel(item.get("item_code",""))
-    name = QLabel(item.get("product_name",""))
-
-    colors = _load_pc_colors()
-    src_lbl = QLabel(str(item.get("src_color") or ""))
-    pc_cb = QComboBox()
-    if colors: pc_cb.addItems(colors)
-    pc_init = str(item.get("pc_color") or item.get("src_color") or "")
-    if pc_init and (pc_init not in (colors or [])): pc_cb.insertItem(0, pc_init)
-    if pc_init: pc_cb.setCurrentText(pc_init)
-
-    cond = QLineEdit(str(item.get("condition") or ""))
-    qty_sp = QDoubleSpinBox(); qty_sp.setDecimals(3); qty_sp.setMaximum(1e9); qty_sp.setValue(float(item.get("qty") or 0))
-    rate_sp = QDoubleSpinBox(); rate_sp.setDecimals(2); rate_sp.setMaximum(1e9); rate_sp.setValue(float(item.get("rate") or 0))
-
-    unit_cb = QComboBox(); unit_cb.addItems(["sqft","rft","cbft"]); unit_cb.setCurrentText(item.get("unit") or "sqft")
-
-    lay.addRow("Item Code:", code)
-    lay.addRow("Name:", name)
-    lay.addRow("Source Color:", src_lbl)
-    lay.addRow("PC Color:", pc_cb)
-    lay.addRow("Condition:", cond)
-    lay.addRow("Qty:", qty_sp)
-    lay.addRow("Rate:", rate_sp)
-    lay.addRow("Unit:", unit_cb)
-
-    bb = QHBoxLayout(); ok = QPushButton("OK"); cc = QPushButton("Cancel")
-    ok.clicked.connect(dlg.accept); cc.clicked.connect(dlg.reject)
-    bb.addStretch(1); bb.addWidget(ok); bb.addWidget(cc); lay.addRow(bb)
-
-    if dlg.exec_():
-        obj = dict(item)
-        obj.update({
-            "pc_color": pc_cb.currentText(),
-            "condition": cond.text().strip() or item.get("condition"),
-            "qty": float(qty_sp.value()),
-            "rate": float(rate_sp.value()),
-            "unit": unit_cb.currentText(),
-        })
-        obj["amount"] = float(obj["qty"]) * float(obj["rate"])
-        return obj
-    return item
-
-
-def _edit_rates_dialog(parent, items, enable_color_select=False, show_src_color=False):
-    """
-    Multi-row editor before saving:
-    - If enable_color_select: per-row PC Color combobox
-    - If show_src_color: include read-only Src Color column
-    """
-    dlg = QDialog(parent); dlg.setWindowTitle("Confirm Items / Rates")
-    lay = QVBoxLayout(dlg)
-
-    cols = ["Item Code","Name"]
-    if show_src_color: cols.append("Src Color")
-    if enable_color_select: cols.append("PC Color")
-    cols.extend(["Cond.","Qty","Rate","Amount","Unit"])
-
-    tbl = QTableWidget(0, len(cols))
-    tbl.setHorizontalHeaderLabels(cols)
-    tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-    tbl.verticalHeader().setVisible(False)
-    tbl.setAlternatingRowColors(True)
-    lay.addWidget(tbl)
-
-    all_colors = _load_pc_colors() if enable_color_select else []
-
-    def add_row(x):
-        r = tbl.rowCount(); tbl.insertRow(r)
-        c = 0
-        tbl.setItem(r, c, QTableWidgetItem(x["item_code"])); c += 1
-        tbl.setItem(r, c, QTableWidgetItem(x["product_name"])); c += 1
-
-        if show_src_color:
-            it = QTableWidgetItem(str(x.get("src_color") or "")); it.setFlags(it.flags() & ~Qt.ItemIsEditable)
-            tbl.setItem(r, c, it); c += 1
-
-        if enable_color_select:
-            pc_widget = QComboBox()
-            if all_colors: pc_widget.addItems(all_colors)
-            init_color = str(x.get("pc_color") or x.get("src_color") or "")
-            if init_color and (init_color not in (all_colors or [])):
-                pc_widget.insertItem(0, init_color)
-            if init_color: pc_widget.setCurrentText(init_color)
-            tbl.setCellWidget(r, c, pc_widget); c += 1
-
-        tbl.setItem(r, c, QTableWidgetItem(str(x.get("condition")))); c += 1
-        tbl.setItem(r, c, QTableWidgetItem(str(x.get("qty")))); c += 1
-
-        rate_sp = QDoubleSpinBox(); rate_sp.setDecimals(2); rate_sp.setMaximum(1e9)
-        rate_sp.setValue(float(x.get("rate") or 0))
-        tbl.setCellWidget(r, c, rate_sp); c += 1
-
-        amt = float(x.get("qty",0)) * float(x.get("rate",0))
-        amt_item = QTableWidgetItem(_fmt_money(amt)); amt_item.setFlags(amt_item.flags() & ~Qt.ItemIsEditable)
-        tbl.setItem(r, c, amt_item); c += 1
-
-        unit_cb = QComboBox(); unit_cb.addItems(["sqft","rft","cbft"])
-        if x.get("unit") in ["sqft","rft","cbft"]:
-            unit_cb.setCurrentText(x.get("unit"))
-        tbl.setCellWidget(r, c, unit_cb)
-
-    for it in items:
-        add_row(it)
-
-    bb = QHBoxLayout(); ok = QPushButton("OK"); cc = QPushButton("Cancel")
-    ok.clicked.connect(dlg.accept); cc.clicked.connect(dlg.reject)
-    bb.addStretch(1); bb.addWidget(ok); bb.addWidget(cc); lay.addLayout(bb)
-
-    if dlg.exec_():
-        out = []
-        for r in range(tbl.rowCount()):
-            c = 0
-            code = tbl.item(r, c).text(); c += 1
-            name = tbl.item(r, c).text(); c += 1
-            src_color = None
-            if show_src_color:
-                src_color = tbl.item(r, c).text() if tbl.item(r, c) else None
-                c += 1
-            pc_color = None
-            if enable_color_select:
-                pc_widget = tbl.cellWidget(r, c)
-                pc_color = pc_widget.currentText() if pc_widget else None
-                c += 1
-            cond = tbl.item(r, c).text(); c += 1
-            qty  = float(tbl.item(r, c).text()); c += 1
-            rate = float(tbl.cellWidget(r, c).value()); c += 1
-            c += 1  # skip displayed amount
-            unit = tbl.cellWidget(r, c).currentText()
-            out.append({
-                "item_code": code,
-                "product_name": name,
-                "src_color": src_color,
-                "pc_color": pc_color,
-                "condition": cond,
-                "qty": qty,
-                "rate": rate,
-                "unit": unit,
-                "amount": qty * rate
-            })
-        return out
-    return items

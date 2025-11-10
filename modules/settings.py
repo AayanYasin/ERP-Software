@@ -5,11 +5,11 @@ import sys
 import subprocess
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
-    QMessageBox, QFrame, QListWidget, QLineEdit, QScrollArea, QListWidgetItem,
+    QMessageBox, QFrame, QListWidget, QLineEdit, QScrollArea,
     QProgressDialog
 )
 from PyQt5.QtGui import QFont
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt
 from firebase.config import db
 
 

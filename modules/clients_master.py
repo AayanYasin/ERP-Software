@@ -4,7 +4,7 @@
 # =============================
 
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QTableWidget,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QTableWidget,
     QTableWidgetItem, QDialog, QFormLayout, QComboBox, QTextEdit, QListWidget, QListWidgetItem,
     QDialogButtonBox, QMessageBox, QHeaderView, QAbstractItemView, QToolBar, QAction, QStyle,
     QProgressDialog, QGroupBox, QShortcut, QTabWidget

@@ -3,12 +3,10 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QTableWidget,
     QTableWidgetItem, QDialog, QFormLayout, QComboBox, QTextEdit, QDialogButtonBox,
-    QMessageBox, QHeaderView, QAbstractItemView, QToolBar, QAction, QStyle, QProgressBar,
-    QSizePolicy, QGroupBox, QDateEdit, QTabWidget, QFrame, QFileDialog, QSpacerItem,
+    QMessageBox, QHeaderView, QAbstractItemView, QToolBar, QAction, QStyle, QProgressBar, QGroupBox, QDateEdit, QTabWidget,
     QGridLayout, QToolButton, QMenu
 )
 from PyQt5.QtCore import Qt, QDate, QTimer
-from PyQt5.QtGui import QColor
 from firebase.config import db
 from firebase_admin import firestore
 import uuid, csv, os, tempfile, datetime

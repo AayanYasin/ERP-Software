@@ -1,11 +1,11 @@
 # view_users.py  — enhanced UI/UX, clearer permissions screen, centered dialogs
 
 from PyQt5.QtCore import Qt, QAbstractTableModel, QModelIndex, QThread, pyqtSignal
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QWidget, QDialog, QTableView, QVBoxLayout, QProgressBar, QHeaderView, QMessageBox,
-    QCheckBox, QFormLayout, QDialogButtonBox, QLabel, QPushButton, QLineEdit, QComboBox,
-    QScrollArea, QHBoxLayout, QFrame, QGroupBox, QApplication, QDesktopWidget, QToolButton, QGraphicsDropShadowEffect
+    QCheckBox, QFormLayout, QLabel, QPushButton, QLineEdit, QComboBox,
+    QScrollArea, QHBoxLayout, QFrame, QGroupBox, QDesktopWidget, QToolButton, QGraphicsDropShadowEffect
 ) 
 from firebase.config import db
 from firebase_admin import auth as admin_auth
